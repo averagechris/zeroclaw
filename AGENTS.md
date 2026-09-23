@@ -2,6 +2,18 @@
 
 Core instructions for AI coding assistants working in this repository. Use `docs/book/src/contributing/architecture-map.md` to load only the references needed for a non-trivial task.
 
+## Maintained Fork
+
+This checkout is the `averagechris/zeroclaw` GitHub fork. Preserve the upstream
+guidance below and read [docs/fork-maintenance.md](docs/fork-maintenance.md)
+before updating the fork or changing its maintenance scaffolding.
+
+- Use `jj`, not `git`, for version-control actions.
+- `origin` is the maintained fork; local `main` tracks `main@origin`.
+- `upstream` is `zeroclaw-labs/zeroclaw` and is fetch-only. Fetch upstream,
+  inspect the changes after the recorded watermark, and port intentionally;
+  never blind-merge upstream.
+
 ## Single Source Of Truth
 
 Do not duplicate state. Before adding a struct field, config entry, schema field, runtime cache, or parallel lookup table, identify the canonical source:
@@ -29,7 +41,8 @@ Prefer borrowed config, getters, resolver closures over live config, on-demand m
 5. Do not add heavy dependencies for minor convenience, speculative abstractions, or config keys and feature flags without a concrete use case.
 6. Add the smallest useful implementation and tests at the real behavior boundary.
 7. Validate at the change's risk level, report commands actually run, and document behavior, risk, side effects, and rollback.
-8. Use a non-`master` branch, open a PR to `master`, and never push directly to `master`.
+8. For this fork, use a non-`main` branch, open a PR to `main`, and never push
+   directly to `main`. Upstream contributions still target upstream's `master`.
 9. Use conventional commits and the full PR template. Prefer small PRs and do not add bot or AI attribution footers.
 10. Declare stacked work with `Depends on #...` and replacement work with `Supersedes #...`.
 
