@@ -9,6 +9,7 @@ pub enum WebSearchProviderRoute {
     AnySearch,
     Serply,
     Keenable,
+    Kagi,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -50,6 +51,10 @@ const BOCHA_PROVIDER: &str = "bocha";
 const ANYSEARCH_PROVIDER: &str = "anysearch";
 const SERPLY_PROVIDER: &str = "serply";
 const KEENABLE_PROVIDER: &str = "keenable";
+/// Kagi has no spelling aliases: config validation checks
+/// `search_provider = "kagi"` exactly (case-insensitive) when a Kagi key is
+/// set, and must agree with this resolver.
+const KAGI_PROVIDER: &str = "kagi";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -103,6 +108,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
         "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Keenable,
             canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
+        "kagi" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Kagi,
+            canonical_provider: KAGI_PROVIDER,
             used_fallback: false,
         },
         // Warns for unknown model_providers, falls back to default.
@@ -227,6 +237,19 @@ mod tests {
             assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
             assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
             assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_kagi_has_one_spelling() {
+        for spelling in ["kagi", " Kagi ", "KAGI"] {
+            let resolved = resolve_web_search_provider(spelling);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Kagi);
+            assert_eq!(resolved.canonical_provider, KAGI_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+        for near_miss in ["kagi-search", "kagii", "kagi.com"] {
+            assert!(resolve_web_search_provider(near_miss).used_fallback);
         }
     }
 

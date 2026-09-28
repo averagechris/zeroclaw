@@ -14,7 +14,9 @@ configuration and its secret manager, outside this repository.
 > as `channels.telegram.<alias>.routes`; see
 > [Telegram](../../book/src/channels/telegram.md#route-one-bot-to-several-agents).
 > The Kagi provider ([Kagi feature and cost
-> settings](issues/17-kagi-feature-and-cost-settings.md)) and the
+> settings](issues/17-kagi-feature-and-cost-settings.md)) exists as
+> `web_search.search_provider = "kagi"` with `web_search.kagi_api_key`; see
+> [Tools](../../book/src/tools/overview.md#kagi-provider). The
 > `bindPaths`/`extraPackages` module options do not exist yet; config shown
 > for them is **proposed**. Update this file when they land, and check every
 > field name against `crates/zeroclaw-config/src/schema.rs` before use.
@@ -269,20 +271,26 @@ start until it passes.
 
 **Stage 2: Kagi.** Add `KAGI_API_KEY` to the environment file. Add
 `web_search_tool` to every profile's `allowed_tools` and `auto_approve`.
-Configure the provider (proposed fork fields):
+Configure the provider:
 
 ```nix
 settings.web_search = {
   enabled = true;
   search_provider = "kagi";
   kagi_api_key = "$KAGI_API_KEY";
-  # DuckDuckGo fallback: offered by the agent only after Kagi fails,
-  # and used only after the person says yes.
+  # No fallback setting: after a Kagi failure the agent may offer
+  # DuckDuckGo and uses it only after the person says yes.
 };
 ```
 
-A misspelled provider or a missing key must stop the daemon at startup.
-If it starts and silently uses DuckDuckGo, the fork change is broken.
+The daemon does not stop on config validation errors; it logs them at
+startup (`config has validation errors`). Check the journal after the
+switch. A misspelled provider with the key set logs
+`web_search_tool withheld`, and the agents have no search at all. A missing
+or empty key (for example `KAGI_API_KEY` absent from the environment file)
+leaves searches failing with `Kagi API key not configured`. Neither case
+searches DuckDuckGo. If a search reports `(via DuckDuckGo)` without anyone
+having agreed to the fallback, the fork change is broken.
 
 **Stage 3: owner shell.** Only after stage 1's isolation proof passes. Add
 `shell` to the owner profile's `allowed_tools`. Unrestricted shell also

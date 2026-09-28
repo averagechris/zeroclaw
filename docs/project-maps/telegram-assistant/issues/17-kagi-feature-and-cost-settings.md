@@ -52,8 +52,13 @@ conversational check, not a formal approval prompt:
   accepts that; it is a preference about search quality, not a security
   boundary. In the group either member may say yes.
 
-The fallback's config field and parameter names are proposed fork additions,
-not current schema.
+As implemented, the parameter is `use_duckduckgo_fallback`, advertised only
+while Kagi is the configured provider. No config field was added: nothing
+needs to turn the fallback off, and the parameter is inert for every other
+provider. ZeroClaw boots with config validation errors as warnings, so
+"fails at startup" means a logged validation error, and a Kagi key paired
+with another provider withholds `web_search_tool` instead of searching
+DuckDuckGo. See [Tools](../../../book/src/tools/overview.md#kagi-provider).
 
 ## Artifacts
 

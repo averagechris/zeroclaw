@@ -1,5 +1,6 @@
 use super::web_search_provider_routing::{
-    SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
+    DEFAULT_WEB_SEARCH_PROVIDER, SearchStatus, WebSearchProviderResolution, WebSearchProviderRoute,
+    resolve_web_search_provider,
 };
 use crate::helpers::response_body;
 use crate::util_helpers::truncate_with_ellipsis;
@@ -165,6 +166,10 @@ pub struct WebSearchTool {
     /// override is active; an inner `None` (blank override) means "not
     /// configured" and must not fall back to the on-disk key.
     serply_api_key_override: Option<Option<String>>,
+    /// Effective Kagi credential when `ZEROCLAW_web_search__kagi_api_key` was
+    /// applied by the config loader. Same shape and meaning as
+    /// `serply_api_key_override`.
+    kagi_api_key_override: Option<Option<String>>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -198,6 +203,7 @@ impl WebSearchTool {
             boot_jina_api_key: jina_api_key,
             anysearch_api_key_override: None,
             serply_api_key_override: None,
+            kagi_api_key_override: None,
             searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -252,6 +258,7 @@ impl WebSearchTool {
             boot_jina_api_key: jina_api_key,
             anysearch_api_key_override: None,
             serply_api_key_override: None,
+            kagi_api_key_override: None,
             searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -300,6 +307,13 @@ impl WebSearchTool {
     pub fn with_serply_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
         self.serply_api_key_override =
             override_key.map(|key| key.filter(|value| !value.is_empty()));
+        self
+    }
+
+    /// Record the schema-mirror env override state for the Kagi key. Same
+    /// contract as [`Self::with_serply_api_key_override`].
+    pub fn with_kagi_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
+        self.kagi_api_key_override = override_key.map(|key| key.filter(|value| !value.is_empty()));
         self
     }
 
@@ -1397,6 +1411,217 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "Serply"), blocks))
     }
 
+    /// Build the "not configured" error for the Kagi key, logging which
+    /// lookup produced it (`env_override` or `config`). This is a
+    /// configuration error, so it carries no DuckDuckGo fallback offer.
+    fn kagi_api_key_not_configured(source: &'static str) -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"search_provider": "kagi", "source": source})),
+            "web_search: Kagi API key not configured"
+        );
+        anyhow::Error::msg(
+            "Kagi API key not configured. Set [web_search] kagi_api_key in config.toml \
+             (or ZEROCLAW_web_search__kagi_api_key). Obtain one at https://kagi.com/api/keys",
+        )
+    }
+
+    /// Resolve `[web_search] kagi_api_key` at use time, like Serply: an active
+    /// env override wins outright; otherwise `config.toml` is reread and the
+    /// value decrypted, so rotation and removal take effect without a restart.
+    fn resolve_kagi_api_key(&self) -> anyhow::Result<String> {
+        if let Some(override_key) = &self.kagi_api_key_override {
+            return override_key
+                .clone()
+                .ok_or_else(|| Self::kagi_api_key_not_configured("env_override"));
+        }
+
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "kagi",
+                        "error": format!("{}", e),
+                    })),
+                "web_search: failed to read config for Kagi API key"
+            );
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for Kagi API key: {e}",
+                self.config_path.display()
+            ))
+        })?;
+
+        // The TOML parser's message quotes the offending line, which can be
+        // the credential itself, so only the derived line number survives.
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let line = toml_error_line(&contents, &e);
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config_path.display().to_string(),
+                        "search_provider": "kagi",
+                        "line": line,
+                    })),
+                "web_search: failed to parse config for Kagi API key"
+            );
+            let at = line
+                .map(|line| format!(" at line {line}"))
+                .unwrap_or_default();
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {}{at} for Kagi API key",
+                self.config_path.display()
+            ))
+        })?;
+
+        let raw_key = config
+            .web_search
+            .kagi_api_key
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| Self::kagi_api_key_not_configured("config"))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Kagi API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_kagi(&self, query: &str) -> anyhow::Result<String> {
+        self.search_kagi_at(KAGI_SEARCH_URL, query).await
+    }
+
+    async fn search_kagi_at(&self, url: &str, query: &str) -> anyhow::Result<String> {
+        // A missing key is a configuration error and is reported without the
+        // fallback offer. Only failures of the call itself carry it.
+        let api_key = self.resolve_kagi_api_key()?;
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+        self.search_kagi_with_client(&client, url, &api_key, query)
+            .await
+            .map_err(kagi_runtime_failure)
+    }
+
+    async fn search_kagi_with_client(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        api_key: &str,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        // Plain web search only: no lens, no other workflow, and no
+        // `extract`, which Kagi bills separately. Safe search is always on
+        // because a shared household chat can reach this tool.
+        let response = client
+            .post(url)
+            .bearer_auth(api_key)
+            .header("User-Agent", KAGI_USER_AGENT)
+            .header("Accept", "application/json")
+            .json(&json!({
+                "query": query,
+                "workflow": "search",
+                "limit": self.max_results,
+                "safe_search": true,
+            }))
+            .send()
+            .await
+            .map_err(|err| transport_search_failure("kagi", "request", &err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("kagi", status));
+        }
+
+        let body = response_body::read_bounded(response, Some(KAGI_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("kagi", "response", err),
+                None => bounded_body_search_failure("kagi", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("kagi", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("kagi", "decode"))?;
+        self.parse_kagi_results(&json, query)
+    }
+
+    fn parse_kagi_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        let data = json
+            .get("data")
+            .and_then(|d| d.as_object())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"search_provider": "kagi"})),
+                    "web_search: invalid Kagi response"
+                );
+                anyhow::Error::msg("Invalid Kagi API response")
+            })?;
+        let results = data
+            .get("search")
+            .and_then(|r| r.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks: Vec<Vec<String>> = Vec::new();
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let snippet = result.get("snippet").and_then(|d| d.as_str()).unwrap_or("");
+            let time = result.get("time").and_then(|t| t.as_str()).unwrap_or("");
+
+            let mut block = vec![format!("{}. {}", i + 1, title), format!("   {}", url)];
+            if !snippet.is_empty() {
+                block.push(format!("   {}", cap_result_content(snippet)));
+            }
+            if !time.is_empty() {
+                block.push(format!("   Date: {}", cap_query_echo(time)));
+            }
+            blocks.push(block);
+        }
+
+        Ok(render_results(results_header(query, "Kagi"), blocks))
+    }
+
+    /// The route for one call: the configured provider, or DuckDuckGo when
+    /// Kagi is configured and the caller set the fallback parameter. Every
+    /// other provider ignores the parameter.
+    fn route_for_call(&self, args: &serde_json::Value) -> WebSearchProviderResolution {
+        let resolution = resolve_web_search_provider(&self.model_provider);
+        let fallback_requested = args
+            .get(KAGI_FALLBACK_PARAM)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if resolution.route == WebSearchProviderRoute::Kagi && fallback_requested {
+            return resolve_web_search_provider(DEFAULT_WEB_SEARCH_PROVIDER);
+        }
+        resolution
+    }
+
     /// Resolve the optional Keenable API key from `[web_search] keenable_api_key`.
     ///
     /// Like Bocha, there is no boot-time snapshot: the config field is the
@@ -1818,6 +2043,26 @@ impl WebSearchTool {
 
 /// Keenable API origin. The search path is chosen per request by
 /// `search_keenable_with_client` depending on whether a key is configured.
+const KAGI_SEARCH_URL: &str = "https://kagi.com/api/v1/search";
+const KAGI_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
+const KAGI_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Tool parameter that sends one call to DuckDuckGo while Kagi is the
+/// configured provider. Advertised only when Kagi is configured.
+const KAGI_FALLBACK_PARAM: &str = "use_duckduckgo_fallback";
+
+/// Appended to every Kagi call failure so the agent can offer DuckDuckGo.
+/// The owner's rule is conversational, not a formal approval: ask first, and
+/// use the fallback only after the person agrees.
+const KAGI_FALLBACK_OFFER: &str = "Kagi search is not working right now. You may ask the person \
+     whether it is okay to search with DuckDuckGo instead. Only if they agree in this \
+     conversation, call web_search_tool again with use_duckduckgo_fallback set to true.";
+
+/// Wrap a Kagi call failure with the DuckDuckGo fallback offer.
+fn kagi_runtime_failure(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::msg(format!("{err} {KAGI_FALLBACK_OFFER}"))
+}
+
 const KEENABLE_API_BASE_URL: &str = "https://api.keenable.ai";
 /// Keyed search endpoint (`X-API-Key` header).
 const KEENABLE_SEARCH_PATH: &str = "/v1/search";
@@ -2278,7 +2523,7 @@ impl Tool for WebSearchTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "query": {
@@ -2287,7 +2532,14 @@ impl Tool for WebSearchTool {
                 }
             },
             "required": ["query"]
-        })
+        });
+        if resolve_web_search_provider(&self.model_provider).route == WebSearchProviderRoute::Kagi {
+            schema["properties"][KAGI_FALLBACK_PARAM] = json!({
+                "type": "boolean",
+                "description": "Search with DuckDuckGo instead of Kagi. Only set this after a Kagi search failed and the person in this conversation agreed to use DuckDuckGo."
+            });
+        }
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2312,7 +2564,18 @@ impl Tool for WebSearchTool {
             &format!("Searching web for: {}", query)
         );
 
-        let resolution = resolve_web_search_provider(&self.model_provider);
+        let resolution = self.route_for_call(&args);
+        if resolution.route == WebSearchProviderRoute::DuckDuckGo
+            && resolve_web_search_provider(&self.model_provider).route
+                == WebSearchProviderRoute::Kagi
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"search_provider": "duckduckgo", "configured_provider": "kagi"})),
+                "web_search: using the DuckDuckGo fallback the agent requested after Kagi failed"
+            );
+        }
         if resolution.used_fallback {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2335,6 +2598,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
+            WebSearchProviderRoute::Kagi => self.search_kagi(query).await?,
         };
 
         Ok(ToolResult {
@@ -3095,6 +3359,7 @@ mod tests {
             boot_jina_api_key: None,
             anysearch_api_key_override: None,
             serply_api_key_override: None,
+            kagi_api_key_override: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
             max_results: 5,
             timeout_secs: 15,
@@ -6230,6 +6495,247 @@ mod tests {
         assert!(!query_string.contains("serply-test-key"));
         assert!(!query_string.contains("api_key"));
         assert!(recorded[0].body.is_empty());
+    }
+
+    fn kagi_tool(config_path: PathBuf) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            "kagi".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            false,
+        )
+    }
+
+    fn kagi_tool_with_key(api_key: &str) -> (tempfile::TempDir, WebSearchTool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nsearch_provider = \"kagi\"\nkagi_api_key = \"{api_key}\"\n"),
+        )
+        .unwrap();
+        let tool = kagi_tool(config_path);
+        (tmp, tool)
+    }
+
+    #[tokio::test]
+    async fn kagi_request_is_plain_safe_search_with_bearer_key() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .and(header("authorization", "Bearer kagi-test-key"))
+            .and(header("user-agent", KAGI_USER_AGENT))
+            .and(body_json(serde_json::json!({
+                "query": "what is rust",
+                "workflow": "search",
+                "limit": 5,
+                "safe_search": true,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"trace": "t-1", "ms": 120},
+                "data": {
+                    "search": [
+                        {
+                            "url": "https://www.rust-lang.org/",
+                            "title": "Rust Programming Language",
+                            "snippet": "A language empowering everyone.",
+                            "time": "2026-09-01T00:00:00Z",
+                            "image": {"url": "https://example.com/i.png"},
+                            "props": {"rank": 1}
+                        },
+                        {"url": "https://doc.rust-lang.org/book/", "title": "The Book"}
+                    ],
+                    "related_search": [{"props": {"query": "rust tutorial"}}]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        let result = tool
+            .search_kagi_at(&format!("{}/api/v1/search", server.uri()), "what is rust")
+            .await
+            .expect("mocked Kagi search succeeds");
+        assert_eq!(
+            result,
+            "Search results for: what is rust (via Kagi)\n\
+             1. Rust Programming Language\n   https://www.rust-lang.org/\n   \
+             A language empowering everyone.\n   Date: 2026-09-01T00:00:00Z\n\
+             2. The Book\n   https://doc.rust-lang.org/book/"
+        );
+
+        // The key travels only in the Authorization header.
+        let recorded = server.received_requests().await.unwrap();
+        assert!(!recorded[0].url.as_str().contains("kagi-test-key"));
+        assert!(!String::from_utf8_lossy(&recorded[0].body).contains("kagi-test-key"));
+    }
+
+    #[test]
+    fn kagi_parser_handles_empty_and_invalid_responses() {
+        let tool = WebSearchTool::new("kagi".to_string(), None, None, 5, 15);
+        let empty = tool
+            .parse_kagi_results(&serde_json::json!({"data": {"search": []}}), "q")
+            .unwrap();
+        assert!(empty.contains("No results found"), "{empty}");
+        let other_types_only = tool
+            .parse_kagi_results(&serde_json::json!({"data": {"news": [{"url": "x"}]}}), "q")
+            .unwrap();
+        assert!(other_types_only.contains("No results found"));
+        // The 400 shape: `data` is null or an empty array, `error` explains.
+        for invalid in [
+            serde_json::json!({"data": null, "error": [{"code": "search.bad"}]}),
+            serde_json::json!({"data": [], "error": [{"code": "search.bad"}]}),
+        ] {
+            let err = tool.parse_kagi_results(&invalid, "q").unwrap_err();
+            assert!(err.to_string().contains("Invalid Kagi API response"));
+        }
+    }
+
+    #[tokio::test]
+    async fn kagi_call_failures_offer_duckduckgo_but_config_errors_do_not() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let url = format!("{}/api/v1/search", server.uri());
+
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        let err = tool
+            .search_kagi_at(&url, "rust")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kagi search failed"), "{err}");
+        assert!(err.contains("search_status=unavailable"), "{err}");
+        assert!(err.contains("use_duckduckgo_fallback"), "{err}");
+
+        // A missing key fails before any request and offers no fallback.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\nsearch_provider = \"kagi\"\n").unwrap();
+        let before = server.received_requests().await.unwrap().len();
+        let err = kagi_tool(config_path)
+            .search_kagi_at(&url, "rust")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Kagi API key not configured"), "{err}");
+        assert!(!err.contains("use_duckduckgo_fallback"), "{err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+    }
+
+    #[test]
+    fn kagi_fallback_parameter_is_kagi_only_and_explicit() {
+        let kagi = WebSearchTool::new("kagi".to_string(), None, None, 5, 15);
+        let schema = kagi.parameters_schema();
+        assert_eq!(
+            schema["properties"][KAGI_FALLBACK_PARAM]["type"],
+            serde_json::json!("boolean")
+        );
+        assert_eq!(schema["required"], serde_json::json!(["query"]));
+        let route =
+            |tool: &WebSearchTool, args: serde_json::Value| tool.route_for_call(&args).route;
+        assert_eq!(
+            route(&kagi, json!({"query": "q"})),
+            WebSearchProviderRoute::Kagi
+        );
+        assert_eq!(
+            route(&kagi, json!({"query": "q", KAGI_FALLBACK_PARAM: false})),
+            WebSearchProviderRoute::Kagi
+        );
+        assert_eq!(
+            route(&kagi, json!({"query": "q", KAGI_FALLBACK_PARAM: "true"})),
+            WebSearchProviderRoute::Kagi,
+            "only a JSON boolean selects the fallback"
+        );
+        assert_eq!(
+            route(&kagi, json!({"query": "q", KAGI_FALLBACK_PARAM: true})),
+            WebSearchProviderRoute::DuckDuckGo
+        );
+
+        // Other providers neither advertise nor honour it.
+        let serply = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        assert!(
+            serply.parameters_schema()["properties"]
+                .get(KAGI_FALLBACK_PARAM)
+                .is_none()
+        );
+        assert_eq!(
+            route(&serply, json!({"query": "q", KAGI_FALLBACK_PARAM: true})),
+            WebSearchProviderRoute::Serply
+        );
+    }
+
+    #[test]
+    fn kagi_api_key_resolves_from_config_encrypted_and_env_override() {
+        let (_tmp, tool) = kagi_tool_with_key("disk-key");
+        assert_eq!(tool.resolve_kagi_api_key().unwrap(), "disk-key");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("kagi-secret").unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nkagi_api_key = \"{encrypted}\"\n"),
+        )
+        .unwrap();
+        let tool = WebSearchTool::new_with_config(
+            "kagi".to_string(),
+            None,
+            None,
+            None,
+            None,
+            5,
+            15,
+            config_path.clone(),
+            true,
+        );
+        assert_eq!(tool.resolve_kagi_api_key().unwrap(), "kagi-secret");
+
+        let tool = tool.with_kagi_api_key_override(Some(Some("env-key".to_string())));
+        assert_eq!(tool.resolve_kagi_api_key().unwrap(), "env-key");
+        for blank in [None, Some(String::new())] {
+            let tool = kagi_tool(config_path.clone()).with_kagi_api_key_override(Some(blank));
+            let err = tool.resolve_kagi_api_key().unwrap_err().to_string();
+            assert!(err.contains("Kagi API key not configured"), "{err}");
+        }
+
+        // Blank on disk is not configured.
+        std::fs::write(&config_path, "[web_search]\nkagi_api_key = \"  \"\n").unwrap();
+        assert!(kagi_tool(config_path).resolve_kagi_api_key().is_err());
+    }
+
+    #[test]
+    fn kagi_config_parse_error_does_not_quote_the_credential() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nkagi_api_key = \"leaky-kagi-secret\" trailing\n",
+        )
+        .unwrap();
+        let err = kagi_tool(config_path)
+            .resolve_kagi_api_key()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Failed to parse config file"), "{err}");
+        assert!(err.contains("at line 2"), "{err}");
+        assert!(!err.contains("leaky-kagi-secret"), "{err}");
     }
 
     #[test]

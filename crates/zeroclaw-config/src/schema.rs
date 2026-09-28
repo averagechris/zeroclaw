@@ -4983,6 +4983,39 @@ impl Config {
         Some(table)
     }
 
+    /// Kagi misconfiguration must not become a silent DuckDuckGo search:
+    /// `search_provider = "kagi"` needs a key, and a Kagi key needs
+    /// `search_provider = "kagi"`, so a misspelled provider is caught. The
+    /// spelling matches `resolve_web_search_provider`, which accepts no Kagi
+    /// aliases.
+    fn validate_web_search_kagi(&self) -> Result<()> {
+        let web_search = &self.web_search;
+        if !web_search.enabled {
+            return Ok(());
+        }
+        let provider = web_search.search_provider.trim();
+        let wants_kagi = provider.eq_ignore_ascii_case("kagi");
+        let has_key = web_search
+            .kagi_api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        if wants_kagi && !has_key {
+            validation_bail!(
+                RequiredFieldEmpty,
+                "web_search.kagi_api_key",
+                "web_search.search_provider is \"kagi\" but web_search.kagi_api_key is empty"
+            );
+        }
+        if has_key && !wants_kagi {
+            validation_bail!(
+                ValidationFailed,
+                "web_search.search_provider",
+                "web_search.kagi_api_key is set, so web_search.search_provider must be \"kagi\" (found {provider:?})"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate `channels.telegram.<alias>.routes`. The table must be
     /// non-empty, use canonical nonzero numeric IDs, name enabled agents, be
     /// the alias's only binding, and never send a group to an agent that also
@@ -9027,7 +9060,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>), or "kagi" (requires API key; plain search with safe search on)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -9072,6 +9105,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub keenable_api_key: Option<String>,
+    /// Kagi Search API key (required if search_provider is `"kagi"`). Obtain at <https://kagi.com/api/keys>. When set, `search_provider` must be `"kagi"`, so a misspelled provider cannot silently fall back to DuckDuckGo.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub kagi_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -9107,6 +9146,7 @@ impl Default for WebSearchConfig {
             anysearch_api_key: None,
             serply_api_key: None,
             keenable_api_key: None,
+            kagi_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -24755,6 +24795,8 @@ impl Config {
             }
         }
 
+        self.validate_web_search_kagi()?;
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
@@ -31120,6 +31162,47 @@ api_base_url = "http://127.0.0.1:8081"
             ("-1004", "household"),
         ]);
         config.validate().expect("no DM/group sharing");
+    }
+
+    #[test]
+    async fn validate_kagi_needs_a_key_and_a_key_needs_kagi() {
+        let with = |provider: &str, key: Option<&str>| {
+            let mut config = Config::default();
+            config.web_search.search_provider = provider.to_string();
+            config.web_search.kagi_api_key = key.map(str::to_string);
+            config.validate()
+        };
+        with("kagi", Some("key")).expect("kagi with a key is valid");
+        with(" KAGI ", Some("key")).expect("provider spelling is case-insensitive");
+        with("duckduckgo", None).expect("no Kagi config is unaffected");
+
+        for key in [None, Some(""), Some("   ")] {
+            let err = with("kagi", key)
+                .expect_err("kagi without a key")
+                .to_string();
+            assert!(
+                err.contains("web_search.kagi_api_key is empty"),
+                "{key:?}: {err}"
+            );
+        }
+        for provider in ["kagii", "kagi-search", "duckduckgo", "brave"] {
+            let err = with(provider, Some("key"))
+                .expect_err("a Kagi key with another provider")
+                .to_string();
+            assert!(
+                err.contains("web_search.search_provider must be \"kagi\""),
+                "{provider}: {err}"
+            );
+        }
+
+        // A disabled web search is not checked.
+        let mut config = Config::default();
+        config.web_search.enabled = false;
+        config.web_search.search_provider = "kagii".into();
+        config.web_search.kagi_api_key = Some("key".into());
+        config
+            .validate()
+            .expect("disabled web search is not validated");
     }
 
     #[test]

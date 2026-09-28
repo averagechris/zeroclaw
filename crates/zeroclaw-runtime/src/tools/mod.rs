@@ -238,6 +238,44 @@ fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
         .then(|| root_config.web_search.serply_api_key.clone())
 }
 
+/// Kagi credential override state for `WebSearchTool`, with the same
+/// contract as [`serply_api_key_override`].
+fn kagi_api_key_override(root_config: &Config) -> Option<Option<String>> {
+    root_config
+        .prop_is_env_overridden("web_search.kagi_api_key")
+        .then(|| root_config.web_search.kagi_api_key.clone())
+}
+
+/// A Kagi key with a `search_provider` that does not resolve to Kagi is a
+/// misspelled or stale provider. The resolver would silently search with
+/// DuckDuckGo, and config validation only warns at boot, so the tool is
+/// withheld instead: searches fail visibly until the config is fixed.
+fn kagi_provider_mismatch(root_config: &Config) -> bool {
+    let web_search = &root_config.web_search;
+    let has_kagi_key = web_search
+        .kagi_api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let routes_to_kagi = zeroclaw_tools::web_search_provider_routing::resolve_web_search_provider(
+        &web_search.search_provider,
+    )
+    .route
+        == zeroclaw_tools::web_search_provider_routing::WebSearchProviderRoute::Kagi;
+    let mismatch = has_kagi_key && !routes_to_kagi;
+    if mismatch {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "search_provider": web_search.search_provider,
+                })),
+            "web_search_tool withheld: web_search.kagi_api_key is set but search_provider is not \"kagi\""
+        );
+    }
+    mismatch
+}
+
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
     root_config.claude_code.enabled
         || root_config.codex_cli.enabled
@@ -1533,7 +1571,7 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Web search tool (enabled by default for GLM and other models)
-    if root_config.web_search.enabled {
+    if root_config.web_search.enabled && !kagi_provider_mismatch(root_config) {
         // Rate-limited like every other outbound-network tool (see web_fetch
         // and http_request above): without the wrapper an agent loop could
         // issue unbounded searches against the configured provider — and
@@ -1556,6 +1594,7 @@ fn all_tools_with_runtime_on_thread(
                 root_config.secrets.encrypt,
             )
             .with_serply_api_key_override(serply_api_key_override(root_config))
+            .with_kagi_api_key_override(kagi_api_key_override(root_config))
             // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
             // memory only. Without handing it over, the tool would reread
             // `config.toml` and miss an env-only key, or send a stored key
@@ -3369,6 +3408,78 @@ permissions = ["http_client"]
         assert!(
             error.contains("Rate limit exceeded"),
             "web_search_tool is not wrapped in RateLimitedTool; got: {error}"
+        );
+    }
+
+    /// A Kagi key with a provider that does not resolve to Kagi (a typo such
+    /// as "kagii") would otherwise search DuckDuckGo silently. The tool is
+    /// withheld instead; with the provider spelled right it is registered.
+    #[test]
+    fn web_search_tool_is_withheld_when_kagi_key_meets_another_provider() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let names_for = |provider: &str| -> Vec<String> {
+            let mut cfg = test_config(&tmp);
+            cfg.web_search.enabled = true;
+            cfg.web_search.search_provider = provider.to_string();
+            cfg.web_search.kagi_api_key = Some("kagi-key".to_string());
+            let mem: Arc<dyn Memory> =
+                Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+            all_tools(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                mem,
+                None,
+                None,
+                &browser,
+                &http,
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+            )
+            .expect("tool registry builds")
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect()
+        };
+
+        for mismatched in ["kagii", "duckduckgo", "brave"] {
+            assert!(
+                !names_for(mismatched).contains(&"web_search_tool".to_string()),
+                "{mismatched}: tool must be withheld"
+            );
+        }
+        assert!(names_for("kagi").contains(&"web_search_tool".to_string()));
+    }
+
+    #[test]
+    fn kagi_api_key_override_mirrors_env_override_state() {
+        let mut cfg = Config::default();
+        cfg.web_search.kagi_api_key = Some("stored-key".to_string());
+        assert_eq!(kagi_api_key_override(&cfg), None);
+        cfg.set_prop("web_search.kagi_api_key", "env-key").unwrap();
+        cfg.env_overridden_paths
+            .insert("web_search.kagi_api_key".to_string());
+        assert_eq!(
+            kagi_api_key_override(&cfg),
+            Some(Some("env-key".to_string()))
         );
     }
 
