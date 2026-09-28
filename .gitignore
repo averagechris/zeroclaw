@@ -60,6 +60,7 @@ docker-compose.override.yml
 
 # Environment files (may contain secrets)
 .env
+/.direnv/
 
 # Python virtual environments
 

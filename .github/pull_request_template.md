@@ -1,6 +1,6 @@
 ## Summary
 
-- **Base branch:** `master` (all contributions)
+- **Base branch:** `main` (all contributions)
 - **What changed and why:** (2 to 5 bullets; the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
@@ -21,14 +21,14 @@ Explain the change for someone unfamiliar with this part of ZeroClaw: what it is
 
 Include this subsection when reviewer-run manual verification adds useful signal, especially for user-visible behavior, a non-obvious test path, or a named CI coverage gap. For changes without useful manual verification, including docs-only, pure-refactor, or trivial changes, set the first field to `N/A` with a one-line reason and remove the remaining prompts.
 
-When reviewer testing is requested, frame it A/B: the same steps should show the old behavior on `master` and the new behavior on this branch, so the reviewer can see the delta themselves.
+When reviewer testing is requested, frame it A/B: the same steps should show the old behavior on `main` and the new behavior on this branch, so the reviewer can see the delta themselves.
 
 - **Reviewer testing requested?** (`Yes` / `N/A`; if `N/A`, one line why)
 - **Interface(s) exercised:** Name the surface(s) this touches using the same vocabulary the attribution span records: `surface` (`web` / `tui` / `cli`) and `channel` for messaging surfaces. Match the live attribution values; do not invent interface names.
 - **Setup / preconditions:** (config, provider, channel, or state needed first)
 - **Steps to run:** (the exact click-through or command sequence)
 - **Expected on this branch (after):** (what the reviewer should observe if it works)
-- **Prior behavior on `master` (before):** (run the same steps unpatched; what breaks or is missing, so the fix is visible)
+- **Prior behavior on `main` (before):** (run the same steps unpatched; what breaks or is missing, so the fix is visible)
 
 ### How I tested
 

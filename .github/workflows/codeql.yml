@@ -14,7 +14,7 @@ name: CodeQL
 # keeps it from rendering as a permanently skipped check on every PR.
 #
 # Triggers:
-#   push to master     — immediate feedback on merged code
+#   push to main     — immediate feedback on merged code
 #   schedule           — daily catch for new queries (query packs update
 #                        independently of the codebase)
 #   workflow_dispatch  — manual re-run after a config change, or an
@@ -22,13 +22,13 @@ name: CodeQL
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   schedule:
     - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
   workflow_dispatch:
 
 # A scan of a superseded commit has no value: a newer push cancels any
-# in-flight run so the latest master analysis is never queued behind a
+# in-flight run so the latest main analysis is never queued behind a
 # stale or scheduled one (same policy the Rust job had in its old home).
 concurrency:
   group: codeql-${{ github.ref }}

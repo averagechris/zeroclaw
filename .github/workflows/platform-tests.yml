@@ -2,7 +2,7 @@ name: Scheduled Platform Tests
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
     paths:
       - ".github/workflows/platform-tests.yml"
       - "crates/zeroclaw-tools/src/coding_cli.rs"
@@ -69,7 +69,7 @@ jobs:
         with:
           shared-key: platform-test
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep

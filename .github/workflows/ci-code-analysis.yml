@@ -1,15 +1,15 @@
-# Static analysis — fast Semgrep pattern checks on every PR and master push.
+# Static analysis — fast Semgrep pattern checks on every PR and main push.
 #
 # Semgrep: fast pattern scan (injection / path-traversal / unsafe patterns, plus
 #   config-layer surfaces CodeQL does not cover — GitHub Actions YAML, Dockerfiles,
 #   shell, HTML). On PRs it runs diff-aware (--baseline-commit) so only findings the
-#   branch introduces are reported; on master push it does a full scan. Results upload
+#   branch introduces are reported; on main push it does a full scan. Results upload
 #   as SARIF to the GitHub Security tab. Report-only (no --error) — surfaced, never
 #   gating. .semgrepignore suppresses known false-positive surfaces (tests, examples,
 #   docs theme).
 #
 # Deep CodeQL taint analysis (Rust and JS/TS) lives in the sibling codeql.yml
-# (master push + daily schedule + manual dispatch). It is deliberately not
+# (main push + daily schedule + manual dispatch). It is deliberately not
 # PR-triggered — see the rationale there — which also keeps it from rendering
 # as a permanently skipped check on every PR.
 
@@ -17,9 +17,9 @@ name: Code Analysis
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
   push:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           baseline=""
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            # pull_request.base.sha can remain stale as master advances. Derive the
+            # pull_request.base.sha can remain stale as main advances. Derive the
             # actual PR boundary from the checked-out merge commit and current base ref.
             baseline_commit="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
             baseline="--baseline-commit ${baseline_commit}"

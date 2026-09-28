@@ -2,17 +2,17 @@ name: Quality Gate
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
   push:
-    branches: [master]
-  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+    branches: [main]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/main/…` branch
   # and fires `merge_group`. The required `CI Required Gate` must report on that
   # branch or queued PRs stall, so the full gate runs here too.
   merge_group:
 
 concurrency:
   # Merge-queue runs key on the unique queue ref (github.ref →
-  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # `refs/heads/gh-readonly-queue/main/pr-N-<sha>`) so speculative entries
   # never cancel each other; PRs still key on the PR number.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -24,49 +24,21 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
-# ── Runner selection: a checked-in label on each compile-heavy job ──────────
-# The Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test, test-channel-features, memory-postgres-test, msrv, parallel-runtime-test,
-# installer-drift) and the Linux `build` matrix entry name their runner label
-# directly, so runner selection does not wait for fmt. The build matrix still
-# waits for path-changes to select its Windows task-owner recovery tests.
-# `tests/architecture/ci_runner_labels.rs` fails the workspace suite if those
-# labels or their cache-provider inputs drift apart, so moving the fleet stays
-# one reviewed edit even though the constant is written more than once.
+# ── Runner selection: GitHub-hosted for fork compatibility ────────────────
+# Linux jobs use GitHub-hosted Ubuntu runners because this fork has no
+# repository runners and does not install the Blacksmith GitHub App. Compile
+# jobs still name their runner directly so they can start independently of fmt;
+# `tests/architecture/ci_runner_labels.rs` keeps runner and cache selection
+# consistent across the required gate.
 #
-# WHY NOT read the label from a `fmt` output: `runs-on` resolves before a job is
-# created, so every compile job had to declare `needs: [fmt]` and wait for a
-# GitHub-hosted runner to pick up a 24-second formatting check first. On run
-# 34948990064 that put an 8.6-minute hosted queue wait in front of the whole
-# Blacksmith fan-out. `CI Required Gate` still needs `fmt`, so a formatting
-# error still blocks merge; it no longer delays compilation.
+# Compile-heavy jobs previously used 8-vCPU Blacksmith workers. GitHub-hosted
+# runners provide fewer resources, so these jobs may take longer, but retaining
+# every job preserves the required quality signal rather than skipping work or
+# reporting false success.
 #
-# WHY NOT the former `vars.CI_USE_BLACKSMITH` toggle: `vars` is unreadable in
-# fork-origin `pull_request` runs, and 90% of this repo's PRs are fork-origin.
-# The fail-closed expression therefore sent essentially every contributor PR to
-# ubuntu-latest, and handed the same unresolved value to the rust-cache
-# composite, which fell back to a GitHub Actions cache that master — now
-# building on Blacksmith — no longer writes. Fork PRs logged "No cache found."
-# while master logged "full match: true". Canary run 33809504331 confirmed both
-# halves directly: on a fork PR it printed CI_USE_BLACKSMITH='' yet still ran on
-# a blacksmith-8vcpu runner, so Blacksmith serves fork PRs and only the
-# expression was blocking. See #7108.
-#
-# TRADE-OFF, deliberate: no `vars`-based switch can govern fork PRs, so there is
-# no longer a runtime kill switch for that path — rolling back is a one-line
-# commit here rather than flipping a repo variable.
-#
-# UNCHANGED SAFETY PROPERTY: every rust-cache call still passes
-# `save-if: github.ref == 'refs/heads/master'`, so fork PRs remain cache READERS
-# only and cannot poison the cache master seeds.
-#
-# PRECONDITIONS: the Blacksmith GitHub App must stay installed on the org, or
-# these jobs queue with no runner (~24h) instead of failing fast. Blacksmith
-# triggerer SSH must remain DISABLED (Blacksmith → Settings → Features → SSH
-# Access) so a green required check attests only the reviewed commit; the
-# endpoint line in job logs is image-default with no authorized keys installed
-# and is not an exposure.
-
+# Every rust-cache call selects the GitHub-hosted cache provider and saves only
+# on `refs/heads/main`; fork PRs remain cache readers and cannot poison the
+# cache seeded by trusted main runs.
 jobs:
   # ── Required formatting check ────────────────────────────────────────────
   # Ordering note: neither GitHub-hosted nor compile jobs wait on `fmt`.
@@ -81,7 +53,7 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -94,7 +66,7 @@ jobs:
 
   history-guard:
     name: Common Ancestor
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -105,12 +77,12 @@ jobs:
       - name: Reject unrelated PR history
         env:
           HISTORY_CHECK_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: bash scripts/ci/common_ancestor_guard.sh origin/master "$HISTORY_CHECK_SHA"
+        run: bash scripts/ci/common_ancestor_guard.sh origin/main "$HISTORY_CHECK_SHA"
 
   # Guards the approved submodule layout introduced in PR #8516; see the bespoke gate registry in README.md.
   repo-structure:
     name: Repository Structure
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -177,7 +149,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -223,7 +195,7 @@ jobs:
     name: Relay Container Fresh-Volume Smoke
     needs: [relay-container-smoke-changes]
     if: needs.relay-container-smoke-changes.outputs.run == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -244,7 +216,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
     # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
@@ -259,9 +231,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
@@ -294,7 +266,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -347,7 +319,7 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -374,7 +346,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: blacksmith-8vcpu-ubuntu-2404
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -395,9 +367,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: bash scripts/ci/apt_install.sh mold libasound2-dev
@@ -469,7 +441,7 @@ jobs:
 
   check:
     name: Check (${{ matrix.name }})
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
@@ -498,9 +470,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
         if: matrix.sys_deps != ''
         run: bash scripts/ci/apt_install.sh ${{ matrix.sys_deps }}
@@ -511,7 +483,7 @@ jobs:
 
   check-plugin-backends:
     name: Check (${{ matrix.name }})
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -552,11 +524,11 @@ jobs:
       - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           # Keep the new runtime build separate from the existing backend caches.
           shared-key: ${{ matrix.suite == 'runtime' && 'plugins-cranelift-runtime' || '' }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check
         if: steps.changed.outputs.run == 'true' && matrix.suite != 'runtime'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
@@ -600,7 +572,7 @@ jobs:
   msrv:
     name: MSRV (declared floor)
     needs: [installer-drift]
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -623,9 +595,9 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
@@ -641,7 +613,7 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -652,9 +624,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install 32-bit system libraries
         run: bash scripts/ci/apt_install.sh gcc-multilib
       - name: Ensure web/dist placeholder exists
@@ -667,11 +639,11 @@ jobs:
     # Bitrot guard only: compiles `agent_benchmarks` under `agent-runtime`
     # without running it. Zero failures across 22 red runs and no bench-fix
     # commit in 6 months, and its narrow form was introduced by #8896 as a
-    # measurement slice for #7108 rather than as coverage. Master, merge-queue
+    # measurement slice for #7108 rather than as coverage. Main, merge-queue
     # and manual runs still execute it, so benches cannot rot undetected before
     # a release; only the per-PR 570s is dropped. Revert by deleting this `if`.
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -681,9 +653,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Verify benchmarks compile
@@ -725,7 +697,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -736,9 +708,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check firmware protocol crate
         run: ./scripts/ci/firmware_protocol_gate.sh
       - name: Ensure web/dist placeholder exists
@@ -765,7 +737,7 @@ jobs:
   # In particular, Lark runs without defaults and QQ excludes live-auth tests.
   test-channel-features:
     name: Test (channel ${{ matrix.name }})
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -787,10 +759,10 @@ jobs:
           components: rustfmt, clippy
       - uses: ./.github/actions/rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           shared-key: channel-feature-${{ matrix.name }}
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install test system dependencies
@@ -806,7 +778,7 @@ jobs:
 
   memory-postgres-test:
     name: Test (PostgreSQL Memory)
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
       postgres:
@@ -830,9 +802,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -857,7 +829,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       run: ${{ steps.changed.outputs.run }}
@@ -901,7 +873,7 @@ jobs:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -911,10 +883,10 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           shared-key: test
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -939,7 +911,7 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
@@ -956,7 +928,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -967,7 +939,7 @@ jobs:
         id: rust-cache
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-deny
         run: |
           curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
@@ -1006,7 +978,7 @@ jobs:
 
   # Detect non-Rust job families and the Windows recovery probe a PR touches,
   # so unrelated PRs do not pay for them. Cheap and always-on; forces every
-  # family true on push / merge_group so master cache-warming and the required
+  # family true on push / merge_group so main cache-warming and the required
   # gate keep exercising the full set. A path-skipped job leaves `CI Required
   # Gate` green (it only trips on failure/cancelled), and this detector is never
   # skipped, so a job that should run never is.
@@ -1016,7 +988,7 @@ jobs:
     # does not wait on `fmt`. Waiting would serialise its own multi-minute
     # GitHub-hosted queue wait AFTER fmt and push every dependent that far back.
     # See the ordering note above `fmt` for which dependents still wait on it.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
@@ -1038,7 +1010,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Non-PR events (push to master, merge_group) always run every gated
+          # Non-PR events (push to main, merge_group) always run every gated
           # job: warms caches and keeps the required gate exercising the full set.
           case "${{ github.event_name }}" in
             pull_request) ;;
@@ -1081,7 +1053,7 @@ jobs:
     name: Nix Module Eval
     needs: [path-changes]
     if: needs.path-changes.outputs.nix == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1097,7 +1069,7 @@ jobs:
     name: Nix Hash Drift
     needs: [path-changes]
     if: needs.path-changes.outputs.nix_hash == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1110,7 +1082,7 @@ jobs:
     name: Docs Style
     needs: [path-changes]
     if: needs.path-changes.outputs.docs == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1118,7 +1090,7 @@ jobs:
           fetch-depth: 0
       - name: Resolve base SHA
         id: base
-        run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git merge-base origin/main HEAD)" >> "$GITHUB_OUTPUT"
       - name: Docs quality gate (markdown lint + em-dash prose check)
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
@@ -1135,7 +1107,7 @@ jobs:
   # Guards Zerocode's RPC-only dependency boundary established in PR #7850; see the bespoke gate registry in README.md.
   zerocode-rpc-boundary:
     name: Zerocode RPC Boundary
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1145,7 +1117,7 @@ jobs:
         id: changed
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="$(git merge-base origin/master HEAD)"
+            base="$(git merge-base origin/main HEAD)"
             if git diff --name-only "$base" HEAD | grep -q '^apps/zerocode/'; then
               echo "run=true" >> "$GITHUB_OUTPUT"
             else
@@ -1161,7 +1133,7 @@ jobs:
   # Guards generated installation surfaces against canonical-spec drift from PR #7558; see the bespoke gate registry in README.md.
   installer-drift:
     name: Installer Drift
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
@@ -1175,9 +1147,9 @@ jobs:
       - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
-          use-blacksmith: 'true'
+          use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
@@ -1197,7 +1169,7 @@ jobs:
     name: Web Permission Tests
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1208,7 +1180,7 @@ jobs:
         with:
           use-blacksmith: 'false'
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
@@ -1234,7 +1206,7 @@ jobs:
     name: CI Required Gate
     if: always()
     needs: [fmt, history-guard, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, test-channel-features, memory-postgres-test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - name: Check results
         run: |

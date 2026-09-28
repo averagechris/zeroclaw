@@ -4,23 +4,10 @@ Thanks for your interest. Every kind of contribution helps — code, docs, bug r
 
 ---
 
-## ⚠️ Branch Migration Notice (March 2026)
+## Default branch
 
-**`master` is the ONLY default branch. The `main` branch no longer exists.**
-
-If you have an existing fork or local clone that tracks `main`, update it:
-
-```bash
-git checkout master
-git branch -D main 2>/dev/null          # delete local main if it exists
-git remote set-head origin master
-git fetch origin --prune                 # remove stale remote refs
-
-# If your fork still has a main branch, delete it
-git push origin --delete main 2>/dev/null
-```
-
-All PRs target **`master`**. PRs targeting `main` will be rejected.
+This fork uses **`main`** as its default branch. Contributions to this fork
+should target `main`.
 
 ---
 
@@ -28,7 +15,7 @@ All PRs target **`master`**. PRs targeting `main` will be rejected.
 
 1. **Find an issue.** Look for [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) labels — these are scoped for newcomers and include enough context to get moving.
 2. **Pick a small scope.** Typo fixes, doc improvements, test additions, and small bug fixes are the fastest path to a merged PR.
-3. **Fork → branch → change → test → PR.** PRs target `master`. Use `feat/*` or `fix/*` branch names.
+3. **Fork → branch → change → test → PR.** PRs target `main`. Use `feat/*` or `fix/*` branch names.
 4. **Open a draft PR early** if you get stuck and ask questions in the description.
 
 For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**. For non-trivial architecture, workflow, config, security, or agent-assisted changes, use the **[Architecture and contribution map](docs/book/src/contributing/architecture-map.md)** to find the right foundation and architecture context before implementing.

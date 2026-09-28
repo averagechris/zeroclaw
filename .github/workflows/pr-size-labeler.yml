@@ -2,7 +2,7 @@ name: PR Size Labeler
 
 on:
   pull_request_target:
-    branches: [master]
+    branches: [main]
     types: [opened, reopened, synchronize]
 
 permissions:

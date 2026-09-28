@@ -2,14 +2,14 @@
 # transparency. Covers Rust crates (cargo-cyclonedx) and npm packages
 # (npm sbom). Container OS-layer SBOM handled separately by Trivy (Phase 2).
 #
-# On push to master: generate and upload SBOM as a CI artifact.
+# On push to main: generate and upload SBOM as a CI artifact.
 # On schedule: regenerate to catch dependency changes between PRs.
 
 name: SBOM
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   schedule:
     - cron: '17 6 * * *'   # daily at 06:17 UTC
 
@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
       - name: Generate Rust SBOM
@@ -51,7 +51,7 @@ jobs:
           npm sbom --sbom-format cyclonedx > ../sbom/web.cdx.json
 
       - name: Upload SBOM artifact
-        if: github.ref == 'refs/heads/master'
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom
