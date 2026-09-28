@@ -78,6 +78,12 @@ example a shared group or `setfacl`. Document the pattern with the option.
 This belongs with stage 3, before owner shell is enabled; no paths are
 selected yet.
 
+As implemented, both options exist with these names. `bindPaths` is not added
+to `ReadWritePaths=`: systemd documents `BindPaths=` mounts as writable, and
+a `ReadWritePaths=` entry for a target that does not exist yet would fail the
+unit. The eval tests check the rendered unit; the KVM test in `nix/test.nix`
+does not cover the new options yet.
+
 Step-by-step bootstrap, including BotFather, ID collection, secrets, the
 module instance, and the service-user Codex login, is in the [setup
 runbook](../setup.md). The module supports an `environmentFile` for

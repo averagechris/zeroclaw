@@ -103,6 +103,8 @@ instance creates it and the others set `createUser = false`.
 | `environmentFile` | `nullOr path` | `null` | systemd `EnvironmentFile=`. Substituted into `settings` strings at start. |
 | `extraConfig` | `lines` | `""` | Raw TOML appended after rendered `settings` (escape hatch). |
 | `bindReadOnlyPaths` | `attrsOf path` | `{}` | `target → source` map → `BindReadOnlyPaths=`. |
+| `bindPaths` | `attrsOf path` | `{}` | `target → source` map → `BindPaths=` (writable binds; hardening unchanged). |
+| `extraPackages` | `listOf package` | `[]` | Added to the unit's `PATH`, for tools the agent runs. |
 
 If you need to override a `serviceConfig` field (e.g. add `MemoryMax`),
 use the standard NixOS pattern rather than a module-level escape hatch:
@@ -185,6 +187,25 @@ SystemCallFilter=@system-service ~@privileged ~@resources
 UMask=0077
 ReadWritePaths=${dataDir}
 ```
+
+To give the agent's tools reach beyond `dataDir`, grant it explicitly
+rather than relaxing these settings. `bindPaths` adds writable bind mounts,
+`bindReadOnlyPaths` read-only ones, and `extraPackages` puts packages on the
+unit's `PATH`:
+
+```nix
+services.zeroclaw.instances.me = {
+  bindReadOnlyPaths."/var/lib/zeroclaw-me/mnt/notes" = "/srv/notes";
+  bindPaths."/var/lib/zeroclaw-me/mnt/scratch" = "/srv/scratch";
+  extraPackages = [ pkgs.git pkgs.curl pkgs.jq ];
+};
+```
+
+Put targets under `dataDir`: a target must exist or be creatable, and
+`ProtectHome=yes` hides `/home`. The service user still needs ordinary Unix
+access to each source. Under `PrivateUsers=yes`, files owned by other users
+appear as `nobody`, so grant access with a shared group or an ACL such as
+`setfacl -m u:zeroclaw-me:rwX /srv/scratch`.
 
 `MemoryDenyWriteExecute=yes` is safe because ZeroClaw 0.7.x is a plain
 Rust binary with no JIT; if a future version adopts a JIT (e.g. through a

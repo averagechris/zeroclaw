@@ -16,10 +16,11 @@ configuration and its secret manager, outside this repository.
 > The Kagi provider ([Kagi feature and cost
 > settings](issues/17-kagi-feature-and-cost-settings.md)) exists as
 > `web_search.search_provider = "kagi"` with `web_search.kagi_api_key`; see
-> [Tools](../../book/src/tools/overview.md#kagi-provider). The
-> `bindPaths`/`extraPackages` module options do not exist yet; config shown
-> for them is **proposed**. Update this file when they land, and check every
-> field name against `crates/zeroclaw-config/src/schema.rs` before use.
+> [Tools](../../book/src/tools/overview.md#kagi-provider). The module's
+> `bindPaths` and `extraPackages` options exist too; see
+> [nix/README.md](../../../nix/README.md#hardening). Check every field name
+> against `crates/zeroclaw-config/src/schema.rs` and `nix/module.nix` before
+> use.
 
 ## Overview
 
@@ -307,25 +308,23 @@ risk_profiles.owner = {
 
 The unit's systemd hardening stays on by decision. The shell cannot write
 outside `/var/lib/zeroclaw-<name>`, read `/home`, or gain privileges, and it
-has only the unit's default `PATH`. Grant reach explicitly (the read-write
-and package options are proposed module additions; see [Always-on host
-boundary](issues/19-always-on-host-boundary.md)):
+has only the unit's default `PATH`. Grant reach explicitly (see [Always-on
+host boundary](issues/19-always-on-host-boundary.md)):
 
 ```nix
 services.zeroclaw.instances.<name> = {
   # Existing option: read-only binds, target = source.
   bindReadOnlyPaths."/var/lib/zeroclaw-<name>/mnt/notes" = "/path/to/notes";
-  # PROPOSED: read-write binds.
+  # Read-write binds.
   bindPaths."/var/lib/zeroclaw-<name>/mnt/scratch" = "/path/to/scratch";
-  # PROPOSED: tools on the shell's PATH.
+  # Tools on the shell's PATH.
   extraPackages = [ pkgs.git pkgs.curl pkgs.jq ];
 };
 ```
 
 The service user must be able to read, or write, each source directory
 through ordinary permissions, such as a shared group or an ACL. Files owned
-by other users appear as `nobody` inside the sandbox. Until the proposed
-options land, use `systemd.services."zeroclaw-<name>".path` and
-`serviceConfig.BindPaths`. Do not loosen the hardening itself.
+by other users appear as `nobody` inside the sandbox. Do not loosen the
+hardening itself.
 
 Never add `shell` to the partner or household profile.
