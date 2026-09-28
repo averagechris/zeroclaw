@@ -945,6 +945,10 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
+    /// When `true`, inbound photos, documents, albums, and voice are dropped
+    /// before any `getFile` call or write under `workspace_dir`. Set for
+    /// routed aliases, whose `workspace_dir` is shared by every routed agent.
+    text_only: bool,
     passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
@@ -2565,6 +2569,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             per_user_session: true,
+            text_only: false,
             passive_group_context: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
@@ -2641,6 +2646,14 @@ impl TelegramChannel {
     /// Direct messages are always sender-scoped either way.
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
+        self
+    }
+
+    /// Drop inbound attachments and voice before materialization. Routed
+    /// aliases need this because the daemon always sets `workspace_dir`, and
+    /// for a routed alias it is a directory every routed agent shares.
+    pub fn with_text_only(mut self, text_only: bool) -> Self {
+        self.text_only = text_only;
         self
     }
 
@@ -3154,7 +3167,14 @@ impl TelegramChannel {
     }
 
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
-        if config.tts.enabled {
+        // A routed alias has no single owning agent to take a TTS provider
+        // from, and must not borrow the runtime default agent's.
+        let routed = config
+            .channels
+            .telegram
+            .get(&self.alias)
+            .is_some_and(zeroclaw_config::schema::TelegramConfig::is_routed);
+        if config.tts.enabled && !routed {
             let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
             match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
@@ -4379,6 +4399,9 @@ impl TelegramChannel {
         {
             return true;
         }
+        if self.text_only {
+            return false;
+        }
         if self.transcription.is_some()
             && self.transcription_manager.is_some()
             && Self::parse_voice_metadata(message).is_some()
@@ -4802,6 +4825,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message_id: i64,
         disambiguate_document_name: bool,
     ) -> AttachmentMaterialization {
+        if self.text_only {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"channel_alias": self.alias})),
+                "Dropping Telegram attachment: this alias is text-only"
+            );
+            return AttachmentMaterialization::SkipPermanent;
+        }
         if let Some(size) = attachment.file_size
             && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
         {
@@ -5244,6 +5276,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// never received the recording. Transient failures stay silent — the same
     /// update is retried, and a notice per attempt would be spam.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> UpdateDisposition {
+        if self.text_only {
+            return UpdateDisposition::SkipPermanent;
+        }
         let Some(config) = self.transcription.as_ref() else {
             return UpdateDisposition::SkipPermanent;
         };
@@ -5660,7 +5695,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .map(|id| id.to_string())
     }
 
-    fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
+    pub(crate) fn parse_update_message(
+        &self,
+        update: &serde_json::Value,
+    ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
@@ -24018,5 +24056,206 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    fn routed_media_updates() -> Vec<serde_json::Value> {
+        let from = serde_json::json!({ "id": 1001, "username": "owner" });
+        let dm = serde_json::json!({ "id": 1001, "type": "private" });
+        vec![
+            serde_json::json!({ "update_id": 1, "message": {
+                "message_id": 1, "chat": dm, "from": from,
+                "photo": [ { "file_id": "photo_file", "file_size": 20 } ],
+                "caption": "what is this?"
+            }}),
+            serde_json::json!({ "update_id": 2, "message": {
+                "message_id": 2, "chat": dm, "from": from,
+                "document": { "file_id": "doc_file", "file_name": "notes.pdf", "file_size": 20 }
+            }}),
+            serde_json::json!({ "update_id": 3, "message": {
+                "message_id": 3, "chat": dm, "from": from,
+                "voice": { "file_id": "voice_file", "duration": 4 }
+            }}),
+        ]
+    }
+
+    /// A routed alias is text-only: an authorized photo, document, voice note,
+    /// or album is dropped before `getFile`, and nothing is written under the
+    /// shared channel workspace. The same photo on an ordinary alias does call
+    /// `getFile`, so the mock would have seen the request.
+    #[tokio::test]
+    async fn text_only_alias_drops_media_before_get_file_or_workspace_write() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/.*$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tiny_jpeg()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/audio/transcriptions$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "hi" })),
+            )
+            .mount(&mock_server)
+            .await;
+        let transcription = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let routed = TelegramChannel::new(
+            "fake-token".into(),
+            "home",
+            Arc::new(|| vec!["1001".into(), "1002".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription(transcription)
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_text_only(true);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let mut transient_retry = None;
+        for update in routed_media_updates() {
+            let outcome = routed
+                .process_update(&update, &tx, &mut transient_retry)
+                .await;
+            assert!(matches!(outcome, UpdateOutcome::Advanced), "{update}");
+        }
+        let album: Vec<serde_json::Value> = (10..12)
+            .map(|id| {
+                serde_json::json!({ "update_id": id, "message": {
+                    "message_id": id, "media_group_id": "album-1",
+                    "chat": { "id": -1003, "type": "supergroup" },
+                    "from": { "id": 1002, "username": "partner" },
+                    "photo": [ { "file_id": format!("album_{id}"), "file_size": 20 } ]
+                }})
+            })
+            .collect();
+        assert!(matches!(
+            routed
+                .try_parse_media_group_with_unsupported(&album, &[])
+                .await,
+            UpdateDisposition::SkipPermanent
+        ));
+
+        assert!(rx.try_recv().is_err(), "no media message may be dispatched");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "text-only alias must not call getFile, download, or transcribe: {:?}",
+            requests
+                .iter()
+                .map(|r| r.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            0,
+            "text-only alias must not write into the channel workspace"
+        );
+
+        // Text on the same alias still flows.
+        let text = serde_json::json!({ "update_id": 20, "message": {
+            "message_id": 20,
+            "chat": { "id": 1001, "type": "private" },
+            "from": { "id": 1001, "username": "owner" },
+            "text": "hello"
+        }});
+        routed
+            .process_update(&text, &tx, &mut transient_retry)
+            .await;
+        let delivered = rx.try_recv().expect("text message is delivered");
+        assert_eq!(delivered.content, "hello");
+        assert_eq!(delivered.reply_target, "1001");
+        assert_eq!(delivered.platform_sender_id.as_deref(), Some("1001"));
+
+        // Control: an ordinary alias downloads the same photo.
+        let ordinary = TelegramChannel::new(
+            "fake-token".into(),
+            "other",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        ordinary
+            .try_parse_attachment_message(&routed_media_updates()[0])
+            .await
+            .expect_parsed("ordinary alias materializes the photo");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/getFile")),
+            "control must observe getFile"
+        );
+    }
+
+    #[test]
+    fn text_only_alias_does_not_treat_media_as_processable() {
+        let ch = TelegramChannel::new("t".into(), "home", Arc::new(|| vec!["1001".into()]), false)
+            .with_workspace_dir(std::env::temp_dir());
+        let photo = &routed_media_updates()[0]["message"];
+        assert!(ch.message_has_processable_content(photo));
+        let ch = ch.with_text_only(true);
+        assert!(!ch.message_has_processable_content(photo));
+    }
+
+    /// A routed alias has no single owning agent, so the model picker (which
+    /// presents one owner's catalog) never opens there. `/model` on a routed
+    /// alias is served by the text command in the routed agent's context.
+    #[tokio::test]
+    async fn routed_alias_never_presents_a_model_picker() {
+        let mut config = model_picker_config();
+        config.agents.get_mut("assistant").unwrap().channels.clear();
+        config.channels.telegram.get_mut("main").unwrap().routes = Some(
+            [("1001".to_string(), "assistant".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let runtime_routes = model_picker_runtime_routes(&config);
+        assert!(
+            TelegramChannel::model_picker_context(&config, "main", runtime_routes.as_ref())
+                .is_none()
+        );
+
+        let mock_server = wiremock::MockServer::start().await;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "main",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_persistence(Arc::new(RwLock::new(config.clone())));
+        let request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: "owner".to_string(),
+            requesting_user_id: "1001".to_string(),
+            reply_target: "1001".to_string(),
+            thread_ts: None,
+            channel_alias: "main".to_string(),
+            owner_agent_alias: "assistant".to_string(),
+            current_model_provider: "openai.primary".to_string(),
+            current_model: "gpt-current".to_string(),
+            model_routes: model_picker_request_routes(&config),
+        };
+        assert!(!ch.present_model_picker(&request).await.unwrap());
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+        assert!(ch.pending_model_pickers.lock().await.is_empty());
     }
 }

@@ -9,12 +9,14 @@ host-specific path. Use placeholders here and keep real values in the host
 configuration and its secret manager, outside this repository.
 
 > [!IMPORTANT]
-> Parts of this runbook depend on fork features that do not exist yet: the
-> Telegram route table and text-only guard ([One-bot route and isolation
-> proof](issues/18-one-bot-route-and-isolation-proof.md)) and the Kagi
-> provider ([Kagi feature and cost
-> settings](issues/17-kagi-feature-and-cost-settings.md)). Config shown for
-> them is **proposed**. Update this file when those land, and check every
+> The Telegram route table and text-only guard ([One-bot route and isolation
+> proof](issues/18-one-bot-route-and-isolation-proof.md)) exist in this fork
+> as `channels.telegram.<alias>.routes`; see
+> [Telegram](../../book/src/channels/telegram.md#route-one-bot-to-several-agents).
+> The Kagi provider ([Kagi feature and cost
+> settings](issues/17-kagi-feature-and-cost-settings.md)) and the
+> `bindPaths`/`extraPackages` module options do not exist yet; config shown
+> for them is **proposed**. Update this file when they land, and check every
 > field name against `crates/zeroclaw-config/src/schema.rs` before use.
 
 ## Overview
@@ -55,7 +57,8 @@ Routing uses exact numeric IDs, never usernames. You need three:
 | Partner user ID | positive integer | `message.from.id` in the partner's DM |
 | Household group chat ID | negative, usually `-100…` | `message.chat.id` in the group |
 
-In a private chat the chat ID equals the user's ID; the route matches both.
+In a private chat the chat ID equals the user's ID; the route matches both,
+so a private route is keyed by the user ID.
 
 1. Create the household group with both humans, then add the bot.
 2. In BotFather, `/setjoingroups` → **Disable**. Nobody can add the bot to
@@ -123,7 +126,7 @@ Things that differ from the module's own examples:
 - For a routed alias, do **not** list `telegram.<alias>` in any agent's
   `channels`. The route table is the only binding.
 
-Stage 1 sketch (the `routes` block is proposed fork config):
+Stage 1 sketch:
 
 ```nix
 services.zeroclaw.instances.<name> = {
@@ -174,18 +177,25 @@ services.zeroclaw.instances.<name> = {
       stream_mode = "partial";     # replies appear as they are written
       # draft_update_interval_ms: leave at the default for now.
 
-      # PROPOSED fork field; spelling not final.
+      # The alias's only agent binding. Positive keys are private chats
+      # (user ID); the negative key is the group chat ID. Unmatched chats
+      # reach no agent. A routed alias is text-only.
       routes = {
-        dm = {
-          "<owner user id>" = "owner";
-          "<partner user id>" = "partner";
-        };
-        groups = { "<household group chat id>" = "household"; };
+        "<owner user id>" = "owner";
+        "<partner user id>" = "partner";
+        "<household group chat id>" = "household";
       };
     };
   };
 };
 ```
+
+The route table is invalid if a key is not a canonical nonzero integer,
+names a missing or disabled agent, or sends the group to an agent that also
+has a private-chat route, or if `telegram.home` also appears in an agent's
+`channels`. The daemon still starts, logs `invalid Telegram route table`, and
+the bot answers no one on that alias until the table is fixed. Routes are read at startup. Before pointing an existing chat at a
+different agent, stop the unit and archive that chat's session.
 
 Leave `[memory]` at its defaults: the SQLite backend, and `auto_save = true`.
 Do not set `read_memory_from` on any agent. `auto_approve` replaces the
@@ -239,8 +249,17 @@ Check in Telegram:
 - A message from a third account, or the bot added to another group
   (temporarily re-enable joining to test), gets no agent reply.
 - `memory_store` a fact in one chat, then ask about it in the other two;
-  it must not surface.
-- `/model` in the group changes the group only; DMs keep their own model.
+  it must not surface. With the default `embedding_provider = "none"`, a
+  stored fact comes back through `memory_recall`, not through the automatic
+  memory context at the start of a turn, so ask the agent to look it up.
+- The automated version of these checks runs in the fork:
+  `cargo test -p zeroclaw-channels --lib -- telegram_routes text_only_alias routed_alias_never_presents`.
+- `/model <hint>` in the group changes the group only; DMs keep their own
+  model. The inline `/model` picker does not open on a routed alias; use the
+  text form.
+- A photo or voice note gets no reply and is not downloaded. The log shows
+  `Dropping Telegram attachment: this alias is text-only` for photos and
+  documents.
 
 The full proof list is in [One-bot route and isolation
 proof](issues/18-one-bot-route-and-isolation-proof.md). Stage 3 must not
