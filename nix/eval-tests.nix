@@ -77,8 +77,62 @@ let
       true
     else
       throw "${name}: expected assertion containing `${expectedSubstring}`, got: ${assertionMessages failed}";
+
+  serviceFor =
+    instances: name: (evalConfig instances).systemd.services."zeroclaw-${name}";
+
+  assertEqual =
+    name: expected: actual:
+    if expected == actual then
+      true
+    else
+      throw "${name}: expected ${builtins.toJSON expected}, got ${builtins.toJSON actual}";
 in
 {
+  bindPathsRenderWritableBindsAndKeepHardening =
+    let
+      unit = serviceFor {
+        me = mkInstance {
+          bindPaths."/var/lib/zeroclaw-me/mnt/scratch" = "/srv/scratch";
+          bindReadOnlyPaths."/var/lib/zeroclaw-me/mnt/notes" = "/srv/notes";
+        };
+      } "me";
+      cfg = unit.serviceConfig;
+    in
+    assertEqual "bindPaths" [ "/srv/scratch:/var/lib/zeroclaw-me/mnt/scratch" ] cfg.BindPaths
+    && assertEqual "bindReadOnlyPaths" [ "/srv/notes:/var/lib/zeroclaw-me/mnt/notes" ] cfg.BindReadOnlyPaths
+    && assertEqual "ReadWritePaths unchanged" [ "/var/lib/zeroclaw-me" ] cfg.ReadWritePaths
+    && assertEqual "ProtectSystem" "strict" cfg.ProtectSystem
+    && assertEqual "ProtectHome" true cfg.ProtectHome
+    && assertEqual "NoNewPrivileges" true cfg.NoNewPrivileges;
+
+  noBindPathsByDefault =
+    let
+      cfg = (serviceFor { me = mkInstance { }; } "me").serviceConfig;
+    in
+    assertEqual "no BindPaths" false (cfg ? BindPaths);
+
+  extraPackagesLandOnTheUnitPath =
+    let
+      unit = serviceFor {
+        me = mkInstance { extraPackages = [ pkgs.jq ]; };
+        other = mkInstance { };
+      } "me";
+      other = serviceFor {
+        me = mkInstance { extraPackages = [ pkgs.jq ]; };
+        other = mkInstance { };
+      } "other";
+    in
+    let
+      onPath =
+        service:
+        lib.hasInfix (builtins.unsafeDiscardStringContext "${lib.getBin pkgs.jq}/bin") (
+          builtins.unsafeDiscardStringContext service.environment.PATH
+        );
+    in
+    assertEqual "jq on me's PATH" true (onPath unit)
+    && assertEqual "jq not on other's PATH" false (onPath other);
+
   duplicateCreatedUsersFail = assertFailsWith "duplicate created users" "same `user` while also setting `createUser = true`" {
     first = mkInstance {
       user = "zeroclaw-shared";

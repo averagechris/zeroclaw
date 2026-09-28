@@ -21,7 +21,8 @@ flowchart LR
 ```
 
 `collect_configured_channels` constructs one `TelegramChannel` for every
-enabled, agent-owned alias. The channel resolves matching peer-group members
+enabled alias that an agent owns or that has a `routes` table (see
+[Route one bot to several agents](#route-one-bot-to-several-agents)). The channel resolves matching peer-group members
 from the shared `Config` when each message arrives. It accepts either the
 sender's numeric Telegram user ID or username, then hands an authorized
 `ChannelMessage` to the shared channel dispatch and agent-turn lifecycle.
@@ -216,6 +217,61 @@ running channel would read. For a valid alias it creates or updates
 `[peer_groups.telegram_<alias>]`, scopes the group to
 `telegram.<alias>`, and saves the identity idempotently.
 
+## Route one bot to several agents
+
+A `routes` table lets one bot serve different chats with different agents,
+for example two people's private chats and a shared group, each with its own
+risk profile, tools, and memory. Routes use exact numeric Telegram IDs, never
+usernames:
+
+```toml
+[channels.telegram.home]
+enabled = true
+per_user_session = false   # one shared session for the group; DMs unaffected
+
+[channels.telegram.home.routes]
+"111111111" = "owner"            # private chat with user 111111111
+"222222222" = "partner"          # private chat with user 222222222
+"-1001234567890" = "household"   # the group with this chat ID
+
+[peer_groups.telegram_home]
+channel = "telegram.home"
+external_peers = ["111111111", "222222222"]
+```
+
+- A positive key routes the private chat whose chat ID and sender ID both
+  equal it. A negative key routes the group or supergroup with exactly that
+  chat ID, whoever in it is speaking.
+- The peer allowlist still applies first. A chat without a route reaches no
+  agent. There is no default or fallback agent.
+- The table is the alias's only agent binding. Do not also list
+  `telegram.home` in any `agents.<alias>.channels`.
+- A routed alias is text-only. Photos, documents, albums, and voice notes are
+  dropped before any download, and nothing is written to the channel's
+  workspace directory. Text-to-speech replies are not bound on a routed alias.
+- The `/model` picker does not open on a routed alias. `/model <hint>` still
+  changes the model for the current session in the routed agent. In a group
+  with `per_user_session = false`, that change applies to the whole group.
+
+Config validation rejects a table that is empty, uses a key that is not a
+canonical nonzero integer (`0123`, `+123`, or a username, for example), names
+a missing or disabled agent, or sends a group to an agent that also has a
+private-chat route on this alias. It also rejects a routed alias that appears
+in any `agents.<alias>.channels`. `zeroclaw config` commands refuse to save
+such a table. The daemon still boots with it, as it does for other validation
+errors, but logs `invalid Telegram route table` and the alias reaches no
+agent until you fix it.
+
+Routes are read at startup. Session keys include the chat ID but not the
+agent, so do not point an existing chat at a different agent and keep its
+history. Stop the daemon, archive or delete that chat's session, change the
+route, and restart.
+
+Get the IDs from `getUpdates` while no ZeroClaw process is polling the token:
+`message.from.id` in each private chat, and `message.chat.id` in the group.
+Converting a group to a supergroup gives it a new `-100…` chat ID, and its
+route stops matching until you update it.
+
 ## Restart and persistence behavior
 
 | Change | When the running channel sees it |
@@ -282,6 +338,7 @@ logging is enabled, events are also written under the install directory at
 | No pairing code appears | A matching peer group already resolves at least one peer, possibly `"*"`. Pairing is intentionally inactive; use the operator bind command or correct the peer group and restart. |
 | The bot still asks for operator approval after `bind-telegram` | The running foreground process has not reloaded, or the identity was bound to the wrong alias. Restart it and verify the `--alias` value. |
 | The bot is silent | Confirm `enabled = true`, confirm an enabled agent owns `telegram.<alias>`, run `zeroclaw channel doctor`, then inspect logs. |
+| A routed alias ignores one chat | The chat has no exact route. The log says `dropping inbound message: no agent owns this channel`. Check the chat's numeric ID, and for a private chat that the sender's ID is the same number. |
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
 | Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |

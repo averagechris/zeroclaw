@@ -230,6 +230,40 @@ let
             managed read-only assets.
           '';
         };
+
+        bindPaths = mkOption {
+          type = types.attrsOf types.path;
+          default = { };
+          example = literalExpression ''
+            {
+              "/var/lib/zeroclaw-me/mnt/scratch" = "/srv/shared/scratch";
+            }
+          '';
+          description = ''
+            Read-write bind-mounts to thread into the unit's namespace via
+            systemd `BindPaths=`. Map of `target = source`, like
+            {option}`bindReadOnlyPaths`. Grants writable reach to specific
+            directories without loosening `ProtectSystem`/`ProtectHome`.
+
+            Prefer targets under {option}`dataDir`: the target must exist or
+            be creatable, and `ProtectHome` hides `/home`. Unix permissions
+            still apply to the service user. Under `PrivateUsers`, files
+            owned by other users appear as `nobody`, so give the service user
+            group or ACL access to the source (for example a shared group or
+            `setfacl -m u:zeroclaw-me:rwX`).
+          '';
+        };
+
+        extraPackages = mkOption {
+          type = types.listOf types.package;
+          default = [ ];
+          example = literalExpression "[ pkgs.git pkgs.curl pkgs.jq ]";
+          description = ''
+            Packages added to the unit's `PATH` (systemd `path`), so tools
+            the agent runs, such as the shell tool, can find them. This only
+            changes what is on `PATH`; it grants no extra permissions.
+          '';
+        };
       };
     };
 
@@ -291,6 +325,7 @@ let
     in
     nameValuePair "zeroclaw-${name}" {
       description = "ZeroClaw agent (instance ${name})";
+      path = instanceCfg.extraPackages;
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -397,6 +432,12 @@ let
 
         BindReadOnlyPaths = mkIf (instanceCfg.bindReadOnlyPaths != { }) (
           mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindReadOnlyPaths
+        );
+
+        # `BindPaths=` mounts are writable by themselves, so the targets need
+        # no `ReadWritePaths=` entry and the hardening above stays as is.
+        BindPaths = mkIf (instanceCfg.bindPaths != { }) (
+          mapAttrsToList (target: source: "${source}:${target}") instanceCfg.bindPaths
         );
       };
     };

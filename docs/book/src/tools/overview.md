@@ -32,7 +32,7 @@ A minimal build ships with:
 | `glob_search` | List files matching a glob pattern within the workspace |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |
+| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, Keenable (no key required; optional key lifts rate limits), or Kagi |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -57,6 +57,39 @@ ZeroClaw sends it only as a Bearer authorization header; without a key, no
 `Authorization` header is sent. Selecting this provider therefore sends search
 queries to a third-party service even in anonymous mode. It does not change the
 default provider and is not used as an automatic fallback.
+
+### Kagi provider
+
+Kagi is an opt-in backend for `web_search_tool` that uses a Kagi Search API
+key from <https://kagi.com/api/keys>:
+
+```toml
+[web_search]
+search_provider = "kagi"
+kagi_api_key = "..."
+```
+
+Each call is one `POST https://kagi.com/api/v1/search` with the query,
+`workflow = "search"`, `limit` set from `max_results`, and safe search on. The
+key travels only as a Bearer authorization header. The tool never sends a
+lens or `extract`, which Kagi bills separately. Every call is billed to the
+key's Kagi account, so the account's own usage limit is the spending guard,
+alongside the tool's normal rate limit.
+
+The spelling is exactly `kagi`. Config validation rejects
+`search_provider = "kagi"` without a key, and a `kagi_api_key` with any other
+provider. The daemon still boots with those errors, but when a key is set
+with another provider it does not register `web_search_tool` at all, so a
+typo cannot turn into a silent DuckDuckGo search.
+
+When a Kagi call fails at runtime (network, timeout, HTTP 429 or 5xx, or the
+account's usage limit), the error tells the agent it may offer DuckDuckGo.
+The tool then accepts one extra boolean parameter, `use_duckduckgo_fallback`,
+which sends that single call to DuckDuckGo. Its description tells the model
+to set it only after the person in the conversation agreed. That rule is
+followed by the model, not enforced by the runtime. A key missing from config
+is reported as a configuration error, without the fallback offer. A key that
+Kagi rejects fails like any other call.
 
 Always registered alongside the built-ins:
 

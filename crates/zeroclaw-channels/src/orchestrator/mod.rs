@@ -10761,6 +10761,9 @@ async fn run_conversation_turn(
 struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
+    /// Route tables for routed Telegram aliases, keyed by alias. Read from
+    /// config at startup, like `owner_by_channel_key`.
+    telegram_routes: Arc<HashMap<String, zeroclaw_config::schema::TelegramRouteTable>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
@@ -10772,6 +10775,7 @@ impl AgentRouter {
         Self {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
+            telegram_routes: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
@@ -10787,10 +10791,23 @@ impl AgentRouter {
         Self {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
+            telegram_routes: Arc::new(HashMap::new()),
             single_ctx: None,
             sop_engine,
             sop_audit,
         }
+    }
+
+    /// Install the route tables of every routed Telegram alias in `config`.
+    fn with_telegram_routes(mut self, config: &Config) -> Self {
+        let routes = config
+            .channels
+            .telegram
+            .keys()
+            .filter_map(|alias| Some((alias.clone(), config.telegram_route_table(alias)?)))
+            .collect();
+        self.telegram_routes = Arc::new(routes);
+        self
     }
 
     fn resolve(
@@ -10799,6 +10816,19 @@ impl AgentRouter {
     ) -> Option<Arc<ChannelRuntimeContext>> {
         if let Some(ctx) = &self.single_ctx {
             return Some(Arc::clone(ctx));
+        }
+        // A routed Telegram alias resolves only through its route table: an
+        // unmatched chat or sender reaches no agent, never an owner fallback.
+        if msg.channel == "telegram"
+            && let Some(table) = msg
+                .channel_alias
+                .as_deref()
+                .and_then(|alias| self.telegram_routes.get(alias))
+        {
+            return table
+                .agent_for(&msg.reply_target, msg.platform_sender_id.as_deref())
+                .and_then(|agent| self.by_agent.get(agent))
+                .cloned();
         }
         if let Some(alias) = msg.channel_alias.as_deref().filter(|s| !s.is_empty()) {
             let composite = format!("{}.{alias}", msg.channel);
@@ -12102,7 +12132,8 @@ fn build_channel_by_id(
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_per_user_session(tg.per_user_session)
-                .with_approval_timeout_secs(tg.approval_timeout_secs),
+                .with_approval_timeout_secs(tg.approval_timeout_secs)
+                .with_text_only(tg.is_routed()),
             ))
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -13189,17 +13220,23 @@ impl ActiveChannelAliases {
             })
             .collect();
 
+        // A Telegram route table is a live binding in its own right: it keeps
+        // its alias active and, like any explicit binding, turns off the
+        // legacy "accept all enabled channels" mode.
+        let routed_keys = config.telegram_routed_channel_keys();
         Self {
             enabled_bindings: config
                 .agents
                 .values()
                 .filter(|a| a.enabled)
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .chain(routed_keys.iter().cloned())
                 .collect(),
             all_known_bindings: config
                 .agents
                 .values()
                 .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .chain(routed_keys)
                 .collect(),
             approval_route_bindings,
         }
@@ -13552,7 +13589,8 @@ fn collect_configured_channels(
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
                     .with_per_user_session(tg.per_user_session)
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                    .with_approval_timeout_secs(tg.approval_timeout_secs)
+                    .with_text_only(tg.is_routed()),
                 ),
                 tg,
             ),
@@ -15257,6 +15295,27 @@ fn explicit_owner_by_channel_key(
     owner_by_channel_key
 }
 
+/// The agent whose context receives a persisted session at startup, or
+/// `None` to skip it. A routed Telegram alias has no single owner, and the
+/// bare-type fallback could name another alias's agent, so its sessions are
+/// skipped here and hydrate lazily on the next turn, into the context the
+/// route selects.
+fn startup_hydration_owner(
+    owner_by_channel_key: &HashMap<String, String>,
+    routed_keys: &[String],
+    channel_id: Option<&str>,
+) -> Option<String> {
+    let channel_id = channel_id?;
+    if routed_keys.iter().any(|key| key == channel_id) {
+        return None;
+    }
+    owner_by_channel_key.get(channel_id).cloned().or_else(|| {
+        channel_id
+            .split_once('.')
+            .and_then(|(bare, _)| owner_by_channel_key.get(bare).cloned())
+    })
+}
+
 fn build_owner_by_channel_key(
     config: &Config,
     enabled_agents: &[String],
@@ -15268,7 +15327,14 @@ fn build_owner_by_channel_key(
     // schema treats this as the source of truth for channel ownership.
     let mut owner_by_channel_key = explicit_owner_by_channel_key(config, enabled_agents);
 
-    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
+    // Routed Telegram aliases have no single owner. `AgentRouter` resolves
+    // them per chat, so they must never enter this map, and their presence
+    // counts as an explicit binding that disables the legacy fallback.
+    let routed_keys = config.telegram_routed_channel_keys();
+    owner_by_channel_key.retain(|key, _| !routed_keys.contains(key));
+
+    let any_binding_declared_anywhere =
+        !routed_keys.is_empty() || config.agents.values().any(|a| !a.channels.is_empty());
 
     if any_binding_declared_anywhere {
         if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
@@ -16384,17 +16450,13 @@ pub async fn start_channels_with_plugin_webhooks(
 
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
+        let routed_keys = config.telegram_routed_channel_keys();
         for m in metadata {
-            let owner_agent = m
-                .channel_id
-                .as_deref()
-                .and_then(|cid| owner_by_channel_key.get(cid).cloned())
-                .or_else(|| {
-                    m.channel_id
-                        .as_deref()
-                        .and_then(|cid| cid.split_once('.').map(|(b, _)| b.to_string()))
-                        .and_then(|b| owner_by_channel_key.get(&b).cloned())
-                });
+            let owner_agent = startup_hydration_owner(
+                &owner_by_channel_key,
+                &routed_keys,
+                m.channel_id.as_deref(),
+            );
             let target_ctx = match owner_agent.as_ref().and_then(|a| agent_ctxs.get(a)) {
                 Some(ctx) => ctx,
                 None => continue,
@@ -16448,7 +16510,8 @@ pub async fn start_channels_with_plugin_webhooks(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
+        .with_telegram_routes(&config);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -18274,6 +18337,9 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[cfg(feature = "channel-telegram")]
+    mod telegram_routes;
 
     #[test]
     fn shared_room_history_keeps_the_speaker_for_any_channel() {
@@ -40646,6 +40712,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let router = AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
+            telegram_routes: Arc::new(HashMap::new()),
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
@@ -48247,6 +48314,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                routes: None,
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -48279,6 +48347,7 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                routes: None,
             },
         );
         config
@@ -51536,6 +51605,7 @@ Done."#;
         AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
+            telegram_routes: Arc::new(HashMap::new()),
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
@@ -51639,6 +51709,7 @@ Done."#;
         let router = AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
+            telegram_routes: Arc::new(HashMap::new()),
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,

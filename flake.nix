@@ -79,6 +79,16 @@
             builtins.toJSON nixosModuleEvalTests
           );
         };
+        apps.fetch-upstream = {
+          type = "app";
+          program = "${pkgs.writeShellApplication {
+            name = "fetch-upstream";
+            runtimeInputs = [ pkgs.jujutsu ];
+            text = ''
+              exec jj git fetch --remote upstream "$@"
+            '';
+          }}/bin/fetch-upstream";
+        };
         devShells.default = pkgs.mkShell {
           packages = [
             rustToolchain
