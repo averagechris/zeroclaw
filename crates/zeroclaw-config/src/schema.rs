@@ -4967,7 +4967,10 @@ impl Config {
     pub fn telegram_route_table(&self, alias: &str) -> Option<TelegramRouteTable> {
         let tg = self.channels.telegram.get(alias)?;
         let table = tg.route_table()?;
-        if let Err(error) = self.validate_telegram_routes(alias, tg) {
+        if let Err(error) = self
+            .validate_telegram_routes(alias, tg)
+            .and_then(|()| self.validate_telegram_invitations(alias, tg))
+        {
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -5016,11 +5019,87 @@ impl Config {
         Ok(())
     }
 
+    /// Enrollment templates cannot grant cross-agent data or host-control tools.
+    pub fn validate_telegram_invitations(&self, alias: &str, tg: &TelegramConfig) -> Result<()> {
+        let Some(invites) = &tg.invitations else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !alias.is_empty()
+                && alias
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "invalid Telegram invitation alias"
+        );
+        let owner = parse_telegram_route_id(&invites.owner_id).filter(|id| *id > 0);
+        let channel_ref = format!("telegram.{alias}");
+        anyhow::ensure!(
+            !self.agents.values().any(|agent| agent
+                .channels
+                .iter()
+                .any(|channel| channel.as_str() == channel_ref)),
+            "Telegram invitation aliases cannot also be bound through agent channels"
+        );
+        anyhow::ensure!(
+            owner.is_some(),
+            "channels.telegram.{alias}.invitations.owner_id must be a canonical positive numeric ID"
+        );
+        anyhow::ensure!(
+            !tg.per_user_session,
+            "Telegram invitations require per_user_session = false for shared group conversations"
+        );
+        for template in [&invites.guest_agent, &invites.group_agent] {
+            let agent = self
+                .agents
+                .get(template)
+                .with_context(|| format!("Telegram invitation template {template} is missing"))?;
+            anyhow::ensure!(
+                agent.enabled && agent.channels.is_empty(),
+                "Telegram invitation templates must be enabled and unbound"
+            );
+            anyhow::ensure!(
+                agent.workspace.path.is_none()
+                    && agent.workspace.access.is_empty()
+                    && agent.workspace.read_memory_from.is_empty()
+                    && !agent.workspace.unrestricted_filesystem,
+                "Telegram invitation templates must have private default workspaces and memory"
+            );
+            anyhow::ensure!(
+                agent.mcp_bundles.is_empty()
+                    && agent.skill_bundles.is_empty()
+                    && agent.knowledge_bundles.is_empty(),
+                "Telegram invitation templates cannot grant external bundles"
+            );
+            let profile = self
+                .risk_profile_for_agent(template)
+                .context("Telegram invitation template risk profile is missing")?;
+            anyhow::ensure!(
+                profile.level != crate::policy::AutonomyLevel::Full,
+                "Telegram invitation templates cannot use full autonomy"
+            );
+            anyhow::ensure!(
+                !profile.allowed_tools.is_empty()
+                    && profile.allowed_tools.iter().all(|tool| matches!(
+                        tool.as_str(),
+                        "memory_recall" | "memory_store" | "memory_forget" | "web_search_tool"
+                    )),
+                "Telegram invitation templates only allow memory tools and web search"
+            );
+            anyhow::ensure!(
+                !tg.routes
+                    .as_ref()
+                    .is_some_and(|routes| routes.values().any(|a| a == template)),
+                "Telegram invitation templates cannot be static route targets"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate `channels.telegram.<alias>.routes`. The table must be
     /// non-empty, use canonical nonzero numeric IDs, name enabled agents, be
     /// the alias's only binding, and never send a group to an agent that also
     /// serves a private chat on this alias.
-    fn validate_telegram_routes(&self, alias: &str, tg: &TelegramConfig) -> Result<()> {
+    pub fn validate_telegram_routes(&self, alias: &str, tg: &TelegramConfig) -> Result<()> {
         let Some(routes) = tg.routes.as_ref() else {
             return Ok(());
         };
@@ -16464,6 +16543,12 @@ fn default_matrix_message_max_bytes() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
+    /// Owner-controlled, durable guest and group enrollment. Generated agents
+    /// use these restricted templates and retain separate memory identities.
+    #[tab(Behavior)]
+    #[nested]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invitations: Option<TelegramInvitationsConfig>,
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false` so an operator who pastes a partial
     /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
@@ -16649,9 +16734,23 @@ fn parse_telegram_route_id(raw: &str) -> Option<i64> {
     (id != 0 && id.to_string() == raw).then_some(id)
 }
 
+/// Declarative policy for Telegram enrollment; memberships live in service state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "telegram_invitations"]
+pub struct TelegramInvitationsConfig {
+    /// Numeric Telegram user ID authorized to invite, activate groups and revoke.
+    pub owner_id: String,
+    /// Restricted agent template for invited private chats.
+    pub guest_agent: String,
+    /// Restricted agent template for activated groups.
+    pub group_agent: String,
+}
+
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
+            invitations: None,
             enabled: false,
             bot_token: String::new(),
             api_base_url: default_telegram_api_base_url(),
@@ -16675,17 +16774,19 @@ impl Default for TelegramConfig {
 }
 
 impl TelegramConfig {
-    /// True when this alias binds agents through `routes`.
+    /// True when this alias binds agents through routes or invitations.
     #[must_use]
     pub fn is_routed(&self) -> bool {
-        self.routes.is_some()
+        self.routes.is_some() || self.invitations.is_some()
     }
 
     /// The parsed route table, or `None` for an alias without `routes`.
     #[must_use]
     pub fn route_table(&self) -> Option<TelegramRouteTable> {
-        let routes = self.routes.as_ref()?;
         let mut table = TelegramRouteTable::default();
+        let Some(routes) = self.routes.as_ref() else {
+            return self.invitations.as_ref().map(|_| table);
+        };
         for (raw_id, agent) in routes {
             let Some(id) = parse_telegram_route_id(raw_id) else {
                 continue;
@@ -23706,6 +23807,7 @@ impl Config {
                 &tg.api_base_url,
             )?;
             self.validate_telegram_routes(alias, tg)?;
+            self.validate_telegram_invitations(alias, tg)?;
         }
 
         for (alias, matrix) in &self.channels.matrix {
@@ -32266,6 +32368,7 @@ auto_save = true
                 telegram: HashMap::from([(
                     "default".to_string(),
                     TelegramConfig {
+                        invitations: None,
                         enabled: true,
                         bot_token: "123:ABC".into(),
                         api_base_url: default_telegram_api_base_url(),
@@ -34099,6 +34202,7 @@ default_temperature = 0.7
     #[test]
     async fn telegram_config_serde() {
         let tc = TelegramConfig {
+            invitations: None,
             enabled: true,
             bot_token: "123:XYZ".into(),
             api_base_url: default_telegram_api_base_url(),
@@ -39931,6 +40035,7 @@ high_entropy_tokens = false
         config.channels.telegram.insert(
             "default".to_string(),
             TelegramConfig {
+                invitations: None,
                 enabled: true,
                 bot_token: plaintext_token.into(),
                 api_base_url: default_telegram_api_base_url(),

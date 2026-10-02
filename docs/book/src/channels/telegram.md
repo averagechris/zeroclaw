@@ -272,6 +272,79 @@ Get the IDs from `getUpdates` while no ZeroClaw process is polling the token:
 Converting a group to a supergroup gives it a new `-100…` chat ID, and its
 route stops matching until you update it.
 
+## Invite friends and approve groups dynamically
+
+Enable `invitations` to enroll people without editing routes or restarting.
+Each invited private chat gets its own agent memory. Each approved group gets
+one shared memory, separate from private chats and other groups. Existing
+static routes take precedence and cannot be changed by enrollment commands.
+
+Use an exact positive numeric owner ID, plus two enabled, unbound agent
+templates. Templates must use private default workspaces, no cross-agent
+memory grants or external bundles, and a risk profile allowing only memory
+and optional `web_search_tool` tools. Full autonomy is rejected. Generated
+agents cannot delegate to other agents.
+
+```toml
+[agents.guest_template]
+model_provider = "openai.codex"
+risk_profile = "guests"
+
+[agents.group_template]
+model_provider = "openai.codex"
+risk_profile = "guests"
+
+[risk_profiles.guests]
+allowed_tools = ["memory_recall", "memory_store", "memory_forget"]
+auto_approve = ["memory_recall", "memory_store"]
+
+[channels.telegram.home]
+enabled = true
+bot_token = "<from your secret manager>"
+per_user_session = false
+
+[channels.telegram.home.invitations]
+owner_id = "111111111"
+guest_agent = "guest_template"
+group_agent = "group_template"
+```
+
+Add a static owner route and owner peer group as in the previous section if
+the owner should also chat with an existing owner agent. Do not attach this
+Telegram alias through `agents.<alias>.channels`.
+
+| Action | Where | Result |
+|---|---|---|
+| `/invite` | Owner's private chat | A single-use link valid for 24 hours |
+| Open invite and press Start | Friend's private chat | Private enrollment; subsequent messages use their own memory |
+| `/activate@your_bot` | Group, sent by the owner | All human group members can chat with the bot; memory belongs to this group |
+| `/guests` | Owner's private chat | Active private and group chat IDs |
+| `/revoke <chat-id>` | Owner's private chat | Blocks new requests from that private chat or group |
+
+Keep BotFather's `/setjoingroups` enabled to add the bot to new groups.
+Disable `/setprivacy` before adding it if ordinary group messages should reach
+it. Groups stay closed until the owner sends `/activate`; a friend's private
+invite grants no group access. Telegram sends the invite payload through
+[`/start`](https://core.telegram.org/bots/features#deep-linking). Treat the
+link as a temporary access credential: whoever redeems it first gets access.
+
+Enrollment controls bypass the model. Edited, forwarded, anonymous-admin,
+and bot-authored enrollment commands cannot grant access. Explicit peer deny
+entries still apply. This mode is text-only, like static routed aliases.
+
+Memberships and hashed invite tokens live in
+`<data_dir>/telegram-memberships/<alias>.sqlite3`, outside the declarative
+TOML. Back up the entire data directory, including memory and session state.
+Re-rendering configuration or restarting preserves enrollment and memory.
+Keep the channel alias stable: it is part of every generated agent identity.
+Revocation preserves memory; a later invite or activation of the same chat
+restores its identity. A turn already running when revoked may finish.
+
+The store permits at most 512 active chats and 128 outstanding invites per
+alias. Invalid templates or unavailable membership storage deny dynamic
+access. If Telegram converts a group to a supergroup, activate the new chat
+ID; it gets a new memory identity. Existing groups are not migrated implicitly.
+
 ## Restart and persistence behavior
 
 | Change | When the running channel sees it |

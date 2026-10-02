@@ -1,5 +1,9 @@
 //! Channel subsystem for messaging platform integrations.
 
+mod agent_factory;
+#[cfg(all(test, feature = "channel-telegram"))]
+mod telegram_enrollment_tests;
+
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
@@ -746,6 +750,8 @@ struct PendingTurn {
     /// separate from the execution permit: waiting hooks and queued lanes do
     /// not consume execution capacity, but they still retain bounded memory.
     pending_work: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(feature = "channel-telegram")]
+    dynamic_agents: Option<Arc<DynamicAgentRuntime>>,
 }
 
 /// A turn waiting for debounce resolution and post-hook routing.
@@ -1243,6 +1249,8 @@ impl ConversationLaneRegistry {
             dispatch_ownership,
             registration,
             pending_work,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents,
         } = *turn;
         run_conversation_turn(
             ctx,
@@ -1252,6 +1260,8 @@ impl ConversationLaneRegistry {
             registration,
             permit,
             pending_work,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents,
         )
         .await;
     }
@@ -2828,9 +2838,18 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     })
 }
 
+#[cfg(test)]
 async fn load_runtime_config_and_defaults(
     path: &Path,
     agent_alias: &str,
+) -> Result<(Config, ChannelRuntimeDefaults)> {
+    load_runtime_config_and_defaults_for_data_dir(path, agent_alias, None).await
+}
+
+async fn load_runtime_config_and_defaults_for_data_dir(
+    path: &Path,
+    agent_alias: &str,
+    data_dir: Option<&Path>,
 ) -> Result<(Config, ChannelRuntimeDefaults)> {
     let contents = tokio::fs::read_to_string(path)
         .await
@@ -2847,6 +2866,11 @@ async fn load_runtime_config_and_defaults(
     let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
     parsed.env_overridden_paths = applied.paths;
     parsed.pre_override_snapshots = applied.snapshots;
+    if let Some(data_dir) = data_dir {
+        parsed.data_dir = data_dir.to_path_buf();
+    }
+    #[cfg(feature = "channel-telegram")]
+    crate::telegram_dynamic::materialize_for_alias(&mut parsed, agent_alias)?;
 
     let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
     let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
@@ -2872,8 +2896,12 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let (next_config, next_defaults) =
-        load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
+    let (next_config, next_defaults) = load_runtime_config_and_defaults_for_data_dir(
+        &config_path,
+        ctx.agent_alias.as_str(),
+        Some(ctx.prompt_config.data_dir.as_path()),
+    )
+    .await?;
     let next_config = Arc::new(next_config);
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
@@ -4754,6 +4782,33 @@ fn build_scope_override_summary(
     )
 }
 
+#[cfg(feature = "channel-telegram")]
+fn is_dynamic_telegram_context(ctx: &ChannelRuntimeContext) -> bool {
+    let alias = ctx.agent_alias.as_str();
+    let configured_static_target = ctx
+        .prompt_config
+        .channels
+        .telegram
+        .values()
+        .any(|telegram| {
+            telegram
+                .routes
+                .as_ref()
+                .is_some_and(|routes| routes.values().any(|target| target == alias))
+        });
+    !configured_static_target
+        && ctx
+            .prompt_config
+            .channels
+            .telegram
+            .iter()
+            .any(|(channel, telegram)| {
+                telegram.invitations.is_some()
+                    && (alias.starts_with(&format!("tg_{channel}_dm_"))
+                        || alias.starts_with(&format!("tg_{channel}_group_")))
+            })
+}
+
 fn is_bare_model_picker_command(content: &str) -> bool {
     let mut parts = content.split_whitespace();
     let Some(command) = parts.next() else {
@@ -4799,6 +4854,26 @@ async fn handle_runtime_command_for_delivery(
     let Some(command) = parse_runtime_command(&msg.channel, &msg.content) else {
         return false;
     };
+    #[cfg(feature = "channel-telegram")]
+    if is_dynamic_telegram_context(ctx)
+        && matches!(
+            command,
+            ChannelRuntimeCommand::ShowProviders
+                | ChannelRuntimeCommand::SetProvider(_)
+                | ChannelRuntimeCommand::ShowModel
+                | ChannelRuntimeCommand::SetModel(_)
+                | ChannelRuntimeCommand::SetModelScoped(_, _)
+                | ChannelRuntimeCommand::ShowConfig
+        )
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_attrs(::serde_json::json!({"agent_alias": ctx.agent_alias.as_str()})),
+            "ignoring model/config runtime command for enrolled Telegram agent"
+        );
+        return true;
+    }
 
     let Some(channel) = target_channel else {
         return true;
@@ -10717,10 +10792,18 @@ async fn run_conversation_turn(
     registration: Option<TurnRegistration>,
     permit: tokio::sync::OwnedSemaphorePermit,
     pending_work: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(feature = "channel-telegram")] dynamic_agents: Option<Arc<DynamicAgentRuntime>>,
 ) {
     let execution_permit = permit;
 
     let Some(registration) = registration else {
+        #[cfg(feature = "channel-telegram")]
+        if !queued_dynamic_membership_is_current(dynamic_agents.as_deref(), ctx.as_ref(), &msg) {
+            drop(dispatch_ownership);
+            drop(execution_permit);
+            drop(pending_work);
+            return;
+        }
         process_channel_message_with_delivery_id(
             ctx,
             msg,
@@ -10744,6 +10827,15 @@ async fn run_conversation_turn(
         return;
     }
 
+    #[cfg(feature = "channel-telegram")]
+    if !queued_dynamic_membership_is_current(dynamic_agents.as_deref(), ctx.as_ref(), &msg) {
+        drop(registration);
+        drop(dispatch_ownership);
+        drop(execution_permit);
+        drop(pending_work);
+        return;
+    }
+
     process_channel_message_with_delivery_id(
         ctx,
         msg,
@@ -10757,6 +10849,270 @@ async fn run_conversation_turn(
     drop(pending_work);
 }
 
+#[cfg(feature = "channel-telegram")]
+fn queued_dynamic_membership_is_current(
+    dynamic_agents: Option<&DynamicAgentRuntime>,
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(dynamic_agents) = dynamic_agents else {
+        return !is_dynamic_telegram_context(ctx);
+    };
+    match dynamic_agents.context_membership_is_current(ctx, msg) {
+        Ok(is_current) => is_current,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"agent_alias": ctx.agent_alias.as_str(), "error": format!("{error:#}")})),
+                "dropping queued Telegram turn after membership recheck failed"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(feature = "channel-telegram")]
+type TelegramMembershipStores = HashMap<String, Arc<crate::telegram_memberships::MembershipStore>>;
+#[cfg(not(feature = "channel-telegram"))]
+type TelegramMembershipStores = HashMap<String, ()>;
+
+#[cfg(feature = "channel-telegram")]
+const MAX_DYNAMIC_AGENT_CONTEXTS: usize = 512;
+
+#[cfg(feature = "channel-telegram")]
+struct DynamicAgentRuntime {
+    config_arc: Arc<RwLock<Config>>,
+    observer: Arc<dyn Observer>,
+    runtime: Arc<dyn platform::RuntimeAdapter>,
+    canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+    session_store: Option<Arc<dyn SessionBackend>>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    membership_stores: TelegramMembershipStores,
+    contexts: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Arc<ChannelRuntimeContext>>>>>,
+}
+
+#[cfg(feature = "channel-telegram")]
+impl DynamicAgentRuntime {
+    fn membership_for_message(
+        &self,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Result<Option<(String, crate::telegram_memberships::Membership)>> {
+        let Some(channel_alias) = msg
+            .channel_alias
+            .as_deref()
+            .filter(|alias| !alias.is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(store) = self.membership_stores.get(channel_alias) else {
+            return Ok(None);
+        };
+        let target = msg
+            .reply_target
+            .split_once(':')
+            .map_or(msg.reply_target.as_str(), |(chat, _)| chat);
+        let Some(chat_id) = parse_canonical_telegram_id(target) else {
+            return Ok(None);
+        };
+        let Some(sender_id) = msg
+            .platform_sender_id
+            .as_deref()
+            .and_then(parse_canonical_telegram_id)
+            .filter(|sender_id| *sender_id > 0)
+        else {
+            return Ok(None);
+        };
+        if chat_id > 0 && sender_id != chat_id {
+            return Ok(None);
+        }
+        let Some(membership) = store.membership(chat_id)? else {
+            return Ok(None);
+        };
+        let kind_matches_chat = match membership.kind {
+            crate::telegram_memberships::MembershipKind::Private => chat_id > 0,
+            crate::telegram_memberships::MembershipKind::Group => chat_id < 0,
+        };
+        if !kind_matches_chat {
+            return Ok(None);
+        }
+        Ok(Some((channel_alias.to_string(), membership)))
+    }
+
+    fn current_membership_policy_is_valid(
+        &self,
+        channel_alias: &str,
+        membership: &crate::telegram_memberships::Membership,
+        expected_alias: &str,
+    ) -> bool {
+        let mut config = self.config_arc.read().clone();
+        let Some(telegram) = config.channels.telegram.get(channel_alias) else {
+            return false;
+        };
+        if !telegram.enabled
+            || telegram.invitations.is_none()
+            || config
+                .validate_telegram_routes(channel_alias, telegram)
+                .and_then(|()| config.validate_telegram_invitations(channel_alias, telegram))
+                .is_err()
+        {
+            return false;
+        }
+        crate::telegram_dynamic::materialize(&mut config, channel_alias, membership)
+            .is_ok_and(|alias| alias == expected_alias)
+    }
+
+    fn context_policy_is_current(
+        &self,
+        ctx: &ChannelRuntimeContext,
+        channel_alias: &str,
+        membership: &crate::telegram_memberships::Membership,
+    ) -> Result<bool> {
+        let mut config = self.config_arc.read().clone();
+        let alias = crate::telegram_dynamic::materialize(&mut config, channel_alias, membership)?;
+        let agent = config
+            .resolved_agent_config(&alias)
+            .context("enrolled agent is missing")?;
+        let profile = config
+            .risk_profile_for_agent(&alias)
+            .context("enrolled risk profile is missing")?;
+        let built_profile = ctx
+            .prompt_config
+            .risk_profile_for_agent(&alias)
+            .context("built risk profile is missing")?;
+        // Compare against the context's existing construction inputs rather
+        // than caching another policy copy. A narrowed grant must invalidate
+        // both the cached context and turns already waiting in its queue.
+        Ok(
+            serde_json::to_value(agent)? == serde_json::to_value(ctx.agent_cfg.as_ref())?
+                && serde_json::to_value(profile)? == serde_json::to_value(built_profile)?,
+        )
+    }
+
+    fn context_membership_is_current(
+        &self,
+        ctx: &ChannelRuntimeContext,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Result<bool> {
+        if !is_dynamic_telegram_context(ctx) {
+            return Ok(true);
+        }
+        let Some((channel_alias, membership)) = self.membership_for_message(msg)? else {
+            return Ok(false);
+        };
+        if membership.agent_alias(&channel_alias) != ctx.agent_alias.as_str()
+            || !self.current_membership_policy_is_valid(
+                &channel_alias,
+                &membership,
+                ctx.agent_alias.as_str(),
+            )
+        {
+            return Ok(false);
+        }
+        if !self.context_policy_is_current(ctx, &channel_alias, &membership)? {
+            return Ok(false);
+        }
+        let store = self
+            .membership_stores
+            .get(&channel_alias)
+            .context("Telegram membership store is unavailable")?;
+        Ok(store.membership(membership.chat_id)?.as_ref() == Some(&membership))
+    }
+
+    async fn resolve_membership(
+        &self,
+        channel_alias: &str,
+        membership: crate::telegram_memberships::Membership,
+    ) -> Result<Option<Arc<ChannelRuntimeContext>>> {
+        let store = self
+            .membership_stores
+            .get(channel_alias)
+            .context("Telegram membership store is unavailable")?;
+        let agent_alias = membership.agent_alias(channel_alias);
+        if store.membership(membership.chat_id)?.as_ref() != Some(&membership)
+            || !self.current_membership_policy_is_valid(channel_alias, &membership, &agent_alias)
+        {
+            return Ok(None);
+        }
+        let cell = {
+            let mut contexts = self.contexts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(context) = contexts.get(&agent_alias).and_then(|cell| cell.get())
+                && !self.context_policy_is_current(context, channel_alias, &membership)?
+            {
+                contexts.remove(&agent_alias);
+            }
+            if let Some(cell) = contexts.get(&agent_alias) {
+                Arc::clone(cell)
+            } else {
+                // Keep the cache bounded under revoke/reinvite churn. Ready
+                // contexts remain alive for in-flight turns through their Arcs.
+                if contexts.len() >= MAX_DYNAMIC_AGENT_CONTEXTS {
+                    let evict = contexts
+                        .iter()
+                        .find(|(_, cell)| cell.get().is_some())
+                        .map(|(alias, _)| alias.clone())
+                        .context("dynamic Telegram context capacity is temporarily full")?;
+                    contexts.remove(&evict);
+                }
+                let cell = Arc::new(tokio::sync::OnceCell::new());
+                contexts.insert(agent_alias.clone(), Arc::clone(&cell));
+                cell
+            }
+        };
+
+        let context = cell
+            .get_or_try_init(|| async {
+                let mut effective_config = self.config_arc.read().clone();
+                let materialized_alias = crate::telegram_dynamic::materialize(
+                    &mut effective_config,
+                    channel_alias,
+                    &membership,
+                )?;
+                anyhow::ensure!(
+                    materialized_alias == agent_alias,
+                    "Telegram membership identity changed during materialization"
+                );
+                let effective_config_arc = Arc::new(RwLock::new(effective_config.clone()));
+                let prepared = agent_factory::PreparedChannelAgent::prepare(
+                    &effective_config,
+                    effective_config_arc,
+                    &agent_alias,
+                    Arc::clone(&self.observer),
+                    Arc::clone(&self.runtime),
+                    self.canvas_store.clone(),
+                    self.sop_engine.clone(),
+                    self.sop_audit.clone(),
+                    false,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(prepared.finish(
+                    Arc::clone(&self.channels_by_name),
+                    self.session_store.clone(),
+                ))
+            })
+            .await?;
+
+        // A revoke racing the potentially slow provider/tool setup prevents a
+        // newly built context from being returned for this inbound turn.
+        if store.membership(membership.chat_id)?.as_ref() != Some(&membership)
+            || !self.current_membership_policy_is_valid(channel_alias, &membership, &agent_alias)
+            || !self.context_policy_is_current(context, channel_alias, &membership)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Arc::clone(context)))
+    }
+}
+
+#[cfg(feature = "channel-telegram")]
+fn parse_canonical_telegram_id(raw: &str) -> Option<i64> {
+    let id = raw.parse::<i64>().ok()?;
+    (id != 0 && id.to_string() == raw).then_some(id)
+}
+
 #[derive(Clone)]
 struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
@@ -10767,6 +11123,8 @@ struct AgentRouter {
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    #[cfg(feature = "channel-telegram")]
+    dynamic_agents: Option<Arc<DynamicAgentRuntime>>,
 }
 
 impl AgentRouter {
@@ -10779,6 +11137,8 @@ impl AgentRouter {
             single_ctx: Some(ctx),
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         }
     }
 
@@ -10795,7 +11155,35 @@ impl AgentRouter {
             single_ctx: None,
             sop_engine,
             sop_audit,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    fn with_dynamic_agents(
+        mut self,
+        config_arc: Arc<RwLock<Config>>,
+        observer: Arc<dyn Observer>,
+        runtime: Arc<dyn platform::RuntimeAdapter>,
+        canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+        channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+        session_store: Option<Arc<dyn SessionBackend>>,
+        membership_stores: TelegramMembershipStores,
+    ) -> Self {
+        self.dynamic_agents = Some(Arc::new(DynamicAgentRuntime {
+            config_arc,
+            observer,
+            runtime,
+            canvas_store,
+            channels_by_name,
+            session_store,
+            sop_engine: self.sop_engine.clone(),
+            sop_audit: self.sop_audit.clone(),
+            membership_stores,
+            contexts: Mutex::new(HashMap::new()),
+        }));
+        self
     }
 
     /// Install the route tables of every routed Telegram alias in `config`.
@@ -10846,6 +11234,63 @@ impl AgentRouter {
             return Some(Arc::clone(ctx));
         }
         None
+    }
+
+    async fn resolve_async(
+        &self,
+        msg: &zeroclaw_api::channel::ChannelMessage,
+    ) -> Result<Option<Arc<ChannelRuntimeContext>>> {
+        if let Some(ctx) = &self.single_ctx {
+            return Ok(Some(Arc::clone(ctx)));
+        }
+        #[cfg(feature = "channel-telegram")]
+        if msg.channel == "telegram"
+            && let (Some(dynamic), Some(channel_alias)) = (
+                self.dynamic_agents.as_ref(),
+                msg.channel_alias
+                    .as_deref()
+                    .filter(|alias| !alias.is_empty()),
+            )
+        {
+            let live_route_state = {
+                let config = dynamic.config_arc.read();
+                let Some(telegram) = config.channels.telegram.get(channel_alias) else {
+                    return Ok(None);
+                };
+                if telegram.is_routed() {
+                    Some(config.telegram_route_table(channel_alias))
+                } else {
+                    None
+                }
+            };
+            if let Some(route_table) = live_route_state {
+                // A configured static route wins. Invalid and unmatched
+                // route tables stay closed and never fall back to a
+                // different alias or an unrelated owner.
+                let route_table = route_table.unwrap_or_default();
+                if let Some(agent) =
+                    route_table.agent_for(&msg.reply_target, msg.platform_sender_id.as_deref())
+                {
+                    return Ok(self.by_agent.get(agent).cloned());
+                }
+                if let Some((membership_alias, membership)) = dynamic.membership_for_message(msg)? {
+                    return dynamic
+                        .resolve_membership(&membership_alias, membership)
+                        .await;
+                }
+                return Ok(None);
+            }
+            // An ordinary Telegram alias uses its static owner table.
+            // Bypass the startup route-table snapshot so a removed or
+            // newly invalid routed policy cannot authorize stale traffic.
+            let composite = format!("telegram.{channel_alias}");
+            return Ok(self
+                .owner_by_channel_key
+                .get(&composite)
+                .and_then(|agent| self.by_agent.get(agent))
+                .cloned());
+        }
+        Ok(self.resolve(msg))
     }
 }
 
@@ -11405,9 +11850,16 @@ async fn run_message_dispatch_loop(
             }
         }
 
-        let Some(ctx) = router.resolve(&msg) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
-            continue;
+        let ctx = match router.resolve_async(&msg).await {
+            Ok(Some(ctx)) => ctx,
+            Ok(None) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
+                continue;
+            }
+            Err(error) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "error": format!("{error:#}")})), "dropping inbound message: dynamic agent initialization failed");
+                continue;
+            }
         };
 
         // Gate answers were already considered against the global approval
@@ -11687,6 +12139,8 @@ async fn run_message_dispatch_loop(
                             dispatch_ownership,
                             registration,
                             pending_work,
+                            #[cfg(feature = "channel-telegram")]
+                            dynamic_agents: router.dynamic_agents.clone(),
                         }),
                         order: ingress_order.register(&source_key),
                     };
@@ -11750,6 +12204,8 @@ async fn run_message_dispatch_loop(
                     dispatch_ownership,
                     registration,
                     pending_work,
+                    #[cfg(feature = "channel-telegram")]
+                    dynamic_agents: router.dynamic_agents.clone(),
                 }),
                 order: ingress_order.register(&source_key),
             }),
@@ -13516,8 +13972,29 @@ fn collect_configured_channels(
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Vec<ConfiguredChannel> {
+    let mut membership_stores = HashMap::new();
+    collect_configured_channels_with_membership_stores(
+        config_arc,
+        matrix_skip_context,
+        tool_specs,
+        sop_engine,
+        sop_audit,
+        &mut membership_stores,
+    )
+}
+
+fn collect_configured_channels_with_membership_stores(
+    config_arc: &Arc<RwLock<Config>>,
+    matrix_skip_context: &str,
+    tool_specs: &[(String, String)],
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    membership_stores: &mut TelegramMembershipStores,
+) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
     let _ = tool_specs;
+    #[cfg(not(feature = "channel-telegram"))]
+    let _ = membership_stores;
     #[cfg(not(feature = "channel-amqp"))]
     let _ = (&sop_engine, &sop_audit);
     #[allow(unused_mut)]
@@ -13552,6 +14029,40 @@ fn collect_configured_channels(
         if !tg.enabled {
             continue;
         }
+        let invitation_store = if tg.invitations.is_some() {
+            if let Err(error) = config
+                .validate_telegram_routes(alias, tg)
+                .and_then(|()| config.validate_telegram_invitations(alias, tg))
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("telegram.{alias}"), "error": format!("{error:#}")})),
+                    "Skipping Telegram invitations channel with invalid policy"
+                );
+                continue;
+            }
+            match crate::telegram_memberships::MembershipStore::open(&config.data_dir, alias) {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    membership_stores.insert(alias.clone(), Arc::clone(&store));
+                    Some(store)
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"channel": format!("telegram.{alias}"), "error": format!("{error:#}")})),
+                        "Skipping Telegram invitations channel because its membership store could not be opened"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let ack = tg.ack_reactions.unwrap_or(config.channels.ack_reactions);
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
@@ -13563,34 +14074,40 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let mut telegram_channel = TelegramChannel::new(
+            tg.bot_token.clone(),
+            alias.clone(),
+            peer_resolver,
+            tg.mention_only,
+        )
+        .with_voice_peer_resolver(voice_peer_resolver)
+        .with_persistence(config_arc.clone());
+        if let Some(store) = invitation_store {
+            telegram_channel = telegram_channel.with_invitations(store);
+        }
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
-                    TelegramChannel::new(
-                        tg.bot_token.clone(),
-                        alias.clone(),
-                        peer_resolver,
-                        tg.mention_only,
-                    )
-                    .with_voice_peer_resolver(voice_peer_resolver)
-                    .with_persistence(config_arc.clone())
-                    .with_api_base(tg.api_base_url.clone())
-                    .with_ack_reactions(ack)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_passive_group_context(tg.passive_group_context)
-                    .with_transcription_manager(
-                        config.transcription.clone(),
-                        resolved_transcription_manager(&config, &format!("telegram.{alias}")),
-                    )
-                    .with_tts(&config)
-                    .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
-                    .with_proxy_url(tg.proxy_url.clone())
-                    .with_tool_command_specs(tool_specs.to_vec())
-                    .with_per_user_session(tg.per_user_session)
-                    .with_approval_timeout_secs(tg.approval_timeout_secs)
-                    .with_text_only(tg.is_routed()),
+                    telegram_channel
+                        .with_api_base(tg.api_base_url.clone())
+                        .with_ack_reactions(ack)
+                        .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                        .with_passive_group_context(tg.passive_group_context)
+                        .with_transcription_manager(
+                            config.transcription.clone(),
+                            resolved_transcription_manager(&config, &format!("telegram.{alias}")),
+                        )
+                        .with_tts(&config)
+                        .with_workspace_dir(
+                            config.channel_workspace_dir(&format!("telegram.{alias}")),
+                        )
+                        .with_proxy_url(tg.proxy_url.clone())
+                        .with_tool_command_specs(tool_specs.to_vec())
+                        .with_per_user_session(tg.per_user_session)
+                        .with_approval_timeout_secs(tg.approval_timeout_secs)
+                        .with_text_only(tg.is_routed()),
                 ),
                 tg,
             ),
@@ -15839,303 +16356,38 @@ pub async fn start_channels_with_plugin_webhooks(
         None;
 
     let mut agent_ctxs: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+    let mut membership_stores = HashMap::new();
 
     for agent_alias in &enabled_agents {
-        let agent = config
-            .resolved_agent_config(agent_alias)
-            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
-        let risk_profile = config
-            .risk_profile_for_agent(agent_alias)
-            .with_context(|| {
-                format!(
-                    "agents.{agent_alias}.risk_profile does not name a configured risk_profiles entry"
-                )
-            })?
-            .clone();
-
-        // Resolve the agent's model provider strictly from its mandatory
-        // `<type>.<alias>` reference. No fallback to a first/default provider:
-        // an agent whose ref does not resolve to a configured entry with a
-        // `model` is rejected here.
-        let runtime_defaults = runtime_defaults_from_config(&config, agent.model_provider.as_str())
-            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
-        let provider_name = runtime_defaults.default_model_provider.clone();
-        let model = runtime_defaults.model.clone();
-        let temperature = runtime_defaults.temperature;
-        let provider_api_key = runtime_defaults.api_key.clone();
-        let provider_api_url = runtime_defaults.api_url.clone();
-        let provider_reliability = runtime_defaults.reliability.clone();
-        let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
-        let model_provider: Arc<dyn ModelProvider> = Arc::from(
-            create_resilient_model_provider_nonblocking(
-                Arc::new(config.clone()),
-                &provider_name,
-                provider_api_key.clone(),
-                provider_api_url.clone(),
-                provider_reliability.clone(),
-                provider_runtime_options.clone(),
-            )
-            .await?,
-        );
-
-        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"error": format!("{}", e), "agent": agent_alias})
-                    ),
-                "ModelProvider warmup failed (non-fatal)"
-            );
-        }
-
-        let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
+        let prepared = agent_factory::PreparedChannelAgent::prepare(
             &config,
+            Arc::clone(&config_arc),
             agent_alias,
-            provider_api_key.as_deref(),
-        )
-        .await?;
-        let (composio_key, composio_entity_id) = if config.composio.enabled {
-            (
-                config.composio.api_key.as_deref(),
-                Some(config.composio.entity_id.as_str()),
-            )
-        } else {
-            (None, None)
-        };
-
-        let workspace = config.agent_workspace_dir(agent_alias);
-        // Per-agent skills: install-wide workspace + open_skills set,
-        // unioned with this agent's declared `skill_bundles`.
-        let skills =
-            zeroclaw_runtime::skills::load_skills_for_agent(&workspace, &config, agent_alias);
-
-        let all_tools_result_ch = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            &risk_profile,
-            agent_alias,
+            Arc::clone(&observer),
             Arc::clone(&runtime),
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            provider_api_key.as_deref(),
-            &config,
             canvas_store.clone(),
-            false,
-            None,
             sop_engine.clone(),
             sop_audit.clone(),
-            Some(Arc::clone(&config_arc)),
-        )?;
-        // Route the per-agent tool registry through the one gated seam - see
-        // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
-        // text-tool prompt policy below may clear `deferred_section` for a
-        // non-native strict-tool-parsing target.
-        let ChannelAssembledTools {
-            tools: built_tools,
-            mut deferred_section,
-            pinned_section,
-            ask_user_handle: ask_user_handle_ch,
-            reaction_handle: reaction_handle_ch,
-            poll_handle: poll_handle_ch,
-            escalate_handle: escalate_handle_ch,
-            channel_room_handle: channel_room_handle_ch,
-            activated_handle: ch_activated_handle,
-        } = assemble_channel_agent_tools(
-            &config,
-            agent_alias,
-            provider_name.as_str(),
-            model.as_str(),
-            &security,
-            all_tools_result_ch,
-            &skills,
-            Arc::clone(&runtime),
-        )
-        .await;
-
-        let tool_specs: Vec<(String, String)> = built_tools
-            .iter()
-            .map(|t| (t.name().to_string(), t.description().to_string()))
-            .collect();
-
-        let tools_registry = Arc::new(built_tools);
-
-        let mut tool_descs: Vec<(&str, &str)> = vec![
-            (
-                "shell",
-                "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-            ),
-            (
-                "file_read",
-                "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-            ),
-            (
-                "file_write",
-                "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-            ),
-            (
-                "memory_store",
-                "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-            ),
-            (
-                "memory_recall",
-                "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-            ),
-            (
-                "memory_forget",
-                "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-            ),
-        ];
-
-        if matches!(
-            config.effective_skills_prompt_mode(agent_alias),
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-        ) {
-            tool_descs.push((
-                "read_skill",
-                "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-            ));
-        }
-        if config.browser.enabled {
-            tool_descs.push((
-                "browser_open",
-                "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-            ));
-        }
-        if config.composio.enabled {
-            tool_descs.push((
-                "composio",
-                "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
-            ));
-        }
-        tool_descs.push((
-            "schedule",
-            "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-        ));
-        tool_descs.push((
-            "pushover",
-            "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
-        ));
-        tool_descs.push((
-            "channel_room",
-            "Create channel rooms and invite users through active channels. Use with Matrix channel keys such as matrix.default.",
-        ));
-        if !config.agents.is_empty() {
-            tool_descs.push((
-                "delegate",
-                "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
-            ));
-        }
-        if config.channels.email.values().any(|c| c.enabled) {
-            tool_descs.push((
-                "email_search",
-                "Search the IMAP inbox by sender, subject, or date. Returns a list of matching emails with UID, sender, subject, and date. Use when asked about email. Follow up with email_read to fetch the full body.",
-            ));
-            tool_descs.push((
-                "email_read",
-                "Fetch the full content of an email by its UID (from email_search). Returns sender, to, date, subject, body text, and attachments.",
-            ));
-        }
-
-        // Filter out tools excluded for non-CLI channels so this agent's
-        // system prompt does not advertise them for channel-driven runs.
-        {
-            let active_profile = &risk_profile;
-            let excluded = &active_profile.excluded_tools;
-            if !excluded.is_empty() && active_profile.level != AutonomyLevel::Full {
-                tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
-            }
-        }
-        let effective_tool_names =
-            effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
-        tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
-
-        let bootstrap_max_chars = if agent.resolved.compact_context {
-            Some(6000)
-        } else {
-            None
-        };
-        let startup_excluded_tools: &[String] = if risk_profile.level == AutonomyLevel::Full {
-            &[]
-        } else {
-            &risk_profile.excluded_tools
-        };
-        let native_tools = ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
-            model_provider.as_ref(),
-            model.as_str(),
-            tools_registry.as_ref(),
-            startup_excluded_tools,
-            ch_activated_handle.as_ref(),
-        )?;
-        let expose_text_tool_protocol = compose_channel_mcp_prompt_sections(
-            native_tools,
-            agent.resolved.strict_tool_parsing,
-            &mut tool_descs,
-            &mut deferred_section,
-            &pinned_section,
-        );
-        let callable_protocol_exposed = native_tools || expose_text_tool_protocol;
-        let mut system_prompt = build_system_prompt_with_mode_and_effective_tools(
-            &workspace,
-            &model,
-            &tool_descs,
-            |name| callable_protocol_exposed && effective_tool_names.contains(name),
-            &skills,
-            Some(&agent.identity),
-            bootstrap_max_chars,
-            Some(&risk_profile),
-            native_tools,
-            config.effective_skills_prompt_mode(agent_alias),
-            agent.resolved.compact_context,
-            agent.resolved.max_system_prompt_chars,
             true,
-            config.channels.show_tool_calls,
-            runtime.shell_profile().as_ref(),
-        );
-        if expose_text_tool_protocol {
-            system_prompt.push_str(&build_tool_instructions_for_names(
-                tools_registry.as_ref(),
-                &effective_tool_names,
-            ));
-        }
-        if !deferred_section.is_empty() {
-            system_prompt.push('\n');
-            system_prompt.push_str(&deferred_section);
-        }
-        if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
-        {
-            system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
-        }
+        )
+        .await?;
+        let tool_specs = &prepared.tool_specs;
 
         if channels_by_name_shared.is_none() {
-            if !skills.is_empty() {
-                println!(
-                    "  🧩 Skills:   {}",
-                    skills
-                        .iter()
-                        .map(|s| s.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+            if !prepared.skill_names().is_empty() {
+                println!("  🧩 Skills:   {}", prepared.skill_names().join(", "));
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> = collect_configured_channels(
-                &config_arc,
-                "runtime startup",
-                &tool_specs,
-                sop_engine.clone(),
-                sop_audit.clone(),
-            );
+            let mut configured_channels: Vec<ConfiguredChannel> =
+                collect_configured_channels_with_membership_stores(
+                    &config_arc,
+                    "runtime startup",
+                    tool_specs,
+                    sop_engine.clone(),
+                    sop_audit.clone(),
+                    &mut membership_stores,
+                );
 
             #[cfg(feature = "channel-nostr")]
             {
@@ -16234,7 +16486,7 @@ pub async fn start_channels_with_plugin_webhooks(
             }
 
             println!("🦀 ZeroClaw Channel Server");
-            println!("  🤖 Model:    {model} (agent: {agent_alias})");
+            println!("  🤖 Model:    {} (agent: {agent_alias})", prepared.model());
             let effective_backend = config.resolve_active_storage().kind();
             println!(
                 "  🧠 Memory:   {} (auto-save: {})",
@@ -16292,141 +16544,7 @@ pub async fn start_channels_with_plugin_webhooks(
                 .expect("channels_by_name initialized on first iteration"),
         );
 
-        // Wire this agent's reaction / ask_user / channel room / escalate tool handles
-        // into the shared `channels_by_name` map.
-        {
-            let mut map = reaction_handle_ch.write();
-            for (name, ch) in channels_by_name.as_ref() {
-                map.insert(name.clone(), Arc::clone(ch));
-            }
-        }
-        if let Some(ref handle) = ask_user_handle_ch {
-            let mut map = handle.write();
-            for (name, ch) in channels_by_name.as_ref() {
-                map.insert(name.clone(), Arc::clone(ch));
-            }
-        }
-        if let Some(ref handle) = channel_room_handle_ch {
-            let mut map = handle.write();
-            for (name, ch) in channels_by_name.as_ref() {
-                map.insert(name.clone(), Arc::clone(ch));
-            }
-        }
-        if let Some(ref handle) = poll_handle_ch {
-            let mut map = handle.write();
-            for (name, ch) in channels_by_name.as_ref() {
-                map.insert(name.clone(), Arc::clone(ch));
-            }
-        }
-        if let Some(ref handle) = escalate_handle_ch {
-            let mut map = handle.write();
-            for (name, ch) in channels_by_name.as_ref() {
-                map.insert(name.clone(), Arc::clone(ch));
-            }
-        }
-
-        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert(provider_name.clone(), Arc::clone(&model_provider));
-        let message_timeout_secs =
-            effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
-        let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
-
-        let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(
-            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                Arc::clone(&mem),
-                config.memory.clone(),
-                config.data_dir.clone(),
-            ),
-        );
-
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::clone(&channels_by_name),
-            model_provider: Arc::clone(&model_provider),
-            model_provider_ref: Arc::new(provider_name.clone()),
-            agent_alias: Arc::new(agent_alias.clone()),
-            agent_cfg: Arc::new(agent.clone()),
-            prompt_config: Arc::new(config.clone()),
-            memory: Arc::clone(&mem),
-            memory_strategy,
-            tools_registry: Arc::clone(&tools_registry),
-            observer: Arc::clone(&observer),
-            system_prompt: Arc::new(system_prompt),
-            model: Arc::new(model.clone()),
-            temperature,
-            auto_save_memory: config.memory.auto_save,
-            max_tool_iterations: config.effective_max_tool_iterations(agent_alias.as_str()),
-            min_relevance_score: config.memory.min_relevance_score,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
-                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
-            ))),
-            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
-                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
-            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
-            reliability: Arc::new(config.reliability.clone()),
-            provider_runtime_options,
-            workspace_dir: Arc::new(workspace.clone()),
-            message_timeout_secs,
-            interrupt_on_new_message,
-            multimodal: config.multimodal.clone(),
-            media_pipeline: config.media_pipeline.clone(),
-            transcription_config: config.transcription.clone(),
-            agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                Some(Arc::new(zeroclaw_runtime::hooks::HookRunner::from_config(
-                    &config.hooks,
-                )))
-            } else {
-                None
-            },
-            non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
-            autonomy_level: risk_profile.level,
-            tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),
-            model_routes: Arc::new(config.model_routes.clone()),
-            query_classification: config.query_classification.clone(),
-            ack_reactions: config.channels.ack_reactions,
-            show_tool_calls: config.channels.show_tool_calls,
-            session_store: shared_session_store.clone(),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
-            activated_tools: ch_activated_handle,
-            cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
-                config.cost.clone(),
-                &config.data_dir,
-            )
-            .map(|tracker| {
-                let by_type =
-                    zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
-                ChannelCostTrackingState {
-                    tracker,
-                    model_provider_pricing: Arc::new(by_type),
-                    agent_alias: Arc::new(agent_alias.clone()),
-                }
-            }),
-            pacing: config.pacing.clone(),
-            max_tool_result_chars: agent.resolved.max_tool_result_chars,
-            context_token_budget: agent.resolved.effective_context_budget(),
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::from_millis(config.channels.debounce_ms),
-            )),
-            receipt_generator: if agent.resolved.tool_receipts.enabled {
-                Some(zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new())
-            } else {
-                None
-            },
-            show_receipts_in_response: agent.resolved.tool_receipts.show_in_response,
-            last_applied_config_stamp: Arc::new(Mutex::new(None)),
-            runtime_defaults_override: Arc::new(Mutex::new(None)),
-            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            sop_engine: sop_engine.clone(),
-            sop_audit: sop_audit.clone(),
-        });
-
+        let runtime_ctx = prepared.finish(channels_by_name, shared_session_store.clone());
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
@@ -16510,8 +16628,22 @@ pub async fn start_channels_with_plugin_webhooks(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit)
-        .with_telegram_routes(&config);
+    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    #[cfg(feature = "channel-telegram")]
+    let router = router.with_dynamic_agents(
+        Arc::clone(&config_arc),
+        Arc::clone(&observer),
+        Arc::clone(&runtime),
+        canvas_store.clone(),
+        Arc::clone(
+            channels_by_name_shared
+                .as_ref()
+                .expect("channels_by_name initialized before router construction"),
+        ),
+        shared_session_store.clone(),
+        membership_stores,
+    );
+    let router = router.with_telegram_routes(&config);
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -37004,6 +37136,8 @@ BTC is currently around $65,000 based on latest tool output."#
             delivery_message_id,
             registration: Some(registration),
             pending_work,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         });
 
         match lanes.enqueue("conversation", turn) {
@@ -40716,6 +40850,8 @@ BTC is currently around $65,000 based on latest tool output."#
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         };
         run_message_dispatch_loop(rx, router, 1).await;
 
@@ -40880,6 +41016,8 @@ BTC is currently around $65,000 based on latest tool output."#
             delivery_message_id,
             registration: Some(registration),
             pending_work,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         });
         let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(1)));
         let worker = zeroclaw_spawn::spawn!(Arc::clone(&lanes).process_turn(turn));
@@ -48300,6 +48438,7 @@ This is an example JSON object for profile settings."#;
                 enabled: true,
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                invitations: None,
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
@@ -48333,6 +48472,7 @@ This is an example JSON object for profile settings."#;
                 enabled: true,
                 bot_token: "test-token".to_string(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
+                invitations: None,
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 multi_message_delay_ms: 800,
@@ -51609,6 +51749,8 @@ Done."#;
             single_ctx: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         }
     }
 
@@ -51713,6 +51855,8 @@ Done."#;
             single_ctx: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
+            #[cfg(feature = "channel-telegram")]
+            dynamic_agents: None,
         };
         (router, engine, run_id)
     }

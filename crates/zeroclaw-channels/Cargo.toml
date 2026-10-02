@@ -224,7 +224,7 @@ channel-email = [
 tls-client = ["dep:tokio-rustls", "dep:webpki-roots"]
 ws-transport = ["zeroclaw-config/ws-transport", "dep:tokio-tungstenite"]
 image-normalization = ["dep:image"]
-channel-telegram = ["image-normalization"]
+channel-telegram = ["image-normalization", "dep:rusqlite"]
 channel-lark = ["dep:aes", "dep:axum", "dep:cbc", "dep:prost", "ws-transport"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and

@@ -16,6 +16,9 @@ use zeroclaw_config::schema::{
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
+#[path = "telegram_invitation_commands.rs"]
+mod invitation_commands;
+
 /// How long a successful `getUpdates` exchange stays evidence that the listener
 /// is working.
 ///
@@ -935,6 +938,7 @@ pub struct TelegramChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     persist: Option<Arc<RwLock<Config>>>,
     pairing: Option<PairingGuard>,
+    invitations: Option<Arc<crate::telegram_memberships::MembershipStore>>,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
@@ -2562,6 +2566,7 @@ impl TelegramChannel {
             peer_resolver,
             persist: None,
             pairing,
+            invitations: None,
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
@@ -3590,6 +3595,17 @@ impl TelegramChannel {
         self
     }
 
+    /// Enable durable invitations while resolving their policy from live config.
+    pub(crate) fn with_invitations(
+        mut self,
+        store: Arc<crate::telegram_memberships::MembershipStore>,
+    ) -> Self {
+        self.invitations = Some(store);
+        self.pairing = None;
+        self.text_only = true;
+        self
+    }
+
     /// The conflict message when a matching `ignore` denies `identity`.
     ///
     /// Asked before `try_pair`, because pairing consumes the one-time code.
@@ -4500,7 +4516,12 @@ impl TelegramChannel {
 
         let identities = Self::authorization_identities(message);
 
-        if self.is_any_user_allowed(identities.iter().map(String::as_str)) {
+        if self.message_sender_is_allowed(message) {
+            return;
+        }
+        if self.invitations.is_some() {
+            self.send_invitation_notice("channel-telegram-invitation-required", &chat_id)
+                .await;
             return;
         }
 
@@ -5702,12 +5723,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let message = update.get("message")?;
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
+        if (self.invitations.is_some() && Self::invitation_command(text).is_some())
+            || self.is_dynamic_settings_command(message, text)
+        {
+            return None;
+        }
 
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
-        let identities = Self::authorization_identities(message);
-
-        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
+        if !self.message_sender_is_allowed(message) {
             return None;
         }
 
@@ -6752,8 +6776,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
 
         let has_response = response.is_some();
-        let (identities, callback_chat_id) = Self::approval_callback_context(cb);
-        let responder_allowed = self.is_any_user_allowed(identities.iter().map(String::as_str));
+        let (_, callback_chat_id) = Self::approval_callback_context(cb);
+        let responder_allowed = self.approval_callback_sender_is_allowed(cb);
         let (resolution, resolved_tool) = match (response, callback_chat_id.as_deref()) {
             (Some(response), Some(chat_id)) => {
                 crate::util::resolve_pending_approval_with_tool(
@@ -6978,6 +7002,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // its failure is logged, but a failed spinner dismissal must not
             // hold up the offset, since retrying the update would re-run the
             // approval side effect that has already been applied.
+            if uid.is_some() {
+                *transient_retry = None;
+            }
+            return UpdateOutcome::Advanced;
+        }
+
+        if self.handle_invitation_command(update).await {
             if uid.is_some() {
                 *transient_retry = None;
             }

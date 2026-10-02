@@ -1302,3 +1302,23 @@ channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
+
+# Durable Telegram invitations and group activation.
+channel-telegram-invitation-created = Share this invitation privately. It expires and can be used once: { $link }
+channel-telegram-invitation-welcome = You're invited. Send a message to start your private conversation.
+channel-telegram-invitation-invalid = This invitation is invalid, expired, or already used. Ask the owner for a new invitation.
+channel-telegram-invitation-required = Ask the owner for a private invitation to this bot.
+channel-telegram-invitation-rejected = This enrollment command was rejected. Send a new command directly to this bot.
+channel-telegram-invitation-owner-only = Only the owner can use this command. Manage invitations in a private chat with the bot.
+channel-telegram-invitation-unavailable = Enrollment is temporarily unavailable. Please try again later.
+channel-telegram-invitation-static-route = This chat is managed by the bot's configuration and cannot be changed through invitations.
+channel-telegram-invitation-group-active = This group is approved. Its conversation and memory are separate from private chats.
+channel-telegram-invitation-group-only = Send /activate in the group you want to approve.
+channel-telegram-invitation-no-guests = There are no active invited chats.
+channel-telegram-invitation-guests = Active invited chats:
+    { $entries }
+channel-telegram-invitation-revoked = Access revoked. Existing memory and conversation history are retained.
+channel-telegram-invitation-no-membership = This chat has no active invitation membership.
+channel-telegram-invitation-revoke-usage = Use /revoke followed by a numeric chat ID from /guests.
+
+channel-telegram-invitation-settings-restricted = The owner manages this chat's model and settings.
