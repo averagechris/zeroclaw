@@ -225,3 +225,20 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+# OpenAI image generation and editing
+tool-image-gen-openai-description = Generate an image or edit images from this conversation using the existing Codex login. Use images to supply reference paths from this agent's workspace. The result is saved and sent as an image.
+tool-image-gen-openai-prompt = Describe the image to create or the changes to make.
+tool-image-gen-openai-images = Up to four reference image paths inside this agent's workspace. Omit to generate a new image.
+tool-image-gen-openai-size = Output dimensions. Default is 1024x1024.
+tool-image-gen-openai-quality = Rendering quality. Default is medium.
+tool-image-gen-openai-background = Use transparent for a cutout or sticker. Default is auto.
+tool-image-gen-openai-invalid-options = Invalid image options. Check the tool's size, quality, background, and reference-image limits.
+tool-image-gen-openai-missing-prompt = Provide a nonempty image prompt.
+tool-image-gen-openai-file-error = Could not read or save the image in this agent's workspace.
+tool-image-gen-openai-outside-workspace = Image references and output files must stay inside this agent's workspace.
+tool-image-gen-openai-input-limit = Image editing accepts up to four reference images, totaling at most 20 MiB.
+tool-image-gen-openai-image-type = Reference images must be PNG, JPEG, or WebP.
+tool-image-gen-openai-api-failed = The image request failed. Check the Codex login, usage limits, and configured image model.
+tool-image-gen-openai-response-failed = OpenAI returned an invalid or missing image.
+tool-image-gen-openai-output-limit = The generated image exceeds the response size limit.

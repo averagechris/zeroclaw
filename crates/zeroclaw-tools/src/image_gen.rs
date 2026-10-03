@@ -9,6 +9,9 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_config::schema::ImageGenProvider;
+
+mod codex;
 
 const FAL_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const FAL_ERROR_LIMIT_BYTES: usize = 16 * 1024;
@@ -191,6 +194,11 @@ async fn read_generated_image_body(response: reqwest::Response) -> anyhow::Resul
 }
 
 pub struct ImageGenTool {
+    provider: ImageGenProvider,
+    codex: Option<(
+        zeroclaw_providers::openai_codex::OpenAiCodexModelProvider,
+        String,
+    )>,
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
     default_model: String,
@@ -229,6 +237,8 @@ impl ImageGenTool {
         nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            provider: ImageGenProvider::Fal,
+            codex: None,
             security,
             workspace_dir,
             default_model,
@@ -239,6 +249,21 @@ impl ImageGenTool {
                 "security.nat64_prefixes",
             )?,
         })
+    }
+
+    /// Select the configured image backend without changing legacy constructors.
+    pub fn with_codex(
+        mut self,
+        provider: zeroclaw_providers::openai_codex::OpenAiCodexModelProvider,
+        model: String,
+    ) -> Self {
+        self.codex = Some((provider, model));
+        self
+    }
+
+    pub fn with_provider(mut self, provider: ImageGenProvider) -> Self {
+        self.provider = provider;
+        self
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -476,11 +501,17 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
+        if self.provider == ImageGenProvider::OpenaiCodex {
+            return codex::description();
+        }
         "Generate an image from a text prompt using fal.ai (Flux models). \
          Saves the result to the workspace images directory and returns the file path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        if self.provider == ImageGenProvider::OpenaiCodex {
+            return codex::parameters_schema();
+        }
         json!({
             "type": "object",
             "required": ["prompt"],
@@ -519,7 +550,11 @@ impl Tool for ImageGenTool {
             });
         }
 
-        let mut result = self.generate(args).await?;
+        let mut result = if self.provider == ImageGenProvider::OpenaiCodex {
+            self.generate_codex(args).await?
+        } else {
+            self.generate(args).await?
+        };
         // A generated image saved to an ephemeral workspace never reaches the
         // host and is lost at session end; warn loudly on success
         if !self.persistent_writes && result.success {

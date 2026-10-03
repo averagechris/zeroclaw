@@ -40,6 +40,38 @@ A minimal build ships with:
 | `ask_user` | Send a question to the active channel and wait for a reply. Supports optional `choices` for structured responses (inline keyboard on Telegram, numbered list on CLI). On ACP, `choices` are required: free-form ask awaits the ACP elicitation RFD. Parameters: `question` (required), `choices` (optional list), `timeout_secs` (default 600). |
 | `escalate_to_human` | Send a structured escalation message with urgency routing. `high` / `critical` urgency additionally notifies any channels listed in `[escalation] alert_channels`. Parameters: `summary` (required), `context` (optional), `urgency` (`low`/`medium`/`high`/`critical`, default `medium`), `wait_for_response` (bool, default false), `timeout_secs` (default 600). On ACP, `wait_for_response: true` fails immediately if the channel cannot receive free-form replies (awaits ACP elicitation RFD). |
 
+### Image generation and editing
+
+Enable `image_gen` to create images and edit local references:
+
+```toml
+[image_gen]
+enabled = true
+provider = "openai_codex"
+default_model = "gpt-image-2"
+```
+
+The Codex backend uses the agent's configured OpenAI model profile and existing
+Codex login, including its selected auth profile and token refresh. That model
+profile must set `requires_openai_auth = true`. No image API key is needed.
+Image requests count toward the signed-in account's Codex usage.
+
+Call `image_gen` with `prompt` and optionally `images`, an array of up to four
+PNG, JPEG, or WebP reference paths. References must belong to the current
+agent's workspace, even when the agent has broader read permissions. Combined
+references and each generated image are limited to 20 MiB. The tool accepts
+`size`, `quality`, and `background`; use `background = "transparent"` for cutouts.
+
+Results are saved under that workspace's `images/` directory with unique names
+and returned with an `[IMAGE:path]` marker for channel delivery and later edits.
+Interrupted, failed, or oversized streams produce no output image. Invited
+Telegram chats can receive the `image_gen` permission without host-control or
+cross-chat access.
+
+Existing configurations keep the fal.ai backend. Set `provider = "fal"` to
+select it explicitly; its model, API-key environment variable, and tool
+parameters retain their existing behavior.
+
 ### AnySearch provider
 
 AnySearch is an explicit, opt-in backend for `web_search_tool`:
