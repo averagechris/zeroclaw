@@ -4795,6 +4795,7 @@ mod tests {
             thread_ts: None,
             cancellation_token: None,
             attachments: Vec::new(),
+            attachment_workspace: None,
             in_reply_to: None,
             references: Vec::new(),
             force_voice: false,
