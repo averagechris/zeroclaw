@@ -1872,7 +1872,35 @@ fn all_tools_with_runtime_on_thread(
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
             root_config.security.nat64_prefixes.clone(),
-        ) {
+        )
+        .and_then(|tool| {
+            let tool = tool.with_provider(root_config.image_gen.provider);
+            if root_config.image_gen.provider
+                != zeroclaw_config::schema::ImageGenProvider::OpenaiCodex
+            {
+                return Ok(tool);
+            }
+            let (family, alias, entry) = root_config
+                .resolved_model_provider_for_agent(agent_alias)
+                .ok_or_else(|| {
+                    anyhow::Error::msg("Codex image generation requires an agent model profile")
+                })?;
+            anyhow::ensure!(
+                family == "openai" && entry.requires_openai_auth,
+                "Codex image generation requires an OpenAI login model profile"
+            );
+            let options =
+                zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
+            let provider = zeroclaw_providers::openai_codex::OpenAiCodexModelProvider::new(
+                alias,
+                &options,
+                entry.api_key.as_deref(),
+            )?;
+            let model = entry.model.clone().ok_or_else(|| {
+                anyhow::Error::msg("Codex image generation requires a configured model")
+            })?;
+            Ok(tool.with_codex(provider, model))
+        }) {
             Ok(tool) => tool_arcs.push(Arc::new(tool)),
             Err(e) => {
                 ::zeroclaw_log::record!(

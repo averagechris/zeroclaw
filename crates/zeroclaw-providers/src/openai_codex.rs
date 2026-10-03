@@ -1,3 +1,6 @@
+mod image_generation;
+pub use image_generation::CodexImageRequest;
+
 use crate::ModelProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
@@ -1319,7 +1322,7 @@ impl OpenAiCodexModelProvider {
         account_id: Option<&str>,
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
-        request: &ResponsesRequest,
+        stream: bool,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = self
             .http_client()
@@ -1329,7 +1332,7 @@ impl OpenAiCodexModelProvider {
             .header("originator", "pi")
             .header("Content-Type", "application/json");
 
-        if request.stream {
+        if stream {
             request_builder = request_builder.header("accept", "text/event-stream");
         }
 
@@ -1405,7 +1408,7 @@ impl OpenAiCodexModelProvider {
             creds.account_id.as_deref(),
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
-            &request,
+            request.stream,
         );
 
         let response = request_builder.json(&request).send().await?;
@@ -1439,7 +1442,7 @@ impl OpenAiCodexModelProvider {
                         creds.account_id.as_deref(),
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
-                        &request,
+                        request.stream,
                     )
                     .json(&request)
                     .send()
@@ -1655,7 +1658,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     creds.account_id.as_deref(),
                     creds.access_token.as_deref(),
                     creds.use_gateway_api_key_auth,
-                    &request,
+                    request.stream,
                 )
                 .json(&request);
 
@@ -1876,7 +1879,7 @@ mod tests {
             parallel_tool_calls: None,
         };
         let request_builder =
-            provider.responses_request_builder("test-key", None, None, true, &request);
+            provider.responses_request_builder("test-key", None, None, true, request.stream);
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response_body: serde_json::Value = request_builder

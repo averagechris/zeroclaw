@@ -5086,8 +5086,9 @@ impl Config {
                             | "memory_forget"
                             | "web_search_tool"
                             | "reaction"
+                            | "image_gen"
                     )),
-                "Telegram invitation templates only allow memory tools, web search, and scoped reactions"
+                "Telegram invitation templates only allow memory tools, web search, scoped reactions, and workspace image generation"
             );
             anyhow::ensure!(
                 !tg.routes
@@ -10192,8 +10193,8 @@ impl Default for ImageProviderFluxConfig {
 /// Standalone image generation tool configuration (`[image_gen]`).
 ///
 /// When enabled, registers an `image_gen` tool that generates images via
-/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
-/// to the workspace `images/` directory.
+/// fal.ai or the agent's existing Codex login.
+/// Generated and edited images are saved to the workspace `images/` directory.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image_gen"]
@@ -10202,14 +10203,29 @@ pub struct ImageGenConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Default fal.ai model identifier.
+    /// Image generation backend. Existing configurations keep fal.ai.
+    #[serde(default)]
+    pub provider: ImageGenProvider,
+
+    /// Default model identifier for the selected image API.
     #[serde(default = "default_image_gen_model")]
     pub default_model: String,
 
-    /// Environment variable name holding the fal.ai API key.
+    /// Environment variable holding the fal.ai API key. Unused with Codex login.
     #[serde(default = "default_image_gen_api_key_env")]
     #[credential_class = "legacy_env_path"]
     pub api_key_env: String,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum ImageGenProvider {
+    #[default]
+    Fal,
+    OpenaiCodex,
 }
 
 fn default_image_gen_model() -> String {
@@ -10224,6 +10240,7 @@ impl Default for ImageGenConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: ImageGenProvider::default(),
             default_model: default_image_gen_model(),
             api_key_env: default_image_gen_api_key_env(),
         }
@@ -27614,6 +27631,77 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn image_generation_invitation_grant_preserves_host_control_restrictions() {
+        let mut config = Config::default();
+        config.risk_profiles.insert(
+            "guests".into(),
+            RiskProfileConfig {
+                allowed_tools: vec!["image_gen".into(), "memory_recall".into()],
+                ..Default::default()
+            },
+        );
+        for alias in ["guest", "group"] {
+            config.agents.insert(
+                alias.into(),
+                AliasedAgentConfig {
+                    risk_profile: "guests".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let telegram = TelegramConfig {
+            per_user_session: false,
+            invitations: Some(TelegramInvitationsConfig {
+                owner_id: "1001".into(),
+                guest_agent: "guest".into(),
+                group_agent: "group".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            config
+                .validate_telegram_invitations("home", &telegram)
+                .is_ok()
+        );
+        config
+            .risk_profiles
+            .get_mut("guests")
+            .unwrap()
+            .allowed_tools
+            .push("shell".into());
+        assert!(
+            config
+                .validate_telegram_invitations("home", &telegram)
+                .is_err()
+        );
+        config
+            .risk_profiles
+            .get_mut("guests")
+            .unwrap()
+            .allowed_tools
+            .pop();
+        config
+            .agents
+            .get_mut("guest")
+            .unwrap()
+            .workspace
+            .unrestricted_filesystem = true;
+        assert!(
+            config
+                .validate_telegram_invitations("home", &telegram)
+                .is_err()
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn image_generation_legacy_config_keeps_fal_backend() {
+        let config: ImageGenConfig =
+            toml::from_str("enabled = true\ndefault_model = 'fal-ai/flux/schnell'\n").unwrap();
+        assert_eq!(config.provider, ImageGenProvider::Fal);
+        assert_eq!(config.api_key_env, "FAL_API_KEY");
+    }
     #[::core::prelude::v1::test]
     fn channel_external_peers_carries_every_ignore_across_matching_groups() {
         let config: super::Config = toml::from_str(
