@@ -160,6 +160,76 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+/// Bind a model-requested reaction to the active inbound conversation.
+///
+/// The current turn's channel object, channel name, and reply target are the
+/// canonical scope. The model may select a message and emoji, but cannot
+/// redirect the reaction to another channel or recipient.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReactionScopeError {
+    MissingConversation,
+    InvalidArguments,
+}
+
+impl ReactionScopeError {
+    pub(crate) fn message_key(self) -> &'static str {
+        match self {
+            Self::MissingConversation => "turn-reaction-missing-conversation",
+            Self::InvalidArguments => "turn-reaction-invalid-arguments",
+        }
+    }
+}
+
+pub(crate) fn scope_reaction_to_current_conversation(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    channel_alias: Option<&str>,
+    channel_reply_target: Option<&str>,
+) -> Result<(), ReactionScopeError> {
+    if tool_name != "reaction" {
+        return Ok(());
+    }
+
+    let channel_name = channel_name.trim();
+    if channel_name.is_empty() || matches!(channel_name, "agent" | "daemon") {
+        return Err(ReactionScopeError::MissingConversation);
+    }
+
+    // `channel_alias` is Some even for an unaliased channel when a live
+    // Channel object is present. None therefore means the turn has no
+    // authoritative channel object to bind against.
+    let Some(channel_alias) = channel_alias else {
+        return Err(ReactionScopeError::MissingConversation);
+    };
+    let channel_alias = channel_alias.trim();
+    let channel_key = if channel_alias.is_empty() {
+        channel_name.to_string()
+    } else {
+        format!("{channel_name}.{channel_alias}")
+    };
+
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return Err(ReactionScopeError::MissingConversation);
+    };
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return Err(ReactionScopeError::InvalidArguments);
+    };
+    args.insert(
+        "channel".to_string(),
+        serde_json::Value::String(channel_key),
+    );
+    args.insert(
+        "channel_id".to_string(),
+        serde_json::Value::String(reply_target.to_string()),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{maybe_inject_channel_delivery_defaults, maybe_inject_originating_channel};

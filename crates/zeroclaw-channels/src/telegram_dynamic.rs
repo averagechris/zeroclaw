@@ -99,6 +99,7 @@ mod tests {
                     "memory_recall".into(),
                     "memory_store".into(),
                     "memory_forget".into(),
+                    "reaction".into(),
                 ],
                 ..Default::default()
             },
@@ -243,6 +244,18 @@ mod tests {
             .unwrap()
             .allowed_tools
             .push("shell".into());
+        assert!(validate(&cfg).is_err());
+        cfg.risk_profiles
+            .get_mut("guests")
+            .unwrap()
+            .allowed_tools
+            .pop();
+        assert!(validate(&cfg).is_ok());
+        cfg.risk_profiles
+            .get_mut("guests")
+            .unwrap()
+            .allowed_tools
+            .push("send_via".into());
         assert!(validate(&cfg).is_err());
         cfg.risk_profiles
             .get_mut("guests")
