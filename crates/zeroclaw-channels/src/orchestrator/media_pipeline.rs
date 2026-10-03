@@ -299,6 +299,7 @@ impl<'a> MediaPipeline<'a> {
             .await
             {
                 Ok(frames) => {
+                    let mut frame_annotations = Vec::new();
                     for (index, frame) in frames.iter().enumerate() {
                         let frame_attachment = MediaAttachment {
                             file_name: format!("video_frame_{index}.jpg"),
@@ -307,12 +308,14 @@ impl<'a> MediaPipeline<'a> {
                             marker: None,
                         };
                         match persist_image_attachment(workspace_dir, &frame_attachment).await {
-                            Ok(path) => annotations.push(format!(
-                                "[Video frame {} of {}]\n[IMAGE:{}]",
-                                index + 1,
-                                frames.len(),
-                                path.display()
-                            )),
+                            Ok(path) => {
+                                let path = path.display().to_string();
+                                frame_annotations.push(format!(
+                                    "[Video frame {} of {}]\n[Image saved for this agent: {path}]\n[IMAGE:{path}]",
+                                    index + 1,
+                                    frames.len(),
+                                ));
+                            }
                             Err(error) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -326,13 +329,22 @@ impl<'a> MediaPipeline<'a> {
                                     ),
                                     "Media pipeline: could not persist video frame in agent workspace"
                                 );
-                                annotations.push(
+                                frame_annotations.push(
                                     "[Video frames could not be saved for vision. Tell the user the clip could not be inspected.]".to_string(),
                                 );
                                 break;
                             }
                         }
                     }
+                    if frame_annotations
+                        .iter()
+                        .any(|annotation| annotation.starts_with("[Video frame "))
+                    {
+                        annotations.push(
+                            "When making a meme from this clip, use one of these saved frame paths as an image_gen reference.".to_string(),
+                        );
+                    }
+                    annotations.extend(frame_annotations);
                 }
                 Err(error) => {
                     ::zeroclaw_log::record!(
@@ -1373,10 +1385,37 @@ mod tests {
             marker: None,
         };
 
-        let result = pipeline.process("inspect this clip", &[attachment]).await;
+        let result = pipeline
+            .process("make a meme from this clip", &[attachment])
+            .await;
 
         assert_eq!(result.matches("[Video frame ").count(), 4, "{result}");
         assert!(result.contains("[Video frame 4 of 4]"));
+        assert!(result.contains("make a meme from this clip"), "{result}");
+        assert!(
+            result.contains("use one of these saved frame paths as an image_gen reference"),
+            "{result}"
+        );
+        let (cleaned_result, marker_paths) =
+            zeroclaw_providers::multimodal::parse_image_markers(&result);
+        assert_eq!(marker_paths.len(), 4, "{marker_paths:?}");
+        assert!(cleaned_result.contains("make a meme from this clip"));
+        assert!(cleaned_result.contains("one of these saved frame paths"));
+
+        let messages = [zeroclaw_providers::ChatMessage::user(result.clone())];
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider_scoped(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            workspace.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        let (prepared_text, normalized_images) =
+            zeroclaw_providers::multimodal::parse_image_markers(&prepared.messages[0].content);
+        assert_eq!(normalized_images.len(), 4, "{normalized_images:?}");
+        assert!(prepared_text.contains("make a meme from this clip"));
+        assert!(prepared_text.contains("one of these saved frame paths"));
         assert!(
             !result.contains("transcription") && !result.contains("Video audio"),
             "a silent clip must not produce an audio failure annotation: {result}"
@@ -1389,7 +1428,25 @@ mod tests {
         assert_eq!(entries.len(), 4);
         let mut frame_hashes = std::collections::HashSet::new();
         for entry in entries {
-            let frame = std::fs::read(entry.path()).unwrap();
+            let path = tokio::fs::canonicalize(entry.path()).await.unwrap();
+            let path_text = path.display().to_string();
+            assert!(
+                result.contains(&format!("[Image saved for this agent: {path_text}]")),
+                "the frame path should be explicit in model-visible text: {result}"
+            );
+            assert!(
+                result.contains(&format!("[IMAGE:{path_text}]")),
+                "the same saved frame should be sent through vision: {result}"
+            );
+            assert!(
+                cleaned_result.contains(&format!("[Image saved for this agent: {path_text}]")),
+                "marker parsing should retain the saved-image path hint: {cleaned_result}"
+            );
+            assert!(
+                prepared_text.contains(&format!("[Image saved for this agent: {path_text}]")),
+                "provider preparation should retain the saved-image path hint: {prepared_text}"
+            );
+            let frame = std::fs::read(path).unwrap();
             assert!(frame.starts_with(&[0xff, 0xd8]));
             let decoded = image::load_from_memory(&frame).unwrap();
             assert!(decoded.width() <= VIDEO_FRAME_WIDTH as u32);
