@@ -84,6 +84,10 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod telegram_dynamic;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod telegram_memberships;
 #[cfg(feature = "channel-twitch")]
 pub mod twitch;
 #[cfg(feature = "channel-twitter")]

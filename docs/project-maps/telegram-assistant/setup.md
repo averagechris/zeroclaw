@@ -4,6 +4,12 @@ Bootstrap instructions for the one-bot, three-agent assistant described in
 the [Telegram assistant map](map.md). Written for the owner and for agents
 helping him set it up later. Follow the sections in order.
 
+This runbook describes fixed owner, partner, and household routes. For
+invited friends and arbitrary approved groups, use the
+[dynamic enrollment setup](../../book/src/channels/telegram.md#invite-friends-and-approve-groups-dynamically)
+instead. That mode needs only the owner ID configured ahead of time;
+private and group memberships survive declarative configuration rebuilds.
+
 This file must never contain a real token, key, Telegram ID, or
 host-specific path. Use placeholders here and keep real values in the host
 configuration and its secret manager, outside this repository.

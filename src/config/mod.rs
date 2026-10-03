@@ -120,6 +120,7 @@ mod tests {
             reply_queue_depth_max: 0,
             debounce_ms: None,
             routes: None,
+            invitations: None,
         };
 
         let discord = DiscordConfig {
