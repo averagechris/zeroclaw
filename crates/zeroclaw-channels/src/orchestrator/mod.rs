@@ -1994,7 +1994,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
-             - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}} — clicking opens the form and the typed field values are appended to that button's prompt when submitted. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
+             - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}}. Clicking opens the form and appends the submitted field values to that button's prompt. Every action button and select option needs a prompt describing its behavior.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "whatsapp" | "whatsapp-web" => Some(
@@ -2027,17 +2027,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use *italic* for emphasis (renders as <i>)\n\
              - Use `backticks` for inline code, commands, or technical terms\n\
              - Use triple backticks for code blocks\n\
-             - Use emoji naturally to add personality — but don't overdo it\n\
-             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - Use emoji when it adds tone or meaning. Keep them sparse.\n\
+             - Answer directly. Skip canned openings like 'Great question!' or 'Certainly!'\n\
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - When a question needs current, real-time, or external information \
-               (prices, news, weather, web pages, lookups, etc.), use your tools — \
-               e.g. web_search_tool and web_fetch — to obtain it before answering; \
-               never guess or answer from memory alone when a tool can verify it.\n\
-             - Present the final answer to the latest user message directly from the \
-               tool results, without narrating delayed/internal tool-execution bookkeeping.",
+               (prices, news, weather, web pages, lookups, etc.), use your tools, \
+               such as web_search_tool and web_fetch, to verify it before answering. \
+               Never guess or answer from memory alone when a tool can verify it.\n\
+             - Answer the latest message using the tool results. Do not narrate delays or internal tool bookkeeping.",
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -2123,14 +2122,9 @@ fn build_channel_system_prompt(
         prompt.push_str(&block);
     }
 
-    // Calibration note: static behavioral instruction that benefits from
-    // the higher weight of the system prompt. Lifted out of the deleted
-    // per-turn Channel context block so it survives the relocation.
     prompt.push_str(
-        "\n\nCalibration note: agents in this system currently err on the side \
-         of silence when a response would be appropriate, which users find \
-         frustrating. Skew toward replying. Memory is supplementary context \
-         that informs how you respond, not a gate on whether you respond.",
+        "\n\nWhen a message calls for an answer, give one. Use memory to shape the answer, \
+         not to decide whether to respond.",
     );
 
     prompt
@@ -43968,7 +43962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram block must name the real-time tools so the model knows to reach for them"
         );
         assert!(
-            block.contains("never guess or answer from memory alone"),
+            block.contains("Never guess or answer from memory alone"),
             "telegram block must forbid answering from memory when a tool can verify"
         );
         // Negative: the exact regressed phrasing must never come back.
@@ -43976,6 +43970,57 @@ BTC is currently around $65,000 based on latest tool output."#
             !block.contains("Use tool results silently: answer the latest user message directly"),
             "telegram block must not tell the model to answer directly instead of using tools (#6646)"
         );
+    }
+
+    #[test]
+    fn rendered_telegram_prompt_preserves_custom_identity_and_plain_instructions() {
+        let workspace = make_workspace();
+        let identity = zeroclaw_config::schema::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(
+                r#"{"identity":{"names":{"first":"Michi"},"bio":"A thoughtful conversation partner."},"linguistics":{"style":"Warm, clear, and unforced."}}"#.into(),
+            ),
+        };
+        let tools = [
+            ("memory_recall", "Search saved memories"),
+            ("memory_store", "Save a memory"),
+            ("reaction", "React to the current message"),
+        ];
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &tools,
+            |_| true,
+            &[],
+            Some(&identity),
+            None,
+            Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+            false,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            None,
+        );
+        let prompt = build_channel_system_prompt(&base, "telegram", None);
+
+        assert!(prompt.contains("**Name:** Michi"));
+        assert!(prompt.contains("Warm, clear, and unforced."));
+        assert!(!prompt.contains("You are ZeroClaw"));
+        for tool in ["memory_recall", "memory_store", "reaction"] {
+            assert!(
+                prompt.contains(tool),
+                "rendered prompt should include {tool}"
+            );
+        }
+        assert!(prompt.contains("Tool Honesty"));
+        assert!(prompt.contains("If a tool call fails, report the error."));
+        assert!(prompt.contains("Do not exfiltrate private data."));
+        assert!(prompt.contains("When a message calls for an answer, give one."));
+        assert!(!prompt.contains('—'));
+        assert!(!prompt.contains('–'));
     }
 
     #[test]
