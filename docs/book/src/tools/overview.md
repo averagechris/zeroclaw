@@ -69,12 +69,31 @@ search_provider = "kagi"
 kagi_api_key = "..."
 ```
 
-Each call is one `POST https://kagi.com/api/v1/search` with the query,
+Search calls use `POST https://kagi.com/api/v1/search` with
 `workflow = "search"`, `limit` set from `max_results`, and safe search on. The
-key travels only as a Bearer authorization header. The tool never sends a
-lens or `extract`, which Kagi bills separately. Every call is billed to the
-key's Kagi account, so the account's own usage limit is the spending guard,
-alongside the tool's normal rate limit.
+optional `lens_id` selects a Kagi lens; omit it to use the API key owner's
+normal Kagi account settings. Find lens IDs in Kagi's [Lens settings](https://kagi.com/settings/lenses)
+or use a built-in lens identifier. Kagi does not currently expose a lens-list
+endpoint in its v1 API.
+
+Kagi also supports an explicit page extraction action:
+
+```json
+{"action":"extract","url":"https://example.com/article"}
+```
+
+Extraction sends one URL to `POST https://kagi.com/api/v1/extract` and returns
+Markdown, capped before it enters the model context. The Kagi API requires
+HTTPS. ZeroClaw rejects userinfo, private/local addresses, and metadata hosts;
+the daemon does not fetch the page itself. Search and extraction usage are
+billed to the key's Kagi account, and extraction is separately billed. Use the
+Kagi API portal's spending limit together with ZeroClaw's normal tool rate
+limit.
+
+The key travels only as a Bearer authorization header. Kagi failures during
+search retain the explicit, conversation-approved DuckDuckGo fallback. Page
+extraction has no fallback because another search provider cannot perform the
+same operation.
 
 The spelling is exactly `kagi`. Config validation rejects
 `search_provider = "kagi"` without a key, and a `kagi_api_key` with any other

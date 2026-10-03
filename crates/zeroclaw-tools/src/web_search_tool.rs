@@ -2,7 +2,7 @@ use super::web_search_provider_routing::{
     DEFAULT_WEB_SEARCH_PROVIDER, SearchStatus, WebSearchProviderResolution, WebSearchProviderRoute,
     resolve_web_search_provider,
 };
-use crate::helpers::response_body;
+use crate::helpers::{domain_guard, response_body};
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -1500,11 +1500,12 @@ impl WebSearchTool {
         }
     }
 
-    async fn search_kagi(&self, query: &str) -> anyhow::Result<String> {
-        self.search_kagi_at(KAGI_SEARCH_URL, query).await
-    }
-
-    async fn search_kagi_at(&self, url: &str, query: &str) -> anyhow::Result<String> {
+    async fn search_kagi_at(
+        &self,
+        url: &str,
+        query: &str,
+        lens_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         // A missing key is a configuration error and is reported without the
         // fallback offer. Only failures of the call itself carry it.
         let api_key = self.resolve_kagi_api_key()?;
@@ -1512,7 +1513,7 @@ impl WebSearchTool {
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
         let client = builder.build()?;
-        self.search_kagi_with_client(&client, url, &api_key, query)
+        self.search_kagi_with_client(&client, url, &api_key, query, lens_id)
             .await
             .map_err(kagi_runtime_failure)
     }
@@ -1523,21 +1524,26 @@ impl WebSearchTool {
         url: &str,
         api_key: &str,
         query: &str,
+        lens_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        // Plain web search only: no lens, no other workflow, and no
-        // `extract`, which Kagi bills separately. Safe search is always on
-        // because a shared household chat can reach this tool.
+        // Keep this request to ordinary web results. Lenses are optional, and
+        // safe search remains on because shared chats can reach this tool.
+        let mut request_body = json!({
+            "query": query,
+            "workflow": "search",
+            "limit": self.max_results,
+            "safe_search": true,
+        });
+        if let Some(lens_id) = lens_id {
+            request_body["lens_id"] = json!(lens_id);
+        }
+
         let response = client
             .post(url)
             .bearer_auth(api_key)
             .header("User-Agent", KAGI_USER_AGENT)
             .header("Accept", "application/json")
-            .json(&json!({
-                "query": query,
-                "workflow": "search",
-                "limit": self.max_results,
-                "safe_search": true,
-            }))
+            .json(&request_body)
             .send()
             .await
             .map_err(|err| transport_search_failure("kagi", "request", &err))?;
@@ -1559,6 +1565,86 @@ impl WebSearchTool {
         let json: serde_json::Value = serde_json::from_slice(&body.bytes)
             .map_err(|_| bounded_body_search_failure("kagi", "decode"))?;
         self.parse_kagi_results(&json, query)
+    }
+
+    async fn extract_kagi(&self, raw_url: &str) -> anyhow::Result<String> {
+        self.extract_kagi_at(KAGI_EXTRACT_URL, raw_url).await
+    }
+
+    async fn extract_kagi_at(&self, endpoint: &str, raw_url: &str) -> anyhow::Result<String> {
+        let url = validate_kagi_extract_url(raw_url)?;
+        let api_key = self.resolve_kagi_api_key()?;
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder
+            .build()
+            .map_err(|_| kagi_extract_transport_failure("request", "client"))?;
+
+        let response = client
+            .post(endpoint)
+            .bearer_auth(api_key)
+            .header("User-Agent", KAGI_USER_AGENT)
+            .header("Accept", "application/json")
+            .json(&json!({"pages": [{"url": url}]}))
+            .send()
+            .await
+            .map_err(|err| {
+                let stage = if err.is_timeout() {
+                    "timeout"
+                } else if err.is_connect() {
+                    "connect"
+                } else {
+                    "request"
+                };
+                kagi_extract_transport_failure("request", stage)
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(kagi_extract_http_failure(status));
+        }
+
+        let body = response_body::read_bounded(response, Some(KAGI_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => {
+                    let stage = if err.is_timeout() { "timeout" } else { "body" };
+                    kagi_extract_transport_failure("response", stage)
+                }
+                None => kagi_extract_transport_failure("response", "body"),
+            })?;
+        if body.overflowed {
+            return Err(kagi_extract_transport_failure("response", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| kagi_extract_transport_failure("response", "decode"))?;
+        Self::parse_kagi_extract_results(&json)
+    }
+
+    fn parse_kagi_extract_results(json: &serde_json::Value) -> anyhow::Result<String> {
+        let page = json
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|pages| pages.first())
+            .ok_or_else(|| kagi_extract_transport_failure("response", "invalid_response"))?;
+        if page
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            return Err(kagi_extract_page_failure());
+        }
+        let markdown = page
+            .get("markdown")
+            .and_then(serde_json::Value::as_str)
+            .filter(|content| !content.trim().is_empty())
+            .ok_or_else(kagi_extract_page_failure)?;
+
+        Ok(format!(
+            "Extracted page content via Kagi:\n\n{}",
+            truncate_with_ellipsis(markdown, KAGI_EXTRACT_CONTENT_LIMIT_CHARS)
+        ))
     }
 
     fn parse_kagi_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
@@ -2044,8 +2130,18 @@ impl WebSearchTool {
 /// Keenable API origin. The search path is chosen per request by
 /// `search_keenable_with_client` depending on whether a key is configured.
 const KAGI_SEARCH_URL: &str = "https://kagi.com/api/v1/search";
+const KAGI_EXTRACT_URL: &str = "https://kagi.com/api/v1/extract";
 const KAGI_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 const KAGI_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+const KAGI_EXTRACT_CONTENT_LIMIT_CHARS: usize = 12_000;
+const KAGI_LENS_ID_LIMIT_CHARS: usize = 2_048;
+const KAGI_TOOL_DESCRIPTION_KEY: &str = "tool-web-search-tool-kagi-description";
+const KAGI_INVALID_ARGUMENTS_KEY: &str = "tool-web-search-tool-error-kagi-invalid-arguments";
+const KAGI_UNSAFE_EXTRACT_URL_KEY: &str = "tool-web-search-tool-error-kagi-unsafe-extract-url";
+const KAGI_EXTRACT_API_FAILURE_KEY: &str = "tool-web-search-tool-error-kagi-extract-api-failure";
+const KAGI_EXTRACT_PAGE_FAILURE_KEY: &str = "tool-web-search-tool-error-kagi-extract-page-failure";
+static KAGI_TOOL_DESCRIPTION: LazyLock<String> =
+    LazyLock::new(|| crate::i18n::get_required_tool_string(KAGI_TOOL_DESCRIPTION_KEY));
 
 /// Tool parameter that sends one call to DuckDuckGo while Kagi is the
 /// configured provider. Advertised only when Kagi is configured.
@@ -2061,6 +2157,85 @@ const KAGI_FALLBACK_OFFER: &str = "Kagi search is not working right now. You may
 /// Wrap a Kagi call failure with the DuckDuckGo fallback offer.
 fn kagi_runtime_failure(err: anyhow::Error) -> anyhow::Error {
     anyhow::Error::msg(format!("{err} {KAGI_FALLBACK_OFFER}"))
+}
+
+fn kagi_invalid_arguments() -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_tool_string(
+        KAGI_INVALID_ARGUMENTS_KEY,
+    ))
+}
+
+fn kagi_unsafe_extract_url() -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_tool_string(
+        KAGI_UNSAFE_EXTRACT_URL_KEY,
+    ))
+}
+
+/// Validate URLs before asking Kagi's remote extractor to fetch them. Kagi's
+/// v1 Extract API requires HTTPS. This check intentionally blocks local and
+/// private targets even though the daemon itself never connects to the page.
+fn validate_kagi_extract_url(raw_url: &str) -> anyhow::Result<String> {
+    if raw_url.len() > 4_096 {
+        return Err(kagi_unsafe_extract_url());
+    }
+    let parsed = reqwest::Url::parse(raw_url).map_err(|_| kagi_unsafe_extract_url())?;
+    if parsed.scheme() != "https" {
+        return Err(kagi_unsafe_extract_url());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(kagi_unsafe_extract_url());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(kagi_unsafe_extract_url)?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let is_metadata_hostname = host == "metadata"
+        || host == "metadata.google"
+        || host == "metadata.google.internal"
+        || host.ends_with(".metadata.google.internal")
+        || host.ends_with(".internal")
+        || host.ends_with(".home.arpa");
+    let is_metadata_ip = host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(domain_guard::is_cloud_metadata_ip);
+    if is_metadata_hostname || is_metadata_ip || domain_guard::is_private_or_local_host(&host) {
+        return Err(kagi_unsafe_extract_url());
+    }
+    Ok(parsed.to_string())
+}
+
+fn kagi_extract_http_failure(status: reqwest::StatusCode) -> anyhow::Error {
+    let search_status = classify_http_status(status);
+    kagi_extract_api_failure(format!(
+        "extract_status={}, http={status}",
+        search_status.as_str()
+    ))
+}
+
+fn kagi_extract_transport_failure(stage: &str, category: &str) -> anyhow::Error {
+    let status = if category == "request" {
+        SearchStatus::ClientError
+    } else {
+        SearchStatus::Unavailable
+    };
+    kagi_extract_api_failure(format!(
+        "extract_status={}, transport={category}, stage={stage}",
+        status.as_str()
+    ))
+}
+
+fn kagi_extract_api_failure(details: String) -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+        KAGI_EXTRACT_API_FAILURE_KEY,
+        &[("details", &details)],
+    ))
+}
+
+fn kagi_extract_page_failure() -> anyhow::Error {
+    anyhow::Error::msg(crate::i18n::get_required_tool_string(
+        KAGI_EXTRACT_PAGE_FAILURE_KEY,
+    ))
 }
 
 const KEENABLE_API_BASE_URL: &str = "https://api.keenable.ai";
@@ -2519,7 +2694,11 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
+        if resolve_web_search_provider(&self.model_provider).route == WebSearchProviderRoute::Kagi {
+            KAGI_TOOL_DESCRIPTION.as_str()
+        } else {
+            "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -2534,6 +2713,26 @@ impl Tool for WebSearchTool {
             "required": ["query"]
         });
         if resolve_web_search_provider(&self.model_provider).route == WebSearchProviderRoute::Kagi {
+            schema["properties"]["action"] = json!({
+                "type": "string",
+                "enum": ["search", "extract"],
+                "default": "search",
+                "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-action")
+            });
+            schema["properties"]["query"]["description"] = json!(
+                crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-query")
+            );
+            schema["properties"]["url"] = json!({
+                "type": "string",
+                "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-url")
+            });
+            schema["properties"]["lens_id"] = json!({
+                "type": "string",
+                "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-lens-id")
+            });
+            if let Some(object) = schema.as_object_mut() {
+                object.remove("required");
+            }
             schema["properties"][KAGI_FALLBACK_PARAM] = json!({
                 "type": "boolean",
                 "description": "Search with DuckDuckGo instead of Kagi. Only set this after a Kagi search failed and the person in this conversation agreed to use DuckDuckGo."
@@ -2543,6 +2742,64 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let is_kagi =
+            resolve_web_search_provider(&self.model_provider).route == WebSearchProviderRoute::Kagi;
+        let action = match args.get("action") {
+            None => "search",
+            Some(value) => value.as_str().ok_or_else(kagi_invalid_arguments)?,
+        };
+        if !matches!(action, "search" | "extract") {
+            return Err(kagi_invalid_arguments());
+        }
+        if action == "extract" && !is_kagi {
+            return Err(kagi_invalid_arguments());
+        }
+        if action == "extract" {
+            if args.get("query").is_some() || args.get("lens_id").is_some() {
+                return Err(kagi_invalid_arguments());
+            }
+            if args
+                .get(KAGI_FALLBACK_PARAM)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Err(kagi_invalid_arguments());
+            }
+            let url = args
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(kagi_invalid_arguments)?;
+            let result = self.extract_kagi(url).await?;
+            return Ok(ToolResult {
+                success: true,
+                output: result.into(),
+                error: None,
+            });
+        }
+
+        if args.get("url").is_some() {
+            return Err(kagi_invalid_arguments());
+        }
+        let lens_id = if is_kagi {
+            match args.get("lens_id") {
+                None => None,
+                Some(value) => {
+                    let value = value.as_str().ok_or_else(kagi_invalid_arguments)?.trim();
+                    if value.is_empty()
+                        || value.chars().count() > KAGI_LENS_ID_LIMIT_CHARS
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err(kagi_invalid_arguments());
+                    }
+                    Some(value)
+                }
+            }
+        } else {
+            if args.get("lens_id").is_some() {
+                return Err(kagi_invalid_arguments());
+            }
+            None
+        };
         let query = args.get("query").and_then(|q| q.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2598,7 +2855,9 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::AnySearch => self.search_anysearch(query).await?,
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
-            WebSearchProviderRoute::Kagi => self.search_kagi(query).await?,
+            WebSearchProviderRoute::Kagi => {
+                self.search_kagi_at(KAGI_SEARCH_URL, query, lens_id).await?
+            }
         };
 
         Ok(ToolResult {
@@ -6562,7 +6821,11 @@ mod tests {
 
         let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
         let result = tool
-            .search_kagi_at(&format!("{}/api/v1/search", server.uri()), "what is rust")
+            .search_kagi_at(
+                &format!("{}/api/v1/search", server.uri()),
+                "what is rust",
+                None,
+            )
             .await
             .expect("mocked Kagi search succeeds");
         assert_eq!(
@@ -6577,6 +6840,185 @@ mod tests {
         let recorded = server.received_requests().await.unwrap();
         assert!(!recorded[0].url.as_str().contains("kagi-test-key"));
         assert!(!String::from_utf8_lossy(&recorded[0].body).contains("kagi-test-key"));
+    }
+
+    #[tokio::test]
+    async fn kagi_search_request_includes_requested_lens_id() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .and(body_json(serde_json::json!({
+                "query": "vegetarian dinner",
+                "workflow": "search",
+                "limit": 5,
+                "safe_search": true,
+                "lens_id": "recipes"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"search": []}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        tool.search_kagi_at(
+            &format!("{}/api/v1/search", server.uri()),
+            "vegetarian dinner",
+            Some("recipes"),
+        )
+        .await
+        .expect("a Kagi lens is forwarded in the v1 Search request");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn kagi_extract_posts_one_https_page_and_returns_bounded_markdown() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/extract"))
+            .and(header("authorization", "Bearer kagi-test-key"))
+            .and(body_json(serde_json::json!({
+                "pages": [{"url": "https://example.com/article"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"trace": "trace-1"},
+                "data": [{
+                    "url": "https://example.com/article",
+                    "markdown": "# Article\n\nExtracted body"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        let result = tool
+            .extract_kagi_at(
+                &format!("{}/api/v1/extract", server.uri()),
+                "https://example.com/article",
+            )
+            .await
+            .expect("Kagi extraction succeeds");
+        assert!(result.contains("# Article\n\nExtracted body"));
+        let recorded = server.received_requests().await.unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].url.as_str().contains("kagi-test-key"));
+        assert!(!String::from_utf8_lossy(&recorded[0].body).contains("kagi-test-key"));
+    }
+
+    #[tokio::test]
+    async fn kagi_extract_rejects_unsafe_urls_before_sending_a_request() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+
+        for url in [
+            "http://example.com/article",
+            "file:///etc/passwd",
+            "https://user:password@example.com/article",
+            "https://localhost/article",
+            "https://private.local/article",
+            "https://192.168.1.10/article",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://metadata.google.internal/computeMetadata/v1/",
+        ] {
+            let err = tool
+                .extract_kagi_at(&format!("{}/api/v1/extract", server.uri()), url)
+                .await
+                .unwrap_err();
+            assert!(!err.to_string().contains(url), "URL leaked in error: {err}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn kagi_tool_rejects_ambiguous_or_invalid_action_arguments() {
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        for args in [
+            json!({"action": "extract"}),
+            json!({"action": "extract", "url": "https://example.com", "query": "q"}),
+            json!({"action": "extract", "url": "https://example.com", KAGI_FALLBACK_PARAM: true}),
+            json!({"action": "unknown", "query": "q"}),
+            json!({"query": "q", "url": "https://example.com"}),
+            json!({"query": "q", "lens_id": "  "}),
+            json!({"query": "q", "lens_id": 1}),
+        ] {
+            let result = tool.execute(args).await;
+            assert!(result.is_err(), "invalid arguments unexpectedly succeeded");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Invalid Kagi tool arguments"),
+                "argument errors should be consistent"
+            );
+        }
+
+        let non_kagi = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
+        let result = non_kagi
+            .execute(json!({"action": "extract", "url": "https://example.com"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn kagi_extract_http_and_page_failures_propagate_without_search_fallback() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/extract"))
+            .and(body_json(serde_json::json!({
+                "pages": [{"url": "https://example.com/article"}]
+            })))
+            .respond_with(ResponseTemplate::new(429).set_body_string("secret upstream detail"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        let err = tool
+            .extract_kagi_at(
+                &format!("{}/api/v1/extract", server.uri()),
+                "https://example.com/article",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Kagi extraction failed"), "{err}");
+        assert!(err.contains("extract_status=unavailable"), "{err}");
+        assert!(!err.contains("secret upstream detail"), "{err}");
+        assert!(!err.contains("use_duckduckgo_fallback"), "{err}");
+
+        let failed_page =
+            serde_json::json!({"data": [{"url": "https://example.com", "error": "blocked"}]});
+        let err = WebSearchTool::parse_kagi_extract_results(&failed_page)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Kagi returned no page content"), "{err}");
+        assert!(
+            !err.contains("blocked"),
+            "provider error details should be withheld"
+        );
+
+        let oversized = serde_json::json!({
+            "data": [{"url": "https://example.com", "markdown": "x".repeat(KAGI_EXTRACT_CONTENT_LIMIT_CHARS + 10)}]
+        });
+        let result = WebSearchTool::parse_kagi_extract_results(&oversized).unwrap();
+        assert!(result.contains("..."));
+        assert!(result.chars().count() <= KAGI_EXTRACT_CONTENT_LIMIT_CHARS + 40);
     }
 
     #[test]
@@ -6615,7 +7057,7 @@ mod tests {
 
         let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
         let err = tool
-            .search_kagi_at(&url, "rust")
+            .search_kagi_at(&url, "rust", None)
             .await
             .unwrap_err()
             .to_string();
@@ -6629,7 +7071,7 @@ mod tests {
         std::fs::write(&config_path, "[web_search]\nsearch_provider = \"kagi\"\n").unwrap();
         let before = server.received_requests().await.unwrap().len();
         let err = kagi_tool(config_path)
-            .search_kagi_at(&url, "rust")
+            .search_kagi_at(&url, "rust", None)
             .await
             .unwrap_err()
             .to_string();
@@ -6646,7 +7088,10 @@ mod tests {
             schema["properties"][KAGI_FALLBACK_PARAM]["type"],
             serde_json::json!("boolean")
         );
-        assert_eq!(schema["required"], serde_json::json!(["query"]));
+        assert!(schema.get("required").is_none());
+        assert_eq!(schema["properties"]["action"]["default"], "search");
+        assert_eq!(schema["properties"]["lens_id"]["type"], "string");
+        assert_eq!(schema["properties"]["url"]["type"], "string");
         let route =
             |tool: &WebSearchTool, args: serde_json::Value| tool.route_for_call(&args).route;
         assert_eq!(
@@ -6672,6 +7117,16 @@ mod tests {
         assert!(
             serply.parameters_schema()["properties"]
                 .get(KAGI_FALLBACK_PARAM)
+                .is_none()
+        );
+        assert!(
+            serply.parameters_schema()["properties"]
+                .get("lens_id")
+                .is_none()
+        );
+        assert!(
+            serply.parameters_schema()["properties"]
+                .get("action")
                 .is_none()
         );
         assert_eq!(
