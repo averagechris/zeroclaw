@@ -1296,6 +1296,7 @@ channel-telegram-voice-drop-too-long = ⚠️ Audio message skipped: it is longe
 channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the file could not be retrieved from Telegram — it may be too large or no longer available. Please try a smaller or shorter file.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
 channel-telegram-photo-drop-failed = ⚠️ I couldn't read that photo. Please try sending it again.
+channel-telegram-video-drop-failed = ⚠️ I couldn't process that video. Please send a clip under 2 minutes and 20 MB.
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow

@@ -2,12 +2,23 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::borrow::Cow;
+use std::time::Duration;
 use zeroclaw_config::schema::MediaPipelineConfig;
 
 use super::super::transcription::TranscriptionManager;
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::media::{MarkerKind, MediaAttachment, MediaKind, RenderedMarker};
+
+const VIDEO_MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
+const VIDEO_MAX_DURATION_SECS: u64 = 120;
+const VIDEO_MAX_FRAMES: usize = 4;
+const VIDEO_FRAME_WIDTH: usize = 640;
+const VIDEO_MAX_FRAME_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const VIDEO_MAX_AUDIO_OUTPUT_BYTES: usize = 1024 * 1024;
+const VIDEO_FFMPEG_TIMEOUT: Duration = Duration::from_secs(12);
+#[cfg(test)]
+const VIDEO_FFMPEG_TEST_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// The media understanding pipeline.
 /// Consumes a message's text and attachments, returning enriched text with
@@ -17,6 +28,9 @@ pub struct MediaPipeline<'a> {
     transcription_manager: Option<&'a TranscriptionManager>,
     vision_available: bool,
     workspace_dir: Option<&'a std::path::Path>,
+    ffmpeg_program: std::path::PathBuf,
+    ffprobe_program: std::path::PathBuf,
+    ffmpeg_timeout: Duration,
 }
 
 impl<'a> MediaPipeline<'a> {
@@ -34,6 +48,9 @@ impl<'a> MediaPipeline<'a> {
             transcription_manager,
             vision_available,
             workspace_dir: None,
+            ffmpeg_program: "ffmpeg".into(),
+            ffprobe_program: "ffprobe".into(),
+            ffmpeg_timeout: VIDEO_FFMPEG_TIMEOUT,
         }
     }
 
@@ -42,6 +59,24 @@ impl<'a> MediaPipeline<'a> {
     /// in that agent without granting another routed chat access to it.
     pub fn with_workspace_dir(mut self, workspace_dir: &'a std::path::Path) -> Self {
         self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ffmpeg_program(mut self, program: std::path::PathBuf) -> Self {
+        self.ffmpeg_program = program;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ffprobe_program(mut self, program: std::path::PathBuf) -> Self {
+        self.ffprobe_program = program;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_ffmpeg_timeout(mut self, timeout: Duration) -> Self {
+        self.ffmpeg_timeout = timeout;
         self
     }
 
@@ -108,7 +143,7 @@ impl<'a> MediaPipeline<'a> {
                     annotations.push(annotation);
                 }
                 MediaKind::Video if self.config.summarize_video => {
-                    let annotation = self.process_video(attachment);
+                    let annotation = self.process_video(attachment).await;
                     annotations.push(annotation);
                 }
                 _ => {}
@@ -184,12 +219,459 @@ impl<'a> MediaPipeline<'a> {
         }
     }
 
-    /// Summarize a video attachment.
-    /// Video analysis requires external APIs not currently integrated.
-    /// For now we add a placeholder annotation.
-    fn process_video(&self, attachment: &MediaAttachment) -> String {
-        format!("[Video: {} attached]", attachment.file_name)
+    /// Extract a few bounded video frames for vision and a bounded audio track
+    /// for the resolved agent's transcription provider.
+    async fn process_video(&self, attachment: &MediaAttachment) -> String {
+        if attachment.data.len() > VIDEO_MAX_INPUT_BYTES {
+            return "[Video exceeds the 20 MiB processing limit. Tell the user to send a smaller clip.]".to_string();
+        }
+
+        let Some(workspace_dir) = self.workspace_dir else {
+            return "[Video could not be inspected because this agent has no media workspace.]"
+                .to_string();
+        };
+        let workspace_root = match tokio::fs::canonicalize(workspace_dir).await {
+            Ok(path) => path,
+            Err(_) => {
+                return "[Video could not be inspected because this agent's media workspace is unavailable.]"
+                    .to_string();
+            }
+        };
+        let tempdir = match tempfile::Builder::new()
+            .prefix("telegram-video-")
+            .tempdir_in(&workspace_root)
+        {
+            Ok(tempdir) => tempdir,
+            Err(_) => {
+                return "[Video could not be inspected because temporary media storage is unavailable.]"
+                    .to_string();
+            }
+        };
+        let extension = safe_video_extension(attachment);
+        let input_format = safe_video_demuxer(extension);
+        let input_path = tempdir.path().join(format!("input.{extension}"));
+        if let Err(error) = tokio::fs::write(&input_path, &attachment.data).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                "Media pipeline: failed to stage video under the resolved agent workspace"
+            );
+            return "[Video could not be inspected because temporary media storage failed.]"
+                .to_string();
+        }
+        let info = match probe_video(
+            &self.ffprobe_program,
+            &input_path,
+            input_format,
+            self.ffmpeg_timeout,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                    "Media pipeline: video metadata probe failed"
+                );
+                return "[Video could not be inspected. Do not guess its contents; tell the user the clip could not be processed.]"
+                    .to_string();
+            }
+        };
+        if info.duration_secs > VIDEO_MAX_DURATION_SECS as f64 {
+            return "[Video exceeds the 120 second processing limit. Tell the user to send a shorter clip.]"
+                .to_string();
+        }
+
+        let mut annotations = Vec::new();
+        if self.vision_available {
+            match extract_video_frames(
+                &self.ffmpeg_program,
+                &input_path,
+                input_format,
+                info.duration_secs,
+                self.ffmpeg_timeout,
+            )
+            .await
+            {
+                Ok(frames) => {
+                    for (index, frame) in frames.iter().enumerate() {
+                        let frame_attachment = MediaAttachment {
+                            file_name: format!("video_frame_{index}.jpg"),
+                            data: frame.clone(),
+                            mime_type: Some("image/jpeg".to_string()),
+                            marker: None,
+                        };
+                        match persist_image_attachment(workspace_dir, &frame_attachment).await {
+                            Ok(path) => annotations.push(format!(
+                                "[Video frame {} of {}]\n[IMAGE:{}]",
+                                index + 1,
+                                frames.len(),
+                                path.display()
+                            )),
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({"error": format!("{error:#}")})
+                                    ),
+                                    "Media pipeline: could not persist video frame in agent workspace"
+                                );
+                                annotations.push(
+                                    "[Video frames could not be saved for vision. Tell the user the clip could not be inspected.]".to_string(),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                        "Media pipeline: video frame extraction failed"
+                    );
+                    annotations.push(
+                        "[Video frames could not be extracted. Do not guess the visual content; tell the user the clip could not be inspected.]".to_string(),
+                    );
+                }
+            }
+        }
+
+        if info.has_audio {
+            match extract_video_audio(
+                &self.ffmpeg_program,
+                &input_path,
+                input_format,
+                info.duration_secs,
+                self.ffmpeg_timeout,
+            )
+            .await
+            {
+                Ok(audio) => {
+                    let Some(manager) = self.transcription_manager else {
+                        annotations.push(
+                        "[Video audio transcription unavailable. Do not guess what was said; tell the user transcription is unavailable.]".to_string(),
+                    );
+                        return annotations.join("\n");
+                    };
+                    match manager.transcribe(&audio, "video-audio.mp3").await {
+                        Ok(transcript) if !transcript.trim().is_empty() => {
+                            annotations.push(format!(
+                                "[Video audio transcription: {}]",
+                                transcript.trim()
+                            ));
+                        }
+                        Ok(_) => annotations
+                            .push("[Video audio contained no recognizable speech.]".to_string()),
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                                "Media pipeline: video audio transcription failed"
+                            );
+                            annotations.push(
+                            "[Video audio transcription failed. Do not guess what was said; tell the user and ask them to resend the speech as a voice note.]".to_string(),
+                        );
+                        }
+                    }
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                        "Media pipeline: video audio extraction failed"
+                    );
+                    annotations.push(
+                    "[Video audio could not be extracted. Do not guess what was said; tell the user the audio could not be processed.]".to_string(),
+                );
+                }
+            }
+        }
+
+        if annotations.is_empty() {
+            format!("[Video: {} attached]", attachment.file_name)
+        } else {
+            annotations.join("\n")
+        }
     }
+}
+
+fn safe_video_extension(attachment: &MediaAttachment) -> &'static str {
+    match attachment
+        .file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mov") => "mov",
+        Some("mkv") => "mkv",
+        Some("webm") => "webm",
+        Some("mp4") => "mp4",
+        _ => match attachment.mime_type.as_deref() {
+            Some("video/quicktime") => "mov",
+            Some("video/x-matroska") => "mkv",
+            Some("video/webm") => "webm",
+            _ => "mp4",
+        },
+    }
+}
+
+fn safe_video_demuxer(extension: &str) -> &'static str {
+    match extension {
+        "mp4" | "mov" => "mov",
+        "mkv" | "webm" => "matroska",
+        _ => "mov",
+    }
+}
+
+#[derive(Debug)]
+struct VideoInfo {
+    duration_secs: f64,
+    has_audio: bool,
+}
+
+async fn probe_video(
+    ffprobe: &std::path::Path,
+    input_path: &std::path::Path,
+    input_format: &str,
+    timeout: Duration,
+) -> anyhow::Result<VideoInfo> {
+    let input_path = input_path.to_string_lossy();
+    let mut args = vec!["-v", "error"];
+    append_video_input_options(&mut args, input_format, &input_path);
+    args.extend([
+        "-show_entries",
+        "format=duration:stream=codec_type,duration",
+        "-of",
+        "json",
+    ]);
+    let output = run_media_command(ffprobe, &args, 16 * 1024, timeout, "ffprobe").await?;
+    let metadata: serde_json::Value = serde_json::from_slice(&output)?;
+    let streams = metadata
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let duration_secs = metadata
+        .pointer("/format/duration")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .or_else(|| {
+            streams
+                .iter()
+                .filter_map(|stream| stream.get("duration"))
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|duration| duration.parse::<f64>().ok())
+                .reduce(f64::max)
+        })
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| anyhow::Error::msg("ffprobe did not report a valid video duration"))?;
+    let has_audio = streams.iter().any(|stream| {
+        stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio")
+    });
+    anyhow::ensure!(
+        streams.iter().any(|stream| {
+            stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+        }),
+        "ffprobe found no video stream"
+    );
+    Ok(VideoInfo {
+        duration_secs,
+        has_audio,
+    })
+}
+
+async fn extract_video_frames(
+    ffmpeg: &std::path::Path,
+    input_path: &std::path::Path,
+    input_format: &str,
+    duration_secs: f64,
+    timeout: Duration,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let input_path = input_path.to_string_lossy();
+    let duration_arg = duration_secs.to_string();
+    let frames_arg = VIDEO_MAX_FRAMES.to_string();
+    let frame_rate = format!("{VIDEO_MAX_FRAMES}/{duration_secs}");
+    let scale_filter = format!(
+        "fps={frame_rate},scale=w=min({VIDEO_FRAME_WIDTH}\\,iw):h=min({VIDEO_FRAME_WIDTH}\\,ih):force_original_aspect_ratio=decrease"
+    );
+    let mut args = vec![
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-max_pixels",
+        "8294400",
+    ];
+    append_video_input_options(&mut args, input_format, &input_path);
+    args.extend([
+        "-t",
+        &duration_arg,
+        "-map",
+        "0:v:0",
+        "-vf",
+        &scale_filter,
+        "-frames:v",
+        &frames_arg,
+        "-f",
+        "image2pipe",
+        "-c:v",
+        "mjpeg",
+        "-q:v",
+        "5",
+        "pipe:1",
+    ]);
+    let output = run_media_command(
+        ffmpeg,
+        &args,
+        VIDEO_MAX_FRAME_OUTPUT_BYTES,
+        timeout,
+        "ffmpeg",
+    )
+    .await?;
+    let frames = split_mjpeg_frames(&output);
+    anyhow::ensure!(!frames.is_empty(), "ffmpeg returned no video frames");
+    anyhow::ensure!(
+        frames.len() <= VIDEO_MAX_FRAMES,
+        "ffmpeg returned too many video frames"
+    );
+    Ok(frames)
+}
+
+async fn extract_video_audio(
+    ffmpeg: &std::path::Path,
+    input_path: &std::path::Path,
+    input_format: &str,
+    duration_secs: f64,
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let input_path = input_path.to_string_lossy();
+    let duration_arg = duration_secs.to_string();
+    let mut args = vec!["-hide_banner", "-loglevel", "error", "-threads", "1"];
+    append_video_input_options(&mut args, input_format, &input_path);
+    args.extend([
+        "-t",
+        &duration_arg,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-b:a",
+        "32k",
+        "-f",
+        "mp3",
+        "pipe:1",
+    ]);
+    run_media_command(
+        ffmpeg,
+        &args,
+        VIDEO_MAX_AUDIO_OUTPUT_BYTES,
+        timeout,
+        "ffmpeg",
+    )
+    .await
+}
+
+fn append_video_input_options<'a>(
+    args: &mut Vec<&'a str>,
+    input_format: &'a str,
+    input_path: &'a str,
+) {
+    args.extend(["-protocol_whitelist", "file,pipe", "-f", input_format]);
+    if input_format == "mov" {
+        args.extend(["-enable_drefs", "0", "-use_absolute_path", "0"]);
+    }
+    args.extend(["-i", input_path]);
+}
+
+async fn run_media_command(
+    program: &std::path::Path,
+    args: &[&str],
+    max_output_bytes: usize,
+    timeout: Duration,
+    program_name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt as _;
+    use tokio::process::Command;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let read = async move {
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let len = stdout.read(&mut chunk).await?;
+            if len == 0 {
+                break;
+            }
+            anyhow::ensure!(
+                output.len().saturating_add(len) <= max_output_bytes,
+                "{program_name} output exceeded its size limit"
+            );
+            output.extend_from_slice(&chunk[..len]);
+        }
+        Ok::<Vec<u8>, anyhow::Error>(output)
+    };
+    let run = async {
+        let wait = async { child.wait().await.map_err(anyhow::Error::from) };
+        let (output, status) = tokio::try_join!(read, wait)?;
+        anyhow::ensure!(status.success(), "{program_name} exited unsuccessfully");
+        Ok::<Vec<u8>, anyhow::Error>(output)
+    };
+    tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow::Error::msg(format!("{program_name} timed out after {timeout:?}")))?
+}
+
+fn split_mjpeg_frames(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    let mut start = None;
+    let mut index = 0;
+    while index + 1 < data.len() {
+        match (data[index], data[index + 1]) {
+            (0xff, 0xd8) if start.is_none() => start = Some(index),
+            (0xff, 0xd9) if start.is_some() => {
+                let frame_start = start.take().expect("frame start exists");
+                frames.push(data[frame_start..index + 2].to_vec());
+                if frames.len() == VIDEO_MAX_FRAMES {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    frames
 }
 
 /// Persist image bytes under the resolved agent's private workspace. The
@@ -293,6 +775,7 @@ fn webp_to_png(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
 
     fn default_pipeline_config(enabled: bool) -> MediaPipelineConfig {
         MediaPipelineConfig {
@@ -328,6 +811,86 @@ mod tests {
             mime_type: Some("video/mp4".to_string()),
             marker: None,
         }
+    }
+
+    fn generate_mp4_fixture(
+        duration_secs: u64,
+        with_audio: bool,
+        width: u32,
+        height: u32,
+    ) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        generate_video_fixture(duration_secs, with_audio, width, height, "mp4")
+    }
+
+    fn generate_video_fixture(
+        duration_secs: u64,
+        with_audio: bool,
+        width: u32,
+        height: u32,
+        container: &str,
+    ) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        use std::process::Command;
+
+        if Command::new("ffmpeg").arg("-version").output().is_err()
+            || Command::new("ffprobe").arg("-version").output().is_err()
+        {
+            return None;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("fixture.{container}"));
+        let duration = duration_secs.to_string();
+        let mut command = Command::new("ffmpeg");
+        command.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=size={width}x{height}:rate=1:duration={duration}"),
+        ]);
+        if with_audio {
+            command.args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={duration}"),
+            ]);
+        }
+        command.args(["-threads", "1"]);
+        if container == "webm" {
+            command.args([
+                "-c:v",
+                "libvpx-vp9",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-crf",
+                "40",
+                "-b:v",
+                "0",
+            ]);
+            if with_audio {
+                command.args(["-c:a", "libopus", "-b:a", "32k"]);
+            }
+        } else {
+            command.args(["-c:v", "mpeg4", "-q:v", "10"]);
+            if with_audio {
+                command.args(["-c:a", "aac"]);
+            }
+        }
+        let result = command
+            .args(["-t", &duration, "-y"])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg is available");
+        assert!(
+            result.status.success(),
+            "ffmpeg could not create the fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        Some((directory, path))
     }
 
     #[test]
@@ -775,15 +1338,317 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_annotation() {
+    async fn video_without_agent_workspace_is_not_processed() {
         let config = default_pipeline_config(true);
         let pipeline = MediaPipeline::new(&config, None, false);
 
         let result = pipeline.process("watch", &[sample_video()]).await;
         assert!(
-            result.contains("[Video: clip.mp4 attached]"),
-            "expected video annotation, got: {result}"
+            result.contains("no media workspace"),
+            "video without a resolved agent workspace must fail closed: {result}"
         );
+    }
+
+    #[tokio::test]
+    async fn real_silent_mp4_extracts_scoped_frames_across_duration_and_leaves_no_temp_files() {
+        let Some((_fixture_dir, fixture_path)) = generate_mp4_fixture(8, false, 720, 1280) else {
+            eprintln!("skipping ffmpeg fixture test: ffmpeg/ffprobe unavailable");
+            return;
+        };
+        let bytes = std::fs::read(&fixture_path).unwrap();
+        let mdat = bytes.windows(4).position(|atom| atom == b"mdat").unwrap();
+        let moov = bytes.windows(4).position(|atom| atom == b"moov").unwrap();
+        assert!(
+            moov > mdat,
+            "fixture must exercise a normal moov-at-end MP4"
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true).with_workspace_dir(workspace.path());
+        let attachment = MediaAttachment {
+            file_name: "clip.mp4".to_string(),
+            data: bytes,
+            mime_type: Some("video/mp4".to_string()),
+            marker: None,
+        };
+
+        let result = pipeline.process("inspect this clip", &[attachment]).await;
+
+        assert_eq!(result.matches("[Video frame ").count(), 4, "{result}");
+        assert!(result.contains("[Video frame 4 of 4]"));
+        assert!(
+            !result.contains("transcription") && !result.contains("Video audio"),
+            "a silent clip must not produce an audio failure annotation: {result}"
+        );
+        let media_dir = workspace.path().join("telegram_files");
+        let entries = std::fs::read_dir(&media_dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 4);
+        let mut frame_hashes = std::collections::HashSet::new();
+        for entry in entries {
+            let frame = std::fs::read(entry.path()).unwrap();
+            assert!(frame.starts_with(&[0xff, 0xd8]));
+            let decoded = image::load_from_memory(&frame).unwrap();
+            assert!(decoded.width() <= VIDEO_FRAME_WIDTH as u32);
+            assert!(decoded.height() <= VIDEO_FRAME_WIDTH as u32);
+            assert_eq!(decoded.height(), VIDEO_FRAME_WIDTH as u32);
+            frame_hashes.insert(sha2::Sha256::digest(frame));
+        }
+        assert!(
+            frame_hashes.len() > 1,
+            "samples should span changing frames"
+        );
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            1,
+            "only persistent agent-owned frame images should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_video_duration_over_limit_is_rejected_before_frame_extraction() {
+        let Some((_fixture_dir, fixture_path)) = generate_mp4_fixture(121, false, 1280, 720) else {
+            eprintln!("skipping ffmpeg fixture test: ffmpeg/ffprobe unavailable");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true).with_workspace_dir(workspace.path());
+        let attachment = MediaAttachment {
+            file_name: "long.mp4".to_string(),
+            data: std::fs::read(fixture_path).unwrap(),
+            mime_type: Some("video/mp4".to_string()),
+            marker: None,
+        };
+
+        let result = pipeline.process("inspect", &[attachment]).await;
+
+        assert!(result.contains("120 second processing limit"), "{result}");
+        assert!(!workspace.path().join("telegram_files").exists());
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn real_audio_track_is_detected_and_compressed_audio_stays_below_cap() {
+        let Some((_fixture_dir, fixture_path)) = generate_mp4_fixture(8, true, 1280, 720) else {
+            eprintln!("skipping ffmpeg fixture test: ffmpeg/ffprobe unavailable");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let tempdir = tempfile::tempdir_in(workspace.path()).unwrap();
+        let input_path = tempdir.path().join("fixture.mp4");
+        std::fs::copy(fixture_path, &input_path).unwrap();
+        let info = probe_video(
+            std::path::Path::new("ffprobe"),
+            &input_path,
+            "mov",
+            VIDEO_FFMPEG_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(info.has_audio);
+        assert!(info.duration_secs <= VIDEO_MAX_DURATION_SECS as f64);
+
+        let audio = extract_video_audio(
+            std::path::Path::new("ffmpeg"),
+            &input_path,
+            "mov",
+            info.duration_secs,
+            VIDEO_FFMPEG_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert!(!audio.is_empty());
+        assert!(audio.len() <= VIDEO_MAX_AUDIO_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn matroska_and_webm_inputs_probe_decode_and_extract_audio() {
+        for container in ["mkv", "webm"] {
+            let Some((_fixture_dir, fixture_path)) =
+                generate_video_fixture(6, true, 640, 360, container)
+            else {
+                eprintln!("skipping ffmpeg fixture test: ffmpeg/ffprobe unavailable");
+                return;
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let tempdir = tempfile::tempdir_in(workspace.path()).unwrap();
+            let input_path = tempdir.path().join(format!("fixture.{container}"));
+            std::fs::copy(fixture_path, &input_path).unwrap();
+            let input_format = safe_video_demuxer(container);
+
+            let info = probe_video(
+                std::path::Path::new("ffprobe"),
+                &input_path,
+                input_format,
+                VIDEO_FFMPEG_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert!(
+                info.has_audio,
+                "{container} audio stream should be detected"
+            );
+
+            let frames = extract_video_frames(
+                std::path::Path::new("ffmpeg"),
+                &input_path,
+                input_format,
+                info.duration_secs,
+                VIDEO_FFMPEG_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert!(!frames.is_empty(), "{container} frames should decode");
+
+            let audio = extract_video_audio(
+                std::path::Path::new("ffmpeg"),
+                &input_path,
+                input_format,
+                info.duration_secs,
+                VIDEO_FFMPEG_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            assert!(!audio.is_empty(), "{container} audio should extract");
+            assert!(audio.len() <= VIDEO_MAX_AUDIO_OUTPUT_BYTES);
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_payload_cannot_read_a_sibling_video_file() {
+        let Some((_fixture_dir, fixture_path)) = generate_mp4_fixture(8, true, 1280, 720) else {
+            eprintln!("skipping ffmpeg fixture test: ffmpeg/ffprobe unavailable");
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let sibling_video = workspace.path().join("private-sibling.mp4");
+        std::fs::copy(fixture_path, &sibling_video).unwrap();
+        let playlist = format!("ffconcat version 1.0\nfile '{}'\n", sibling_video.display());
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true).with_workspace_dir(workspace.path());
+        let attachment = MediaAttachment {
+            file_name: "playlist.mp4".to_string(),
+            data: playlist.into_bytes(),
+            mime_type: Some("video/mp4".to_string()),
+            marker: None,
+        };
+
+        let result = pipeline.process("inspect this clip", &[attachment]).await;
+
+        assert!(result.contains("Video could not be inspected"), "{result}");
+        assert!(!result.contains("[Video frame"), "{result}");
+        assert!(!result.contains("transcription"), "{result}");
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            1,
+            "the sibling file remains, and no extracted media was persisted"
+        );
+    }
+
+    #[cfg(unix)]
+    fn executable_script(
+        workspace: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = workspace.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_timeout_kills_child_and_cleans_staged_video() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sleeper = executable_script(workspace.path(), "slow-ffprobe", "exec sleep 5");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true)
+            .with_workspace_dir(workspace.path())
+            .with_ffprobe_program(sleeper)
+            .with_ffmpeg_timeout(VIDEO_FFMPEG_TEST_TIMEOUT);
+        let started = std::time::Instant::now();
+
+        let result = pipeline.process("inspect", &[sample_video()]).await;
+
+        assert!(result.contains("could not be inspected"), "{result}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+        assert!(workspace.path().join("slow-ffprobe").exists());
+        assert!(
+            std::fs::read_dir(workspace.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("telegram-video-")),
+            "temporary video input must be removed after timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_output_limit_cleans_staged_video() {
+        let workspace = tempfile::tempdir().unwrap();
+        let noisy_probe =
+            executable_script(workspace.path(), "noisy-ffprobe", "printf '%17000s' ''");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true)
+            .with_workspace_dir(workspace.path())
+            .with_ffprobe_program(noisy_probe);
+
+        let result = pipeline.process("inspect", &[sample_video()]).await;
+
+        assert!(result.contains("could not be inspected"), "{result}");
+        let entries = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_name(), "noisy-ffprobe");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg_output_limit_kills_child_and_cleans_staged_video() {
+        let workspace = tempfile::tempdir().unwrap();
+        let probe = executable_script(
+            workspace.path(),
+            "fake-ffprobe",
+            "printf '{\"format\":{\"duration\":\"1\"},\"streams\":[{\"codec_type\":\"video\"}]}'",
+        );
+        let noisy_ffmpeg =
+            executable_script(workspace.path(), "noisy-ffmpeg", "printf '%9000000s' ''");
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true)
+            .with_workspace_dir(workspace.path())
+            .with_ffprobe_program(probe)
+            .with_ffmpeg_program(noisy_ffmpeg);
+
+        let result = pipeline.process("inspect", &[sample_video()]).await;
+
+        assert!(
+            result.contains("Video frames could not be extracted"),
+            "{result}"
+        );
+        let entries = std::fs::read_dir(workspace.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            matches!(
+                entry.file_name().to_string_lossy().as_ref(),
+                "fake-ffprobe" | "noisy-ffmpeg"
+            )
+        }));
     }
 
     #[tokio::test]
@@ -813,7 +1678,9 @@ mod tests {
             "missing image annotation"
         );
         assert!(
-            result.contains("[Video: clip.mp4 attached]"),
+            result.contains(
+                "[Video could not be inspected because this agent has no media workspace.]"
+            ),
             "missing video annotation"
         );
         assert!(result.contains("context"), "missing original text");

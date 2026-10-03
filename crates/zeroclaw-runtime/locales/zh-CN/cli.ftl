@@ -1111,6 +1111,7 @@ channel-telegram-voice-drop-too-long = ⚠️ 已跳过音频消息：时长超�
 channel-telegram-voice-drop-file-unavailable = ⚠️ 已跳过音频消息：无法从 Telegram 获取该文件——可能文件过大或已不可用。请尝试更小或更短的文件。
 channel-telegram-voice-drop-empty-transcript = ⚠️ 已跳过音频消息：未能从录音中识别出任何内容。请用更清晰的录音重试。
 channel-telegram-photo-drop-failed = ⚠️ 无法读取这张照片，请重新发送。
+channel-telegram-video-drop-failed = ⚠️ 无法处理该视频，请发送时长少于 2 分钟且大小小于 20 MB 的视频。
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许

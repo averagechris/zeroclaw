@@ -1112,6 +1112,7 @@ channel-telegram-voice-drop-too-long = ⚠️ Mensaje de audio omitido: supera e
 channel-telegram-voice-drop-file-unavailable = ⚠️ Mensaje de audio omitido: no se pudo obtener el archivo de Telegram — puede ser demasiado grande o ya no estar disponible. Prueba con un archivo más pequeño o más corto.
 channel-telegram-voice-drop-empty-transcript = ⚠️ Mensaje de audio omitido: no se pudo reconocer nada en la grabación. Inténtalo de nuevo con una grabación más clara.
 channel-telegram-photo-drop-failed = ⚠️ No pude leer esa foto. Intenta enviarla de nuevo.
+channel-telegram-video-drop-failed = ⚠️ No pude procesar ese video. Envía un clip de menos de 2 minutos y 20 MB.
 channel-discord-approval-btn-allow-once = Permitir una vez
 channel-discord-approval-btn-allow-session = Permitir esta sesión
 channel-discord-approval-btn-allow-always = Permitir siempre

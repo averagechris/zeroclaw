@@ -266,11 +266,15 @@ Check in Telegram:
 - `/model <hint>` in the group changes the group only; DMs keep their own
   model. The inline `/model` picker does not open on a routed alias; use the
   text form.
-- The original text-only baseline dropped photos and voice notes before
-  download. After media support is enabled, admitted photos are saved under
-  the resolved agent's workspace for vision, and voice notes are sent to that
-  agent's configured transcription provider. This behavior still follows the
-  route and authorization checks above; unadmitted messages are not fetched.
+- The original text-only baseline dropped media before download. With media
+  support enabled, admitted photos and extracted video frames are saved under
+  the resolved agent's workspace for vision. Voice notes and video audio use
+  that agent's configured transcription provider. Video requires `ffmpeg`
+  and `ffprobe`; clips are limited to 20 MiB and 120 seconds, with at most
+  four frames scaled within 640×640 pixels and 1 MiB of extracted audio.
+  Videos inside photo albums contribute captions but are not downloaded.
+  These paths follow the route and authorization checks above; unadmitted
+  messages are not fetched.
 
 The full proof list is in [One-bot route and isolation
 proof](issues/18-one-bot-route-and-isolation-proof.md). Stage 3 must not
