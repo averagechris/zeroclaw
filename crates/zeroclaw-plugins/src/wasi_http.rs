@@ -43,18 +43,18 @@
 //! request, and that request is authorized on its own from scratch.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use hyper::header::HOST;
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout, timeout_at};
-use wasmtime_wasi_http::p2::{
-    WasiHttpHooks,
-    bindings::http::types::ErrorCode,
-    body::HyperOutgoingBody,
-    types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
-};
+use tokio::time::{Instant, Sleep, timeout, timeout_at};
+use wasmtime_wasi_http::p2::{bindings::http::types::ErrorCode, body::HyperOutgoingBody};
+use wasmtime_wasi_http::{RequestOptions, WasiHttpHooks};
 use zeroclaw_infra::net_guard::NetworkGuardError;
 
 use crate::egress::{
@@ -525,64 +525,153 @@ impl PluginEgressHooks {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RequestConfig {
+    use_tls: bool,
+    connect_timeout: Duration,
+    first_byte_timeout: Duration,
+    between_bytes_timeout: Duration,
+}
+
+type SendResponse = (
+    hyper::Response<wasmtime_wasi_http::p2::body::HyperIncomingBody>,
+    Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>,
+);
+
 impl WasiHttpHooks for PluginEgressHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
-        config: OutgoingRequestConfig,
-    ) -> wasmtime_wasi_http::p2::HttpResult<HostFutureIncomingResponse> {
-        let Some(authority) = request.uri().authority().cloned() else {
-            return Ok(HostFutureIncomingResponse::ready(Ok(Err(
-                ErrorCode::HttpRequestUriInvalid,
-            ))));
-        };
-        // One endpoint for the grant check, the dial, and the `Host` header.
-        // An authority that cannot name exactly one is a malformed URI, and is
-        // reported as such rather than as a policy denial: nothing about the
-        // host's network is disclosed by telling a guest its own URI is bad.
-        let (host, port) = match authority_endpoint(&authority, config.use_tls) {
-            Ok(endpoint) => endpoint,
-            Err(error) => return Ok(HostFutureIncomingResponse::ready(Ok(Err(error)))),
-        };
+        options: Option<RequestOptions>,
+        _fut: Box<dyn Future<Output = wasmtime_wasi_http::Result<()>> + Send>,
+    ) -> Box<dyn Future<Output = wasmtime_wasi_http::Result<SendResponse>> + Send> {
+        let scope = self.scope.clone();
+        let egress = self.egress.clone();
+        Box::new(async move {
+            let options = options.unwrap_or_default();
+            let config = RequestConfig {
+                use_tls: request.uri().scheme_str() == Some("https"),
+                connect_timeout: options.connect_timeout.unwrap_or(Duration::from_secs(600)),
+                first_byte_timeout: options
+                    .first_byte_timeout
+                    .unwrap_or(Duration::from_secs(600)),
+                between_bytes_timeout: options
+                    .between_bytes_timeout
+                    .unwrap_or(Duration::from_secs(600)),
+            };
+            let Some(authority) = request.uri().authority().cloned() else {
+                return Err(ErrorCode::HttpRequestUriInvalid.into());
+            };
+            // One endpoint for the grant check, the dial, and the `Host` header.
+            // An authority that cannot name exactly one is a malformed URI, and is
+            // reported as such rather than as a policy denial: nothing about the
+            // host's network is disclosed by telling a guest its own URI is bad.
+            let (host, port) = match authority_endpoint(&authority, config.use_tls) {
+                Ok(endpoint) => endpoint,
+                Err(error) => return Err(error.into()),
+            };
 
-        // Deny by default, before anything is spawned and before any name is
-        // looked up: a store that links `wasi:http` without a host-owned egress
-        // service reaches nothing.
-        let Some(service) = self.egress.clone() else {
-            record_denial(
-                self.scope.id(),
+            // Deny by default, before anything is spawned and before any name is
+            // looked up: a store that links `wasi:http` without a host-owned egress
+            // service reaches nothing.
+            let Some(service) = egress else {
+                record_denial(
+                    scope.id(),
+                    &host,
+                    "no egress policy granted for this instance",
+                );
+                return Err(denied().into());
+            };
+
+            // `encrypted` is the confidentiality mode, not a second permission axis:
+            // the operator's grant covers a host, and plain HTTP to a granted host
+            // is permitted. The transport is what selects the effective grant the
+            // boundary re-checks.
+            let egress_request = match EgressRequest::new(
+                scope.clone(),
+                EgressTransport::Http {
+                    encrypted: config.use_tls,
+                },
                 &host,
-                "no egress policy granted for this instance",
-            );
-            return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
-        };
+                port,
+            ) {
+                Ok(request) => request,
+                // A malformed destination never becomes a request, so it never
+                // reaches DNS. The guest still sees only the masked denial.
+                Err(error) => {
+                    record_denial(scope.id(), &host, &error.to_string());
+                    return Err(denied().into());
+                }
+            };
 
-        // `encrypted` is the confidentiality mode, not a second permission axis:
-        // the operator's grant covers a host, and plain HTTP to a granted host
-        // is permitted. The transport is what selects the effective grant the
-        // boundary re-checks.
-        let egress_request = match EgressRequest::new(
-            self.scope.clone(),
-            EgressTransport::Http {
-                encrypted: config.use_tls,
-            },
-            &host,
-            port,
-        ) {
-            Ok(request) => request,
-            // A malformed destination never becomes a request, so it never
-            // reaches DNS. The guest still sees only the masked denial.
-            Err(error) => {
-                record_denial(self.scope.id(), &host, &error.to_string());
-                return Ok(HostFutureIncomingResponse::ready(Ok(Err(denied()))));
+            let id = scope.id().clone();
+            send(request, config, egress_request, service, id)
+                .await
+                .map_err(Into::into)
+        })
+    }
+}
+
+/// A response body that preserves wasi:http's between-bytes timeout for the
+/// custom pinned-send path.
+struct TimedIncomingBody {
+    incoming: hyper::body::Incoming,
+    timeout: Option<Pin<Box<Sleep>>>,
+    between_bytes_timeout: Duration,
+}
+
+impl TimedIncomingBody {
+    fn reset_timeout(&mut self) {
+        match Instant::now().checked_add(self.between_bytes_timeout) {
+            Some(deadline) => {
+                if let Some(timeout) = &mut self.timeout {
+                    timeout.as_mut().reset(deadline);
+                } else {
+                    self.timeout = Some(Box::pin(tokio::time::sleep_until(deadline)));
+                }
             }
-        };
+            None => self.timeout = None,
+        }
+    }
+}
 
-        let id = self.scope.id().clone();
-        let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(send(request, config, egress_request, service, id).await)
-        });
-        Ok(HostFutureIncomingResponse::pending(handle))
+impl hyper::body::Body for TimedIncomingBody {
+    type Data = hyper::body::Bytes;
+    type Error = wasmtime_wasi_http::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.incoming).poll_frame(cx) {
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error.into()))),
+            Poll::Ready(Some(Ok(frame))) => {
+                this.reset_timeout();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => {
+                let Some(timeout) = this.timeout.as_mut() else {
+                    return Poll::Ready(Some(Err(
+                        wasmtime_wasi_http::Error::ConnectionReadTimeout,
+                    )));
+                };
+                if timeout.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Some(Err(wasmtime_wasi_http::Error::ConnectionReadTimeout)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.incoming.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.incoming.size_hint()
     }
 }
 
@@ -604,11 +693,11 @@ impl WasiHttpHooks for PluginEgressHooks {
 /// cannot let the peer decide how long to hold it.
 async fn send(
     mut request: hyper::Request<HyperOutgoingBody>,
-    config: OutgoingRequestConfig,
+    config: RequestConfig,
     egress_request: EgressRequest,
     service: EgressHostService,
     id: PluginInstanceId,
-) -> Result<IncomingResponse, ErrorCode> {
+) -> Result<SendResponse, ErrorCode> {
     use http_body_util::BodyExt;
 
     // The authority is safe to name on the wire because [`authority_endpoint`]
@@ -757,15 +846,22 @@ async fn send(
         .map_err(|_| ErrorCode::ConnectionReadTimeout)?
         .map_err(|_| ErrorCode::HttpProtocolError)?
         .map(|body| {
-            body.map_err(|_| ErrorCode::HttpProtocolError)
-                .boxed_unsync()
+            TimedIncomingBody {
+                incoming: body,
+                timeout: Instant::now()
+                    .checked_add(config.between_bytes_timeout)
+                    .map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+                between_bytes_timeout: config.between_bytes_timeout,
+            }
+            .boxed_unsync()
         });
 
-    Ok(IncomingResponse {
-        resp,
-        worker: Some(worker),
-        between_bytes_timeout: config.between_bytes_timeout,
-    })
+    let io = Box::new(async move {
+        worker.await;
+        Ok(())
+    });
+
+    Ok((resp, io))
 }
 
 /// Dial the pinned addresses in order and return the first connection that
@@ -859,6 +955,87 @@ mod tests {
     use crate::egress::{EgressPolicy, EgressPolicyResolver};
     use crate::{PluginCapability, PluginPermission};
 
+    #[derive(Clone, Copy)]
+    struct OutgoingRequestConfig {
+        use_tls: bool,
+        connect_timeout: Duration,
+        first_byte_timeout: Duration,
+        between_bytes_timeout: Duration,
+    }
+
+    type IncomingResponse = ();
+
+    #[derive(Debug)]
+    enum HostFutureIncomingResponse {
+        Ready(Result<IncomingResponse, ErrorCode>),
+        Pending(tokio::task::JoinHandle<Result<IncomingResponse, ErrorCode>>),
+    }
+
+    trait TestSendRequest {
+        fn test_send_request(
+            &mut self,
+            request: hyper::Request<HyperOutgoingBody>,
+            options: OutgoingRequestConfig,
+        ) -> Result<HostFutureIncomingResponse, String>;
+    }
+
+    impl TestSendRequest for PluginEgressHooks {
+        fn test_send_request(
+            &mut self,
+            request: hyper::Request<HyperOutgoingBody>,
+            options: OutgoingRequestConfig,
+        ) -> Result<HostFutureIncomingResponse, String> {
+            debug_assert_eq!(options.use_tls, request.uri().scheme_str() == Some("https"));
+            let future = WasiHttpHooks::send_request(
+                self,
+                request,
+                Some(RequestOptions {
+                    connect_timeout: Some(options.connect_timeout),
+                    first_byte_timeout: Some(options.first_byte_timeout),
+                    between_bytes_timeout: Some(options.between_bytes_timeout),
+                }),
+                Box::new(async { Ok(()) }),
+            );
+            let future = async move {
+                let (response, io) = Pin::from(future).await.map_err(error_code)?;
+                drop(response);
+                drop(io);
+                Ok(())
+            };
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                Ok(HostFutureIncomingResponse::Pending(
+                    ::zeroclaw_spawn::spawn!(future),
+                ))
+            } else {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                Ok(HostFutureIncomingResponse::Ready(runtime.block_on(future)))
+            }
+        }
+    }
+
+    fn error_code(error: wasmtime_wasi_http::Error) -> ErrorCode {
+        use wasmtime_wasi_http::Error;
+        match error {
+            Error::InternalError(message) => ErrorCode::InternalError(message),
+            Error::ConnectionTimeout => ErrorCode::ConnectionTimeout,
+            Error::ConnectionLimitReached => ErrorCode::ConnectionLimitReached,
+            Error::ConnectionReadTimeout => ErrorCode::ConnectionReadTimeout,
+            Error::ConnectionRefused => ErrorCode::ConnectionRefused,
+            Error::HttpRequestUriInvalid => ErrorCode::HttpRequestUriInvalid,
+            Error::HttpProtocolError | Error::Hyper(_) => ErrorCode::HttpProtocolError,
+            Error::DnsError { rcode, info_code } => ErrorCode::DnsError(
+                wasmtime_wasi_http::p2::bindings::http::types::DnsErrorPayload { rcode, info_code },
+            ),
+            Error::TlsProtocolError | Error::Tls(_) => ErrorCode::TlsProtocolError,
+            Error::TlsCertificateError => ErrorCode::TlsCertificateError,
+            other => ErrorCode::InternalError(Some(format!("{other:?}"))),
+        }
+    }
+
     fn hooks(egress: Option<EgressHostService>) -> PluginEgressHooks {
         let scope = crate::instance::test_scope(
             PluginCapability::Tool,
@@ -878,6 +1055,57 @@ mod tests {
             .expect("valid fixture request")
     }
 
+    async fn assert_stalled_body_timeout(between_bytes_timeout: Duration) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback response peer");
+        let port = listener.local_addr().expect("listener address").port();
+        ::zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na")
+                .await
+                .expect("write response headers and one body byte");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+
+        let mut hooks = hooks(Some(loopback_service()));
+        let future = WasiHttpHooks::send_request(
+            &mut hooks,
+            request(&format!("http://127.0.0.1:{port}/")),
+            Some(RequestOptions {
+                connect_timeout: Some(Duration::from_secs(1)),
+                first_byte_timeout: Some(Duration::from_secs(1)),
+                between_bytes_timeout: Some(between_bytes_timeout),
+            }),
+            Box::new(async { Ok(()) }),
+        );
+        let (response, io) = Pin::from(future)
+            .await
+            .expect("request headers should arrive");
+        let io = wasmtime_wasi::runtime::spawn(async move { Pin::from(io).await });
+        let error = response
+            .into_body()
+            .collect()
+            .await
+            .expect_err("the response stalls after one body byte");
+        assert!(
+            matches!(error, wasmtime_wasi_http::Error::ConnectionReadTimeout),
+            "a stalled response body must surface ConnectionReadTimeout, got {error:?}"
+        );
+        let _ = io.await;
+    }
+
+    #[tokio::test]
+    async fn response_body_timeout_is_preserved_and_overflow_fails_closed() {
+        assert_stalled_body_timeout(Duration::from_millis(20)).await;
+        assert_stalled_body_timeout(Duration::MAX).await;
+    }
+
     fn config() -> OutgoingRequestConfig {
         OutgoingRequestConfig {
             use_tls: false,
@@ -889,7 +1117,7 @@ mod tests {
 
     fn denial(response: HostFutureIncomingResponse) -> ErrorCode {
         match response {
-            HostFutureIncomingResponse::Ready(Ok(Err(code))) => code,
+            HostFutureIncomingResponse::Ready(Err(code)) => code,
             other => panic!("expected a synchronous denial, got: {other:?}"),
         }
     }
@@ -906,7 +1134,7 @@ mod tests {
             "http://api.internal/",
         ] {
             let response = hooks
-                .send_request(request(uri), config())
+                .test_send_request(request(uri), config())
                 .expect("a denial is a guest-visible error, never a trap");
             assert!(
                 matches!(denial(response), ErrorCode::InternalError(Some(message)) if message == DENIED_MESSAGE),
@@ -925,7 +1153,7 @@ mod tests {
             ));
         let mut hooks = hooks(Some(service));
         let response = hooks
-            .send_request(request("http://exa_mple.com/"), config())
+            .test_send_request(request("http://exa_mple.com/"), config())
             .expect("a denial is a guest-visible error, never a trap");
         assert!(matches!(
             denial(response),
@@ -1019,7 +1247,7 @@ mod tests {
             ));
         let mut hooks = hooks(Some(service));
         let response = hooks
-            .send_request(request("http://api.example./"), config())
+            .test_send_request(request("http://api.example./"), config())
             .expect("a malformed URI is a guest-visible error, never a trap");
         assert!(
             matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
@@ -1046,7 +1274,7 @@ mod tests {
             "http://user:pass@example.com:8443/",
         ] {
             let response = hooks
-                .send_request(request(uri), config())
+                .test_send_request(request(uri), config())
                 .expect("a malformed URI is a guest-visible error, never a trap");
             assert!(
                 matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
@@ -1095,7 +1323,7 @@ mod tests {
         };
 
         let response = hooks
-            .send_request(request("http://127.0.0.1:1/"), config)
+            .test_send_request(request("http://127.0.0.1:1/"), config)
             .expect("a nonsense timeout is a guest-visible error, never a trap");
         let HostFutureIncomingResponse::Pending(handle) = response else {
             panic!("a granted destination is dialed asynchronously");
@@ -1144,7 +1372,7 @@ mod tests {
             .expect("the first connection takes the instance's only slot");
 
         let response = hooks
-            .send_request(request(&format!("http://127.0.0.1:{port}/")), config())
+            .test_send_request(request(&format!("http://127.0.0.1:{port}/")), config())
             .expect("a full budget is a guest-visible error, never a trap");
         let HostFutureIncomingResponse::Pending(handle) = response else {
             panic!("a granted destination is authorized asynchronously");
@@ -1214,7 +1442,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = runtime.block_on(async {
             let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
+                .test_send_request(request(&format!("https://127.0.0.1:{port}/")), config)
                 .expect("a stalled peer is a guest-visible error, never a trap");
             let HostFutureIncomingResponse::Pending(handle) = response else {
                 panic!("an authorized destination is dialed asynchronously");
@@ -1408,7 +1636,7 @@ mod tests {
         let mut hooks = hooks(Some(service));
 
         let response = hooks
-            .send_request(
+            .test_send_request(
                 request(&format!("http://rebind.example.com:{}/", pinned.port())),
                 config(),
             )
@@ -1661,7 +1889,7 @@ ok",
         runtime.block_on(async move {
             let mut hooks = hooks(Some(loopback_service()));
             let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), tls_config())
+                .test_send_request(request(&format!("https://127.0.0.1:{port}/")), tls_config())
                 .expect("an authorized destination is dialed asynchronously");
             let HostFutureIncomingResponse::Pending(handle) = response else {
                 panic!("an authorized destination is dialed asynchronously");
@@ -1947,7 +2175,7 @@ ok",
         let (outcome, elapsed) = runtime.block_on(async move {
             let started = std::time::Instant::now();
             let response = hooks
-                .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
+                .test_send_request(request(&format!("https://127.0.0.1:{port}/")), config)
                 .expect("an authorized destination is dialed asynchronously");
             let HostFutureIncomingResponse::Pending(handle) = response else {
                 panic!("an authorized destination is dialed asynchronously");
