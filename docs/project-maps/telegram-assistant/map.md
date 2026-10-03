@@ -2,20 +2,24 @@
 
 ## Destination
 
-A delivery-ready plan for one always-on ZeroClaw daemon on the owner's Linux
-desktop that serves an owner DM, partner DM, and shared household Telegram
-group through one bot and three isolated agent profiles. Prove approved-user
-access, fail-closed routing, sessions, memory isolation, and tool boundaries
-first, with only the built-in memory tools granted.
-Then add plain Kagi search as the first shared tool; only after the isolation
-tests pass, enable unprompted shell for the owner's private agent. V1 has no
-account integrations. Discovery ends when the one-bot routing and isolation
-proof is clear enough to implement safely, or when the three-bot fallback is
-chosen because the proof fails.
+An always-on Michi deployment with isolated invited DMs and groups, useful media
+tools, and workspace-bound memo memory. Finish the memo and owner video-editing
+trial, verify it in Telegram, and keep the deployment reproducible.
 
 ## Notes
 
-Standing constraints from the owner (Chris):
+Current scope, 2026-10-03:
+
+- Dynamic invitations, isolated agent workspaces, Kagi, media understanding,
+  image generation, and smooth streaming are deployed.
+- Replace native durable memory with [memo](issues/22-memo-trial.md). Start with
+  empty stores, without importing previous memories. Cross-chat sharing is deferred.
+- Enable shell and FFmpeg only for the owner's private agent. Keep the host sandbox.
+- The original V1 decisions below are historical where later decisions supersede them.
+  The live host configuration and rollout procedures live in
+  [the host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md).
+
+Standing constraints from the original discovery (Chris):
 
 - One daemon, one host. Hostile multi-tenant isolation is not a goal. The
   goal is that the partner cannot accidentally act through the owner's
@@ -84,7 +88,8 @@ Repository facts that shape the plan:
 - Inbound routing is channel-key to agent, one owner per key
   (`AgentRouter::resolve` in `crates/zeroclaw-channels/src/orchestrator/mod.rs`,
   `Config::agent_for_channel` in `crates/zeroclaw-config/src/schema.rs`).
-  There is no per-sender routing inside one channel alias today.
+  The fork now also supports explicit peer routes and dynamic enrollment within
+  a Telegram alias; see the [Telegram guide](../../book/src/channels/telegram.md).
 - Upstream is building per-sender authorization under tracker
   [#8290](https://github.com/zeroclaw-labs/zeroclaw/issues/8290) and
   [ADR-017](../../book/src/architecture/decisions/ADR-017-inbound-authentication-and-principals.md)
@@ -112,13 +117,12 @@ Agents scan this directory for open, unblocked child decisions.
 
 ## Decisions so far
 
+- [Memo trial](issues/22-memo-trial.md): use a workspace-bound CLI tool with empty stores; disable native durable memory and defer sharing.
+
 - [Launch sequence](issues/16-launch-sequence.md): establish the
   memory-tools-only baseline first, then add Kagi as the first shared tool;
   defer other tools.
-- [Memory tools](issues/21-memory-tools.md): built-in `memory_recall`,
-  `memory_store`, and `memory_forget` on SQLite for all three agents; store
-  and recall unprompted, forget prompts; no export, purge, or community memory
-  server in V1.
+- [Original memory tools](issues/21-memory-tools.md): the SQLite bootstrap decision is superseded by the memo trial.
 - [Inbound routing model](issues/01-inbound-routing-model.md): one Telegram
   alias maps to exactly one agent; principals cannot be split across agents
   within one bot without a code change.

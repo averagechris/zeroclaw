@@ -1,14 +1,54 @@
 # Setup runbook: household Telegram assistant
 
-Bootstrap instructions for the one-bot, three-agent assistant described in
-the [Telegram assistant map](map.md). Written for the owner and for agents
-helping him set it up later. Follow the sections in order.
+The current Michi deployment uses dynamic invitations and agent workspaces.
+Use [the host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md)
+for its reproducible NixOS configuration, media tools, and owner-only shell.
 
-This runbook describes fixed owner, partner, and household routes. For
-invited friends and arbitrary approved groups, use the
-[dynamic enrollment setup](../../book/src/channels/telegram.md#invite-friends-and-approve-groups-dynamically)
-instead. That mode needs only the owner ID configured ahead of time;
-private and group memberships survive declarative configuration rebuilds.
+The numbered sections below preserve the original fixed owner, partner, and
+household bootstrap. They are historical, including the text-only and native
+memory stages. For invited friends and arbitrary approved groups, use the
+[dynamic enrollment setup](../../book/src/channels/telegram.md#invite-friends-and-approve-groups-dynamically).
+It requires only the owner ID configured ahead of time. Enable BotFather's
+`/setjoingroups` when the bot should join approved groups.
+
+## Memo trial
+
+Install the pinned memo CLI in the service environment and configure:
+
+```toml
+[memo]
+enabled = true
+executable = "/absolute/path/to/memo"
+wake_lines = 96
+
+[memory]
+backend = "none"
+auto_save = false
+hygiene_enabled = false
+```
+
+Grant and auto-approve `memo` for each participating risk profile. Remove the
+native memory tool grants. Keep `workspace.read_memory_from` empty. Use a
+separate agent alias and workspace for each DM or group; shared aliases share
+one memo store. The tool fixes its data directory to `<agent workspace>/memo`
+and its store to `default`.
+
+Start empty; do not copy native memories into memo. Ask Michi to remember a new
+useful preference and verify a later reply calls `wake`. Operator inspection
+uses `memo --data-dir <agent workspace>/memo --store default -o json wake
+--lines 96`, as the service user. Incomplete wake returns a pending range and
+its sources; complete each range with `nap`, then repeat wake. The tool handles
+that protocol in chat. Avoid synthetic test notes in real stores because notes
+are append-only.
+
+To reset a trial store, stop the service, move that agent's `memo` directory
+aside, and restart. Keep conversation history, memberships, and provider auth.
+For rollback, restore the prior host configuration and package pin. Dormant
+native memory files remain available; memo notes are not imported back into them.
+Sharing between chats is deferred. See [Memo trial](issues/22-memo-trial.md) for
+the implementation boundary and workflow.
+
+## Historical bootstrap
 
 This file must never contain a real token, key, Telegram ID, or
 host-specific path. Use placeholders here and keep real values in the host

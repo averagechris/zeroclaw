@@ -2,6 +2,29 @@
 
 use super::*;
 
+fn append_memo_tool(
+    config: &Config,
+    workspace: &Path,
+    security: &Arc<SecurityPolicy>,
+    tools: &mut tools::AllToolsResult,
+) {
+    if !config.memo.enabled {
+        return;
+    }
+    let tool: Arc<dyn Tool> = Arc::new(zeroclaw_tools::memo::MemoTool::new(
+        config.memo.executable.clone(),
+        workspace,
+        config.memo.wake_lines,
+        Arc::clone(security),
+    ));
+    tools
+        .tools
+        .push(Box::new(zeroclaw_runtime::tools::ArcToolRef(Arc::clone(
+            &tool,
+        ))));
+    tools.unfiltered_tool_arcs.push(tool);
+}
+
 pub(super) struct PreparedChannelAgent {
     agent_alias: String,
     config: Config,
@@ -113,7 +136,7 @@ impl PreparedChannelAgent {
         let skills =
             zeroclaw_runtime::skills::load_skills_for_agent(&workspace, config, agent_alias);
 
-        let all_tools_result_ch = tools::all_tools_with_runtime(
+        let mut all_tools_result_ch = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             &risk_profile,
@@ -136,6 +159,7 @@ impl PreparedChannelAgent {
             sop_audit.clone(),
             Some(Arc::clone(&config_arc)),
         )?;
+        append_memo_tool(config, &workspace, &security, &mut all_tools_result_ch);
         // Route the per-agent tool registry through the one gated seam - see
         // `assemble_channel_agent_tools` for the knobs and why. `mut` because the
         // text-tool prompt policy below may clear `deferred_section` for a
@@ -189,6 +213,10 @@ impl PreparedChannelAgent {
             (
                 "memory_recall",
                 "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
+            ),
+            (
+                "memo",
+                "Use the agent-scoped local memo. Call action=\"wake\" before every reply. If wake is incomplete, summarize its pending sources with action=\"nap\" and repeat wake until complete. Save only durable, non-sensitive facts as concise one-line notes.",
             ),
             (
                 "memory_forget",
@@ -306,6 +334,18 @@ impl PreparedChannelAgent {
                 tools_registry.as_ref(),
                 &effective_tool_names,
             ));
+        }
+        if effective_tool_names.contains(&"memo") {
+            system_prompt.push_str(
+                "\n\n## Scoped Memo\n\n\
+                 Before replying to each user turn, call the `memo` tool with action `wake`.\n\
+                 If the response says wake is incomplete, faithfully summarize the supplied\n\
+                 pending sources with action `nap`, then call wake again until it is complete.\n\
+                 After a note produces a pending request, summarize only its supplied sources\n\
+                 with `nap` and repeat until no request remains. Memo is append-only: save only\n\
+                 new, verified durable facts or meaningful corrections, not duplicates, task\n\
+                 logs, or secrets. Never infer or combine another agent's store.",
+            );
         }
         if !deferred_section.is_empty() {
             system_prompt.push('\n');
