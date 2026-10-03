@@ -182,6 +182,9 @@ impl ImageGenTool {
         file.write_all(&bytes)
             .await
             .map_err(|_| failure("tool-image-gen-openai-file-error"))?;
+        file.flush()
+            .await
+            .map_err(|_| failure("tool-image-gen-openai-file-error"))?;
         let path = output.display().to_string();
         Ok(ToolResult {
             success: true,
@@ -298,7 +301,7 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         assert_eq!(files.len(), 1);
-        assert_eq!(tokio::fs::read(&files[0]).await.unwrap(), PNG);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), PNG);
         assert_eq!(
             tool.read_codex_reference(files[0].to_str().unwrap())
                 .await
