@@ -1352,12 +1352,15 @@ fn send_conversation_busy(
             zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
         let reply_target = msg.reply_target.clone();
         let thread_ts = msg.thread_ts.clone();
+        let attachment_workspace = ctx.workspace_dir.as_ref().clone();
         let tracked_task = busy_notice_tasks.track();
         zeroclaw_spawn::spawn!(async move {
             let _notice_permit = notice_permit;
             send_notice_with_timeout(
                 channel,
-                SendMessage::new(reply, &reply_target).in_thread(thread_ts),
+                SendMessage::new(reply, &reply_target)
+                    .in_thread(thread_ts)
+                    .with_attachment_workspace(attachment_workspace),
                 "busy_notice",
             )
             .await;
@@ -5194,7 +5197,13 @@ async fn handle_runtime_command_for_delivery(
         ),
     };
 
-    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
+    if let Err(err) = channel
+        .send(
+            &SendMessage::reply_to(msg, response)
+                .with_attachment_workspace(ctx.workspace_dir.as_ref().clone()),
+        )
+        .await
+    {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8890,7 +8899,11 @@ async fn process_channel_message_body(
             );
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
-                    .send(&SendMessage::reply_to(&msg, message).suppress_voice())
+                    .send(
+                        &SendMessage::reply_to(&msg, message)
+                            .with_attachment_workspace(ctx.workspace_dir.as_ref().clone())
+                            .suppress_voice(),
+                    )
                     .await;
             }
             reconcile_early_ack(
@@ -9419,10 +9432,10 @@ async fn process_channel_message_body(
                 stop_matrix_single_message_typing_scope(scope).await;
             }
             match channel
-                .send_draft(&SendMessage::reply_to(
-                    &msg,
-                    zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
-                ))
+                .send_draft(
+                    &SendMessage::reply_to(&msg, zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER)
+                        .with_attachment_workspace(ctx.workspace_dir.as_ref().clone()),
+                )
                 .await
             {
                 Ok(id) => id,
@@ -9566,6 +9579,7 @@ async fn process_channel_message_body(
         let notify_channel = target_channel.clone();
         let notify_reply_target = msg.reply_target.clone();
         let notify_thread_root = followup_thread_id(&msg);
+        let notify_attachment_workspace = ctx.workspace_dir.as_ref().clone();
         let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
             Some(zeroclaw_spawn::spawn!(async move {
                 while notify_rx.recv().await.is_some() {}
@@ -9579,6 +9593,7 @@ async fn process_channel_message_body(
                             .send(
                                 &SendMessage::new(&text, &notify_reply_target)
                                     .in_thread(thread_ts.clone())
+                                    .with_attachment_workspace(notify_attachment_workspace.clone())
                                     .suppress_voice(),
                             )
                             .await;
@@ -10293,7 +10308,8 @@ async fn process_channel_message_body(
                     }
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
-                        .in_thread(msg.thread_ts.clone());
+                        .in_thread(msg.thread_ts.clone())
+                        .with_attachment_workspace(ctx.workspace_dir.as_ref().clone());
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -10311,7 +10327,8 @@ async fn process_channel_message_body(
                             .send_final(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
                                     .force_voice()
-                                    .in_thread(msg.thread_ts.clone()),
+                                    .in_thread(msg.thread_ts.clone())
+                                    .with_attachment_workspace(ctx.workspace_dir.as_ref().clone()),
                             )
                             .await
                             .is_ok()
@@ -10367,6 +10384,9 @@ async fn process_channel_message_body(
                                     "Failed to finalize draft; sending as new message"
                                 );
                                 let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
+                                fallback = fallback.with_attachment_workspace(
+                                    ctx.workspace_dir.as_ref().clone(),
+                                );
                                 if suppress {
                                     fallback = fallback.suppress_voice();
                                 }
@@ -10378,7 +10398,8 @@ async fn process_channel_message_body(
                     // No draft — plain send.
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::reply_to(&msg, &delivered_response)
-                        .with_cancellation(cancellation_token.clone());
+                        .with_cancellation(cancellation_token.clone())
+                        .with_attachment_workspace(ctx.workspace_dir.as_ref().clone());
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -10415,6 +10436,7 @@ async fn process_channel_message_body(
                         .send(
                             &SendMessage::new(block, &delivery_recipient)
                                 .in_thread(msg.thread_ts.clone())
+                                .with_attachment_workspace(ctx.workspace_dir.as_ref().clone())
                                 .suppress_voice(),
                         )
                         .await
@@ -10498,7 +10520,11 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
+                        .send(
+                            &SendMessage::reply_to(&msg, error_text)
+                                .with_attachment_workspace(ctx.workspace_dir.as_ref().clone())
+                                .suppress_voice(),
+                        )
                         .await;
                 }
             } else {
@@ -10575,7 +10601,11 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(&SendMessage::reply_to(&msg, user_msg).suppress_voice())
+                        .send(
+                            &SendMessage::reply_to(&msg, user_msg)
+                                .with_attachment_workspace(ctx.workspace_dir.as_ref().clone())
+                                .suppress_voice(),
+                        )
                         .await;
                 }
             }
@@ -10630,7 +10660,11 @@ async fn process_channel_message_body(
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
                 let _ = channel
-                    .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
+                    .send(
+                        &SendMessage::reply_to(&msg, error_text)
+                            .with_attachment_workspace(ctx.workspace_dir.as_ref().clone())
+                            .suppress_voice(),
+                    )
                     .await;
             }
         }

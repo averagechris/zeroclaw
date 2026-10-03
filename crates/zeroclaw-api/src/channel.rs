@@ -462,6 +462,11 @@ pub struct SendMessage {
     /// File attachments to send with the message.
     /// Channels that don't support attachments ignore this field.
     pub attachments: Vec<MediaAttachment>,
+    /// Agent workspace allowed for local media markers in this delivery.
+    /// Telegram checks canonical local targets against this scope before
+    /// reading or uploading them. Other channel adapters may ignore it.
+    /// `None` preserves legacy callers without runtime agent context.
+    pub attachment_workspace: Option<std::path::PathBuf>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
     /// RFC 5322 References chain for email replies; ignored by non-email channels.
@@ -626,6 +631,7 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            attachment_workspace: None,
             in_reply_to: None,
             references: Vec::new(),
             suppress_voice: false,
@@ -658,6 +664,7 @@ impl SendMessage {
             thread_ts: None,
             cancellation_token: None,
             attachments: vec![],
+            attachment_workspace: None,
             in_reply_to: None,
             references: Vec::new(),
             suppress_voice: false,
@@ -692,6 +699,12 @@ impl SendMessage {
     /// Attach files to this message.
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
+        self
+    }
+
+    /// Limit model-generated local media markers to one agent workspace.
+    pub fn with_attachment_workspace(mut self, workspace: impl Into<std::path::PathBuf>) -> Self {
+        self.attachment_workspace = Some(workspace.into());
         self
     }
 }

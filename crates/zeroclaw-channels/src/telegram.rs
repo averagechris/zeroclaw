@@ -4,7 +4,7 @@ use parking_lot::{Mutex, RwLock};
 use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{
@@ -79,6 +79,7 @@ struct PartialDraftFinish {
 #[derive(Clone)]
 struct PartialDraftHandle {
     commands: tokio::sync::mpsc::Sender<PartialDraftCommand>,
+    attachment_workspace: Option<PathBuf>,
 }
 
 impl PartialDraftHandle {
@@ -392,6 +393,8 @@ struct MultiDraftState {
     /// split on the next flush before trusting `delivered_chunks` as a skip
     /// count, since tag-rewriting can change what the earlier chunks are.
     delivered_prefix: String,
+    /// Per-turn agent scope retained only until this draft is finalized.
+    attachment_workspace: Option<PathBuf>,
 }
 
 impl MultiDraftState {
@@ -404,7 +407,13 @@ impl MultiDraftState {
             last_sent_at: None,
             delivered_chunks: 0,
             delivered_prefix: String::new(),
+            attachment_workspace: None,
         }
+    }
+
+    fn with_attachment_workspace(mut self, workspace: Option<PathBuf>) -> Self {
+        self.attachment_workspace = workspace;
+        self
     }
 }
 
@@ -1108,6 +1117,32 @@ fn is_http_url(target: &str) -> bool {
     target.starts_with("http://") || target.starts_with("https://")
 }
 
+async fn scoped_attachment_path(target: &Path, workspace: &Path) -> anyhow::Result<PathBuf> {
+    let canonical_workspace = tokio::fs::canonicalize(workspace)
+        .await
+        .map_err(|_| anyhow::Error::msg("Telegram attachment workspace is unavailable"))?;
+    let workspace_metadata = tokio::fs::metadata(&canonical_workspace)
+        .await
+        .map_err(|_| anyhow::Error::msg("Telegram attachment workspace is unavailable"))?;
+    if !workspace_metadata.is_dir() {
+        anyhow::bail!("Telegram attachment workspace is unavailable");
+    }
+
+    let canonical_target = tokio::fs::canonicalize(target)
+        .await
+        .map_err(|_| anyhow::Error::msg("Telegram attachment is unavailable"))?;
+    if !canonical_target.starts_with(&canonical_workspace) {
+        anyhow::bail!("Telegram attachment is outside the authorized workspace");
+    }
+    let target_metadata = tokio::fs::metadata(&canonical_target)
+        .await
+        .map_err(|_| anyhow::Error::msg("Telegram attachment is unavailable"))?;
+    if !target_metadata.is_file() {
+        anyhow::bail!("Telegram attachment is unavailable");
+    }
+    Ok(canonical_target)
+}
+
 fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentKind> {
     let normalized = target
         .split('?')
@@ -1133,7 +1168,15 @@ fn infer_attachment_kind_from_target(target: &str) -> Option<TelegramAttachmentK
     }
 }
 
+#[cfg(test)]
 fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
+    parse_path_only_attachment_for_scope(message, None)
+}
+
+fn parse_path_only_attachment_for_scope(
+    message: &str,
+    attachment_workspace: Option<&Path>,
+) -> Option<TelegramAttachment> {
     let trimmed = message.trim();
     if trimmed.is_empty() || trimmed.contains('\n') {
         return None;
@@ -1147,7 +1190,7 @@ fn parse_path_only_attachment(message: &str) -> Option<TelegramAttachment> {
     let candidate = candidate.strip_prefix("file://").unwrap_or(candidate);
     let kind = infer_attachment_kind_from_target(candidate)?;
 
-    if !is_http_url(candidate) && !Path::new(candidate).exists() {
+    if !is_http_url(candidate) && attachment_workspace.is_none() && !Path::new(candidate).exists() {
         return None;
     }
 
@@ -3111,7 +3154,7 @@ impl TelegramChannel {
         &self,
         recipient: &str,
         draft_id: &str,
-    ) -> anyhow::Result<Option<PartialDraftFinish>> {
+    ) -> anyhow::Result<Option<(PartialDraftFinish, Option<PathBuf>)>> {
         let key = PartialDraftHandle::key(recipient, draft_id);
         let handle = self.partial_drafts.lock().remove(&key);
         let Some(handle) = handle else {
@@ -3130,7 +3173,7 @@ impl TelegramChannel {
         let finish = response.await.map_err(|_| {
             anyhow::Error::msg("Telegram partial draft worker did not acknowledge finalization")
         })?;
-        Ok(Some(finish))
+        Ok(Some((finish, handle.attachment_workspace)))
     }
 
     /// Sleep out the remainder of `multi_message_delay_ms` since the last
@@ -3341,7 +3384,7 @@ impl TelegramChannel {
         // Wait out any in-flight turn flush so the final send cannot interleave
         // with an intermediate one for the same draft.
         let _flush_guard = flush_lock.lock().await;
-        let (thread_id, mut last_sent_at, pending) = {
+        let (thread_id, mut last_sent_at, pending, attachment_workspace) = {
             let mut drafts = self.multi_message_drafts.lock();
             let Some(draft) = drafts.remove(&key) else {
                 if !suppress_voice {
@@ -3368,6 +3411,7 @@ impl TelegramChannel {
                 draft.thread_id.clone().or(parsed_thread),
                 draft.last_sent_at,
                 pending,
+                draft.attachment_workspace,
             )
         };
         self.last_draft_edit.lock().remove(&chat_id);
@@ -3464,8 +3508,13 @@ impl TelegramChannel {
         // routed) peer still gets its media, matching ordinary text delivery.
         if !voice_only {
             for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
+                self.send_attachment(
+                    &chat_id,
+                    thread_id.as_deref(),
+                    attachment,
+                    attachment_workspace.as_deref(),
+                )
+                .await?;
             }
         }
 
@@ -6891,6 +6940,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
         attachment: &TelegramAttachment,
+        attachment_workspace: Option<&Path>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -6950,31 +7000,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // Remap Docker container workspace path (/workspace/...) to the host
         // workspace directory so files written by the containerised runtime
         // can be found and sent by the host-side Telegram sender.
-        let remapped;
-        let target = if let Some(rel) = target.strip_prefix("/workspace/") {
-            if let Some(ws) = &self.workspace_dir {
-                remapped = ws.join(rel);
-                remapped.to_str().unwrap_or(target)
-            } else {
-                target
-            }
+        let remap_root = attachment_workspace.or(self.workspace_dir.as_deref());
+        let target_path = if let Some(rel) = target.strip_prefix("/workspace/") {
+            remap_root.map_or_else(|| PathBuf::from(target), |workspace| workspace.join(rel))
         } else {
-            target
+            PathBuf::from(target)
+        };
+        let path = if let Some(workspace) = attachment_workspace {
+            scoped_attachment_path(&target_path, workspace).await?
+        } else {
+            if !target_path.exists() {
+                anyhow::bail!("Telegram attachment path not found: {target}");
+            }
+            target_path
         };
 
-        let path = Path::new(target);
-        if !path.exists() {
-            anyhow::bail!("Telegram attachment path not found: {target}");
-        }
-
         match attachment.kind {
-            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Image => self.send_photo(chat_id, thread_id, &path, None).await,
             TelegramAttachmentKind::Document => {
-                self.send_document(chat_id, thread_id, path, None).await
+                self.send_document(chat_id, thread_id, &path, None).await
             }
-            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, path, None).await,
-            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, path, None).await,
+            TelegramAttachmentKind::Video => self.send_video(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Audio => self.send_audio(chat_id, thread_id, &path, None).await,
+            TelegramAttachmentKind::Voice => self.send_voice(chat_id, thread_id, &path, None).await,
         }
     }
 
@@ -8341,7 +8389,10 @@ impl Channel for TelegramChannel {
                 let (commands, receiver) = tokio::sync::mpsc::channel(8);
                 self.partial_drafts.lock().insert(
                     PartialDraftHandle::key(&message.recipient, &draft_id),
-                    PartialDraftHandle { commands },
+                    PartialDraftHandle {
+                        commands,
+                        attachment_workspace: message.attachment_workspace.clone(),
+                    },
                 );
                 let client = self.http_client();
                 let send_url = self.api_url("sendMessage");
@@ -8367,7 +8418,8 @@ impl Channel for TelegramChannel {
                 let (_, thread_id) = Self::parse_reply_target(&message.recipient);
                 self.multi_message_drafts.lock().insert(
                     Self::multi_draft_key(&message.recipient, &draft_id),
-                    MultiDraftState::new(thread_id),
+                    MultiDraftState::new(thread_id)
+                        .with_attachment_workspace(message.attachment_workspace.clone()),
                 );
                 Ok(Some(draft_id))
             }
@@ -8584,44 +8636,57 @@ impl Channel for TelegramChannel {
 
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
-        let (resolved_message_id, partial_already_delivered) = if Self::is_partial_synthetic_draft(
-            message_id,
-        ) {
-            let Some(finish) = self.finish_partial_draft(recipient, message_id).await? else {
-                return Ok(());
-            };
-            if finish.accepted_without_message_id {
-                let exact_short_text_match = finish.accepted_text.as_deref() == Some(text.as_str())
-                    && text.len() <= TELEGRAM_MAX_MESSAGE_LENGTH
-                    && parse_attachment_markers(text).1.is_empty()
-                    && parse_path_only_attachment(text).is_none()
-                    && (suppress_voice || self.tts_manager.is_none())
-                    && !self.destination_is_voice_peer(recipient);
-                if exact_short_text_match {
-                    (String::new(), true)
-                } else {
+        let (resolved_message_id, partial_already_delivered, attachment_workspace) =
+            if Self::is_partial_synthetic_draft(message_id) {
+                let Some((finish, attachment_workspace)) =
+                    self.finish_partial_draft(recipient, message_id).await?
+                else {
+                    return Ok(());
+                };
+                if finish.accepted_without_message_id {
+                    let exact_short_text_match = finish.accepted_text.as_deref()
+                        == Some(text.as_str())
+                        && text.len() <= TELEGRAM_MAX_MESSAGE_LENGTH
+                        && parse_attachment_markers(text).1.is_empty()
+                        && parse_path_only_attachment_for_scope(
+                            text,
+                            attachment_workspace.as_deref(),
+                        )
+                        .is_none()
+                        && (suppress_voice || self.tts_manager.is_none())
+                        && !self.destination_is_voice_peer(recipient);
+                    if exact_short_text_match {
+                        (String::new(), true, attachment_workspace)
+                    } else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "Telegram accepted a partial draft without returning its message ID; final delivery may duplicate the visible prefix"
+                        );
+                        (String::new(), false, attachment_workspace)
+                    }
+                } else if finish.delivery_unknown {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "Telegram accepted a partial draft without returning its message ID; final delivery may duplicate the visible prefix"
+                        "Telegram partial draft send outcome is unknown; final delivery may duplicate a visible prefix"
                     );
-                    (String::new(), false)
+                    (String::new(), false, attachment_workspace)
+                } else {
+                    (
+                        finish.message_id.unwrap_or_default(),
+                        false,
+                        attachment_workspace,
+                    )
                 }
-            } else if finish.delivery_unknown {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "Telegram partial draft send outcome is unknown; final delivery may duplicate a visible prefix"
-                );
-                (String::new(), false)
             } else {
-                (finish.message_id.unwrap_or_default(), false)
-            }
-        } else {
-            (message_id.to_string(), false)
-        };
+                (message_id.to_string(), false, None)
+            };
 
         // Queue TTS voice reply — immediate mode since text is already final.
         // Skipped when suppress_voice is set (explicit text-only routing override).
@@ -8698,8 +8763,13 @@ impl Channel for TelegramChannel {
 
             // Send attachments
             for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
+                self.send_attachment(
+                    &chat_id,
+                    thread_id.as_deref(),
+                    attachment,
+                    attachment_workspace.as_deref(),
+                )
+                .await?;
             }
 
             return Ok(());
@@ -8835,7 +8905,9 @@ impl Channel for TelegramChannel {
         }
 
         let resolved_message_id = if Self::is_partial_synthetic_draft(message_id) {
-            let Some(finish) = self.finish_partial_draft(recipient, message_id).await? else {
+            let Some((finish, _attachment_workspace)) =
+                self.finish_partial_draft(recipient, message_id).await?
+            else {
                 return Ok(());
             };
             if finish.accepted_without_message_id {
@@ -8925,15 +8997,28 @@ impl Channel for TelegramChannel {
             }
 
             for attachment in &attachments {
-                self.send_attachment(chat_id, thread_id, attachment).await?;
+                self.send_attachment(
+                    chat_id,
+                    thread_id,
+                    attachment,
+                    message.attachment_workspace.as_deref(),
+                )
+                .await?;
             }
 
             return Ok(());
         }
 
-        if let Some(attachment) = parse_path_only_attachment(&content) {
-            self.send_attachment(chat_id, thread_id, &attachment)
-                .await?;
+        if let Some(attachment) =
+            parse_path_only_attachment_for_scope(&content, message.attachment_workspace.as_deref())
+        {
+            self.send_attachment(
+                chat_id,
+                thread_id,
+                &attachment,
+                message.attachment_workspace.as_deref(),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -11017,7 +11102,10 @@ mod tests {
         drop(receiver);
         channel.partial_drafts.lock().insert(
             PartialDraftHandle::key(recipient, &draft_id),
-            PartialDraftHandle { commands },
+            PartialDraftHandle {
+                commands,
+                attachment_workspace: None,
+            },
         );
 
         let error = channel
@@ -25977,5 +26065,293 @@ mod tests {
         assert!(!ch.present_model_picker(&request).await.unwrap());
         assert!(mock_server.received_requests().await.unwrap().is_empty());
         assert!(ch.pending_model_pickers.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_media_uploads_are_limited_to_the_resolved_agent_workspace() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let channel_owner = tempfile::tempdir().unwrap();
+        let agent_workspace = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let owned_file = agent_workspace.path().join("owned.txt");
+        let sibling_secret = sibling.path().join("auth-profiles.json");
+        std::fs::write(&owned_file, b"owned media").unwrap();
+        std::fs::write(&sibling_secret, b"placeholder secret fixture").unwrap();
+
+        // This routed Telegram alias belongs to another workspace. The explicit
+        // transient scope represents the dynamically selected agent.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "shared",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(channel_owner.path().to_path_buf());
+
+        channel
+            .send(
+                &SendMessage::new(format!("[DOCUMENT:{}]", owned_file.display()), "1001")
+                    .with_attachment_workspace(agent_workspace.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "owned media is uploaded");
+        assert!(String::from_utf8_lossy(&requests[0].body).contains("owned media"));
+
+        for (marker, suffix) in [
+            ("IMAGE", "outside.png"),
+            ("DOCUMENT", "auth-profiles.json"),
+            ("VIDEO", "outside.mp4"),
+            ("AUDIO", "outside.wav"),
+            ("VOICE", "outside.ogg"),
+        ] {
+            let outside = sibling.path().join(suffix);
+            std::fs::write(&outside, b"blocked file").unwrap();
+            let result = channel
+                .send(
+                    &SendMessage::new(format!("[{marker}:{}]", outside.display()), "1001")
+                        .with_attachment_workspace(agent_workspace.path().to_path_buf()),
+                )
+                .await;
+            let error = result.expect_err("sibling files cannot be uploaded");
+            assert!(
+                !error
+                    .to_string()
+                    .contains(outside.to_string_lossy().as_ref()),
+                "scope failures must not echo foreign paths"
+            );
+        }
+
+        let path_only = channel
+            .send(
+                &SendMessage::new(sibling_secret.display().to_string(), "1001")
+                    .with_attachment_workspace(agent_workspace.path().to_path_buf()),
+            )
+            .await;
+        assert!(path_only.is_err(), "path-only attachment is also scoped");
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "rejected files never reach Telegram"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_media_upload_rejects_symlink_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let secret = sibling.path().join("secret.pdf");
+        std::fs::write(&secret, b"placeholder secret fixture").unwrap();
+        let link = workspace.path().join("escape.pdf");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let mock_server = wiremock::MockServer::start().await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "shared",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let result = channel
+            .send(
+                &SendMessage::new(format!("[DOCUMENT:{}]", link.display()), "1001")
+                    .with_attachment_workspace(workspace.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.is_err(), "canonical symlink target is outside scope");
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_media_draft_retains_scope_until_final_upload() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+        let workspace = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let owned_file = workspace.path().join("draft.pdf");
+        let foreign_file = sibling.path().join("private.pdf");
+        std::fs::write(&owned_file, b"draft owned media").unwrap();
+        std::fs::write(&foreign_file, b"placeholder private fixture").unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "shared",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_streaming(StreamMode::MultiMessage, 0);
+
+        let draft_id = channel
+            .send_draft(
+                &SendMessage::new("Working", "1001")
+                    .with_attachment_workspace(workspace.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        channel
+            .finalize_draft(
+                "1001",
+                &draft_id,
+                &format!("[DOCUMENT:{}]", owned_file.display()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+
+        let rejected_draft_id = channel
+            .send_draft(
+                &SendMessage::new("Working", "1001")
+                    .with_attachment_workspace(workspace.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let result = channel
+            .finalize_draft(
+                "1001",
+                &rejected_draft_id,
+                &format!("[DOCUMENT:{}]", foreign_file.display()),
+                true,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "draft finalization retains the agent scope"
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_draft_retains_scope_for_owned_images_and_rejects_foreign_documents() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendPhoto$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let owned_image = workspace.path().join("generated.png");
+        let private_document = sibling.path().join("auth-profiles.json");
+        std::fs::write(&owned_image, b"owned generated image fixture").unwrap();
+        std::fs::write(&private_document, b"placeholder secret fixture").unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "shared",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_streaming(StreamMode::Partial, 0);
+        let accepted_draft_text = "A useful assistant update accepted by Telegram.";
+
+        let owned_draft = channel
+            .send_draft(
+                &SendMessage::new("Working", "1001")
+                    .with_attachment_workspace(workspace.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        channel
+            .update_draft_progress("1001", &owned_draft, accepted_draft_text)
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(
+                "1001",
+                &owned_draft,
+                &format!("[IMAGE:{}]", owned_image.display()),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let foreign_draft = channel
+            .send_draft(
+                &SendMessage::new("Working", "1001")
+                    .with_attachment_workspace(workspace.path().to_path_buf()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        channel
+            .update_draft_progress("1001", &foreign_draft, accepted_draft_text)
+            .await
+            .unwrap();
+        let rejected = channel
+            .finalize_draft(
+                "1001",
+                &foreign_draft,
+                &format!("[DOCUMENT:{}]", private_document.display()),
+                true,
+            )
+            .await;
+        assert!(
+            rejected.is_err(),
+            "partial draft scope blocks sibling files"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/sendPhoto"))
+                .count(),
+            1,
+            "owned generated image is uploaded"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/sendDocument"))
+                .count(),
+            0,
+            "foreign local secret never reaches multipart upload"
+        );
     }
 }
