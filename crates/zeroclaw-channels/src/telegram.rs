@@ -7408,6 +7408,34 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        if msg.channel != self.name() || msg.channel_alias.as_deref() != Some(self.alias.as_str()) {
+            return false;
+        }
+
+        // Telegram private chat IDs are the positive user ID of the other
+        // participant. Group and channel chat IDs are negative; forum topic
+        // routes also carry a `:thread_id` suffix. Requiring the normalized
+        // chat and sender IDs to match proves a one-to-one conversation without
+        // trusting message text or maintaining a second copy of inbound state.
+        let parse_positive_id = |raw: &str| {
+            let id = raw.parse::<i64>().ok()?;
+            (id > 0 && id.to_string() == raw).then_some(id)
+        };
+        let Some(chat_id) = parse_positive_id(&msg.reply_target) else {
+            return false;
+        };
+        let Some(sender_id) = msg
+            .platform_sender_id
+            .as_deref()
+            .and_then(parse_positive_id)
+        else {
+            return false;
+        };
+
+        chat_id == sender_id
+    }
+
     fn self_handle(&self) -> Option<String> {
         self.bot_username.lock().clone()
     }

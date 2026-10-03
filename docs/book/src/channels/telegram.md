@@ -242,6 +242,10 @@ external_peers = ["111111111", "222222222"]
 - A positive key routes the private chat whose chat ID and sender ID both
   equal it. A negative key routes the group or supergroup with exactly that
   chat ID, whoever in it is speaking.
+- The runtime identifies a private one-to-one message from the normalized
+  positive chat ID matching the sender's numeric Telegram ID. Group chats,
+  forum-topic routes, and messages without that matching identity keep the
+  reply-intent check.
 - The peer allowlist still applies first. A chat without a route reaches no
   agent. There is no default or fallback agent.
 - The table is the alias's only agent binding. Do not also list
