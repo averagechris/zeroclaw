@@ -14,23 +14,11 @@ ignore = [
     # rustls-pemfile -- unmaintained, functionality moved to rustls-pki-types;
     # transitive dep, upstream migration tracked
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types" },
-    # proc-macro-error2 -- unmaintained derive/attribute macro helper; still in
-    # the resolved graph via matrix-sdk dev-deps (aquamarine) in zeroclaw-channels
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive macro helper via matrix-sdk dev-deps; tracking #8519" },
-    # bitmaps -- repository archived 2026-05-03, all versions affected, no safe
-    # upgrade available. Reached only transitively:
-    # matrix-sdk -> eyeball-im -> imbl -> bitmaps. Upstream tracking issue
-    # matrix-org/matrix-rust-sdk#6859 asks matrix-sdk to move off the imbl stack;
-    # drop this entry once a matrix-sdk release no longer pulls bitmaps.
-    { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained; transitive via matrix-sdk -> eyeball-im -> imbl; no safe upgrade; upstream matrix-org/matrix-rust-sdk#6859" },
-    # imbl-sized-chunks -- double free / use-after-free if an element's Drop
-    # panics during a Chunk or InlineArray removal. Fixed in 0.2.0, which this
-    # workspace cannot reach: it pins matrix-sdk 0.18, whose imbl 6.1.0
-    # requires ^0.1.3. Reached only via matrix-sdk -> imbl, the same stack as
-    # RUSTSEC-2026-0247 above; matrix-sdk 0.19+ clears both. Drop this entry
-    # once the resolved graph has imbl-sized-chunks 0.2 or later; #9899 tracks
-    # that bump.
-    { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks double free if an element's Drop panics; transitive via matrix-sdk -> imbl; the 0.2.0 fix is unreachable under the matrix-sdk 0.18 pin (imbl 6.1.0 requires ^0.1.3); remove once the resolved graph has imbl-sized-chunks >= 0.2; tracking #9899" },
+    # anymap2 -- informational unmaintained advisory with no patched version;
+    # Matrix SDK 0.19.1 still depends on it. RustSec recommends anymap3, but
+    # replacing Matrix SDK's internal type map requires an upstream release.
+    # Remove when matrix-sdk migrates; see https://github.com/rustsec/advisory-db/issues/3300#issuecomment-5939722190.
+    { id = "RUSTSEC-2026-0319", reason = "informational unmaintained anymap2; no patched version; required transitively by matrix-sdk 0.19.1; remove after upstream migration (https://github.com/rustsec/advisory-db/issues/3300#issuecomment-5939722190)" },
 ]
 
 [licenses]
@@ -80,6 +68,19 @@ version = "=1.9.0"
 name = "bitflags"
 version = "=1.3.2"
 
+# Matrix SDK 0.19 uses the newer crypto stack. These exact older versions
+# remain required by ZeroClaw's existing crypto dependencies; each pair has
+# incompatible major APIs and cannot be unified by this Matrix upgrade.
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.10.4"
+reason = "Matrix SDK 0.19 crypto stack requires block-buffer 0.12; workspace digest 0.10 users still require this incompatible 0.10 line"
+
+[[bans.skip]]
+name = "cipher"
+version = "=0.4.4"
+reason = "Matrix SDK 0.19 crypto stack requires cipher 0.5; workspace chacha20poly1305 0.10 still requires this incompatible 0.4 line"
+
 [[bans.skip]]
 name = "chacha20"
 version = "=0.9.1"
@@ -87,6 +88,11 @@ version = "=0.9.1"
 [[bans.skip]]
 name = "cpufeatures"
 version = "=0.2.17"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "=0.1.7"
+reason = "Matrix SDK 0.19 crypto stack requires crypto-common 0.2; workspace digest 0.10 users still require this incompatible 0.1 line"
 
 [[bans.skip]]
 name = "event-listener"
@@ -108,6 +114,11 @@ version = "=0.2.17"
 [[bans.skip]]
 name = "getrandom"
 version = "=0.3.4"
+
+[[bans.skip]]
+name = "inout"
+version = "=0.1.4"
+reason = "Matrix SDK 0.19 crypto stack requires inout 0.2; workspace cipher 0.4 users still require this incompatible 0.1 line"
 
 [[bans.skip]]
 name = "hashbrown"
