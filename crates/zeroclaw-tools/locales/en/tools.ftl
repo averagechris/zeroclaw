@@ -197,6 +197,15 @@ tool-web-search-tool = Search the web for information. Returns relevant search r
 tool-web-search-tool-error-duckduckgo-blocked = DuckDuckGo is rate-limiting this machine. Do not retry or rephrase the search; wait a few minutes, fetch known URLs directly with web_fetch, or configure SearXNG, Brave, or Tavily as the web_search provider.
 tool-web-search-tool-error-searxng-not-configured = SearXNG instance URL not configured. Set [web_search] searxng_instance_url in config.toml, or override it with the ZEROCLAW_web_search__searxng_instance_url environment variable.
 tool-web-search-tool-note-truncated-results = (further results omitted)
+tool-web-search-tool-kagi-description = Search with Kagi, optionally select a lens, or extract one public HTTPS page as Markdown. Search is the default action. Extraction rejects private, local, and metadata hosts.
+tool-web-search-tool-kagi-param-action = Use search (the default) to search Kagi, or extract to fetch one public HTTPS page as Markdown.
+tool-web-search-tool-kagi-param-query = Required for action=search. Be specific for better results.
+tool-web-search-tool-kagi-param-url = Required for action=extract. One publicly reachable HTTPS page URL; private, local, metadata, and user-information URLs are rejected.
+tool-web-search-tool-kagi-param-lens-id = Optional Kagi lens identifier or shareable lens URL for action=search. Omit it to use the Kagi account's normal search settings.
+tool-web-search-tool-error-kagi-invalid-arguments = Invalid Kagi tool arguments. Use action=search with a query and optional lens_id, or action=extract with one public HTTPS URL; DuckDuckGo fallback is available only for search.
+tool-web-search-tool-error-kagi-unsafe-extract-url = Kagi extraction accepts public HTTPS URLs without user information; private, local, and metadata hosts are blocked.
+tool-web-search-tool-error-kagi-extract-api-failure = Kagi extraction failed ({ $details }). Check API access, billing or usage limits, and page accessibility.
+tool-web-search-tool-error-kagi-extract-page-failure = Kagi returned no page content. Check that the requested page is publicly accessible over HTTPS.
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
