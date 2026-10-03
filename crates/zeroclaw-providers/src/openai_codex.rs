@@ -276,13 +276,15 @@ fn response_message_item(role: &str, content: Vec<Value>) -> Value {
 }
 
 fn legacy_tool_output_message(content: &str) -> Value {
-    response_message_item(
-        "user",
-        vec![serde_json::json!({
+    let output = format!("Legacy tool output without call_id:\n{content}");
+    let content = match multimodal_tool_output_content(&output) {
+        Some(content) => content,
+        None => vec![serde_json::json!({
             "type": "input_text",
-            "text": format!("Legacy tool output without call_id:\n{content}"),
+            "text": output,
         })],
-    )
+    };
+    response_message_item("user", content)
 }
 
 fn response_item_type(item: &Value) -> Option<&str> {
@@ -355,6 +357,35 @@ pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
         "name": name,
         "arguments": crate::compatible::sanitize_tool_arguments(&name, &call.arguments),
     })
+}
+
+/// Build a Responses API custom-tool output, preserving image markers as
+/// multimodal output blocks instead of embedding their base64 payloads in text.
+fn build_function_call_output(output: &str) -> Value {
+    multimodal_tool_output_content(output)
+        .map_or_else(|| Value::String(output.to_string()), Value::Array)
+}
+
+fn multimodal_tool_output_content(output: &str) -> Option<Vec<Value>> {
+    let (text, image_refs) = multimodal::parse_image_markers(output);
+    if image_refs.is_empty() {
+        return None;
+    }
+
+    let mut content = Vec::with_capacity(image_refs.len() + 1);
+    if !text.trim().is_empty() {
+        content.push(serde_json::json!({
+            "type": "input_text",
+            "text": text,
+        }));
+    }
+    for image_ref in image_refs {
+        content.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": image_ref,
+        }));
+    }
+    Some(content)
 }
 
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
@@ -467,7 +498,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": build_function_call_output(output),
                         }));
                     } else if !msg.content.trim().is_empty() {
                         input.push(legacy_tool_output_message(&msg.content));
@@ -2592,6 +2623,70 @@ data: [DONE]
         assert_eq!(input[0]["call_id"], "call_123");
         assert_eq!(input[0]["output"], "result");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn build_responses_input_keeps_tool_result_images_out_of_text_output() {
+        let image_data = "data:image/png;base64,c21hbGwtaW1hZ2UtZGF0YQ==";
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: serde_json::json!({
+                "tool_call_id": "call_image_123",
+                "content": format!(
+                    "Image generated successfully.\nFile: /workspace/images/generated.png\n[IMAGE:{image_data}]"
+                ),
+            })
+            .to_string(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_image_123");
+        let output = input[0]["output"]
+            .as_array()
+            .expect("image-bearing tool output should use multimodal blocks");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "input_text");
+        assert!(
+            output[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("generated.png")
+        );
+        assert!(!output[0]["text"].as_str().unwrap().contains("base64"));
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], image_data);
+    }
+
+    #[test]
+    fn build_responses_input_keeps_legacy_tool_images_out_of_text_output() {
+        let image_data = "data:image/png;base64,c21hbGwtaW1hZ2UtZGF0YQ==";
+        let messages = vec![ChatMessage::tool(format!(
+            "legacy result [IMAGE:{image_data}]"
+        ))];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"]
+            .as_array()
+            .expect("legacy output should use a multimodal message");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert!(
+            content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("legacy result")
+        );
+        assert!(!content[0]["text"].as_str().unwrap().contains("base64"));
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], image_data);
+        assert!(input[0].get("call_id").is_none());
     }
 
     #[test]
