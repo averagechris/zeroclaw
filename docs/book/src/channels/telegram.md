@@ -425,6 +425,7 @@ logging is enabled, events are also written under the install directory at
 | A routed alias ignores one chat | The chat has no exact route. The log says `dropping inbound message: no agent owns this channel`. Check the chat's numeric ID, and for a private chat that the sender's ID is the same number. |
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
 | Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
+| Partial streaming shows typing before a reply appears | Telegram waits for a useful answer chunk before creating the visible message. Short replies are sent when generation finishes. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |
 | Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). The shared session shares its controls: any member's `/new` resets the conversation for the whole group/topic, and a session-level `/model` override applies to every member, while `/stop` stays personal to each sender. Direct messages are unaffected. |
 
