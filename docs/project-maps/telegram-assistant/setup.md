@@ -272,6 +272,7 @@ Check in Telegram:
   that agent's configured transcription provider. Video requires `ffmpeg`
   and `ffprobe`; clips are limited to 20 MiB and 120 seconds, with at most
   four frames scaled within 640×640 pixels and 1 MiB of extracted audio.
+  Each ffprobe or ffmpeg process has a 12-second timeout.
   Videos inside photo albums contribute captions but are not downloaded.
   These paths follow the route and authorization checks above; unadmitted
   messages are not fetched.

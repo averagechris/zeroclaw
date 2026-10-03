@@ -260,6 +260,7 @@ external_peers = ["111111111", "222222222"]
   enabled to process them. Video handling requires `ffmpeg` and `ffprobe` on
   the service PATH. Clips are limited to 20 MiB and 120 seconds; vision gets
   at most four frames scaled within 640×640 pixels, and audio is capped at 1 MiB.
+  Each ffprobe or ffmpeg process has a 12-second timeout.
   Photo albums are supported; videos in albums contribute their captions but
   are not downloaded. Documents are not. Text-to-speech replies are
   not bound on a routed alias.
