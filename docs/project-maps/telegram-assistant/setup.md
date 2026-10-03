@@ -266,9 +266,11 @@ Check in Telegram:
 - `/model <hint>` in the group changes the group only; DMs keep their own
   model. The inline `/model` picker does not open on a routed alias; use the
   text form.
-- A photo or voice note gets no reply and is not downloaded. The log shows
-  `Dropping Telegram attachment: this alias is text-only` for photos and
-  documents.
+- The original text-only baseline dropped photos and voice notes before
+  download. After media support is enabled, admitted photos are saved under
+  the resolved agent's workspace for vision, and voice notes are sent to that
+  agent's configured transcription provider. This behavior still follows the
+  route and authorization checks above; unadmitted messages are not fetched.
 
 The full proof list is in [One-bot route and isolation
 proof](issues/18-one-bot-route-and-isolation-proof.md). Stage 3 must not

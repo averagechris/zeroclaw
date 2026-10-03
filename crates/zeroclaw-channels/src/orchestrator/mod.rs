@@ -8785,7 +8785,8 @@ async fn process_channel_message_body(
             &ctx.media_pipeline,
             transcription_manager.as_ref(),
             vision,
-        );
+        )
+        .with_workspace_dir(ctx.workspace_dir.as_path());
         msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
     }
 
@@ -43496,7 +43497,8 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_persists_image_payload_verbatim() {
+    async fn process_channel_message_persists_image_inside_agent_workspace() {
+        let agent_workspace = tempfile::tempdir().unwrap();
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -43545,7 +43547,7 @@ BTC is currently around $65,000 based on latest tool output."#
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
+            workspace_dir: Arc::new(agent_workspace.path().to_path_buf()),
             prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -43633,7 +43635,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .rev()
             .find(|(role, _)| role == "user")
             .expect("provider call should include current user message");
-        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        assert!(current_user.1.contains("[IMAGE:"));
         assert!(current_user.1.contains("please inspect this"));
         drop(calls);
 
@@ -43646,10 +43648,22 @@ BTC is currently around $65,000 based on latest tool output."#
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert!(turns[0].content.starts_with('['));
-        assert!(turns[0].content.contains("[Image: sticker.png attached"));
+        assert!(turns[0].content.contains("[Image saved for this agent:"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(turns[0].content.contains("[IMAGE:data:"));
-        assert!(turns[0].content.contains("AQIDBA"));
+        let image_path = turns[0]
+            .content
+            .split("[IMAGE:")
+            .nth(1)
+            .and_then(|suffix| suffix.split(']').next())
+            .expect("saved image path marker should be present");
+        let image_path = std::path::Path::new(image_path);
+        let agent_workspace_path = agent_workspace.path().canonicalize().unwrap();
+        assert!(
+            image_path.starts_with(&agent_workspace_path),
+            "image path {image_path:?} must stay in agent workspace {:?}",
+            agent_workspace_path
+        );
+        assert_eq!(std::fs::read(image_path).unwrap(), [1, 2, 3, 4]);
     }
 
     #[tokio::test]

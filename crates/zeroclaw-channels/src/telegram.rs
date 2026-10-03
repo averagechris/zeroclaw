@@ -1228,6 +1228,12 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+#[derive(Debug)]
+enum TelegramDownloadError {
+    TooLarge,
+    Failed(anyhow::Error),
+}
+
 /// Default minimum interval between Telegram draft edits.
 const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 
@@ -1256,9 +1262,9 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
-    /// When `true`, inbound photos, documents, albums, and voice are dropped
-    /// before any `getFile` call or write under `workspace_dir`. Set for
-    /// routed aliases, whose `workspace_dir` is shared by every routed agent.
+    /// When `true`, only photos and voice notes are admitted as bounded bytes;
+    /// documents stay unsupported and no upload is written under this alias's
+    /// workspace. The resolved agent owns persistent image storage later.
     text_only: bool,
     passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
@@ -3494,17 +3500,20 @@ impl TelegramChannel {
         self.with_transcription_manager(config, manager)
     }
 
-    /// Store an already-built transcription manager, or nothing. The config is
-    /// recorded only alongside a manager, so a channel never advertises
-    /// transcription it cannot perform.
+    /// Store an already-built transcription manager, if available. Keep the
+    /// enabled config independently so routed aliases can enforce the
+    /// canonical duration limit before fetching media; ordinary aliases still
+    /// require a manager before accepting voice updates.
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
         manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     ) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
-            self.transcription = Some(config);
         }
         self
     }
@@ -4802,10 +4811,10 @@ impl TelegramChannel {
     /// behavior — including the approval notice — is triggered.
     ///
     /// The live config gates are retained alongside the typed checks:
-    /// voice/audio only counts when the transcription config and manager
-    /// `try_parse_voice_message` requires are both present, and
-    /// document/photo only when the workspace dir
-    /// `try_parse_attachment_message` downloads into is set.
+    /// ordinary aliases require their channel transcription manager for voice
+    /// and an alias workspace for documents/photos; routed aliases accept only
+    /// photos and voice because those stay in memory until the owning agent is
+    /// resolved.
     ///
     /// This covers the config-shaped and shape-shaped bails; the
     /// content-shaped permanent bails — over-`max_duration_secs`
@@ -4824,7 +4833,9 @@ impl TelegramChannel {
             return true;
         }
         if self.text_only {
-            return false;
+            return Self::parse_attachment_metadata(message)
+                .is_some_and(|attachment| attachment.kind == IncomingAttachmentKind::Photo)
+                || Self::parse_voice_metadata(message).is_some();
         }
         if self.transcription.is_some()
             && self.transcription_manager.is_some()
@@ -5159,20 +5170,40 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Download a file from the Telegram CDN.
-    async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
+    async fn download_file(&self, file_path: &str) -> Result<Vec<u8>, TelegramDownloadError> {
         let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
             .send()
             .await
-            .context("Failed to download Telegram file")?;
+            .map_err(|error| TelegramDownloadError::Failed(error.without_url().into()))?;
 
         if !resp.status().is_success() {
-            anyhow::bail!("Telegram file download failed: {}", resp.status());
+            return Err(TelegramDownloadError::Failed(anyhow::Error::msg(format!(
+                "Telegram file download failed: {}",
+                resp.status()
+            ))));
+        }
+        if resp
+            .content_length()
+            .is_some_and(|length| length > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES)
+        {
+            return Err(TelegramDownloadError::TooLarge);
         }
 
-        Ok(resp.bytes().await?.to_vec())
+        use futures_util::StreamExt as _;
+        let mut stream = resp.bytes_stream();
+        let mut data = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| TelegramDownloadError::Failed(error.without_url().into()))?;
+            if data.len().saturating_add(chunk.len()) as u64 > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
+                return Err(TelegramDownloadError::TooLarge);
+            }
+            data.extend_from_slice(&chunk);
+        }
+        Ok(data)
     }
 
     /// Extract (file_id, duration) from a voice or audio message.
@@ -5244,7 +5275,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .then_some(sender_identity)
     }
 
-    /// Download and persist one attachment, returning only its prompt marker.
+    /// Download and materialize one attachment, returning its prompt marker.
     /// Authorization, mention gating, captions, replies, and forwarding are
     /// intentionally handled by the caller so an album applies them once.
     async fn materialize_attachment_content(
@@ -5254,7 +5285,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message_id: i64,
         disambiguate_document_name: bool,
     ) -> AttachmentMaterialization {
-        if self.text_only {
+        if self.text_only && attachment.kind != IncomingAttachmentKind::Photo {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5277,7 +5308,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return AttachmentMaterialization::SkipPermanent;
         }
 
-        // Ensure workspace directory is configured
+        // Routed aliases cannot safely write here: one Telegram listener serves
+        // several agents, and this workspace belongs to the alias, not the
+        // selected chat. Keep those image bytes in the typed message envelope;
+        // the resolved agent's media pipeline owns persistent materialization.
+        if self.text_only {
+            return self.download_routed_photo(attachment).await;
+        }
+
+        // Ensure workspace directory is configured for a single-owner alias.
         let Some(workspace) = self.workspace_dir.as_ref().or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -5327,7 +5366,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let file_data = match self.download_file(&tg_file_path).await {
             Ok(d) => d,
-            Err(e) => {
+            Err(TelegramDownloadError::TooLarge) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Skipping Telegram attachment that exceeds the download size limit"
+                );
+                return AttachmentMaterialization::SkipPermanent;
+            }
+            Err(TelegramDownloadError::Failed(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5391,6 +5438,80 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         AttachmentMaterialization::Ready {
             content,
             attachment: media_attachment,
+        }
+    }
+
+    /// Download a routed photo into memory only. The agent that owns the chat
+    /// has not been resolved yet, so durable storage belongs to the later
+    /// agent-scoped media pipeline.
+    async fn download_routed_photo(
+        &self,
+        attachment: &IncomingAttachment,
+    ) -> AttachmentMaterialization {
+        if attachment.kind != IncomingAttachmentKind::Photo {
+            return AttachmentMaterialization::SkipPermanent;
+        }
+        let file_path = match self.get_file_path(&attachment.file_id).await {
+            Ok(path) => path,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{error}")),
+                            "classification": format!("{:?}", error.kind),
+                        })),
+                    "Failed to get routed Telegram photo path"
+                );
+                return match error.kind {
+                    FileLookupFailure::Permanent => AttachmentMaterialization::SkipPermanent,
+                    FileLookupFailure::Transient => AttachmentMaterialization::RetryTransient,
+                };
+            }
+        };
+        let data = match self.download_file(&file_path).await {
+            Ok(data) => data,
+            Err(TelegramDownloadError::TooLarge) => {
+                return AttachmentMaterialization::SkipPermanent;
+            }
+            Err(TelegramDownloadError::Failed(error)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{error}")),
+                        })),
+                    "Failed to download routed Telegram photo"
+                );
+                return AttachmentMaterialization::RetryTransient;
+            }
+        };
+        if data.is_empty() {
+            return AttachmentMaterialization::SkipPermanent;
+        }
+
+        let ext = file_path
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+            .filter(|ext| matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
+            .unwrap_or_else(|| "jpg".to_string());
+        let mime_type = match ext.as_str() {
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "image/jpeg",
+        };
+        let display_name = format!("telegram_photo_{}.{ext}", uuid::Uuid::new_v4());
+        AttachmentMaterialization::Ready {
+            content: "[Photo attached]".to_string(),
+            attachment: zeroclaw_api::media::MediaAttachment {
+                file_name: display_name,
+                data,
+                mime_type: Some(mime_type.to_string()),
+                marker: None,
+            },
         }
     }
 
@@ -5499,6 +5620,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 attachment,
             } => (content, attachment),
             AttachmentMaterialization::SkipPermanent => {
+                if self.text_only && attachment.kind == IncomingAttachmentKind::Photo {
+                    let thread_id = Self::topic_thread_id(message);
+                    self.notify_routed_photo_drop(&chat_id, thread_id.as_deref())
+                        .await;
+                }
                 return UpdateDisposition::SkipPermanent;
             }
             AttachmentMaterialization::RetryTransient => {
@@ -5602,6 +5728,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let mut contents = Vec::with_capacity(ordered.len());
         let mut attachments = Vec::with_capacity(ordered.len());
+        let mut dropped_photo = false;
         for update in ordered {
             let Some(message) = update.get("message") else {
                 continue;
@@ -5623,11 +5750,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     contents.push(content);
                     attachments.push(attachment);
                 }
-                AttachmentMaterialization::SkipPermanent => {}
+                AttachmentMaterialization::SkipPermanent => {
+                    dropped_photo |=
+                        self.text_only && attachment.kind == IncomingAttachmentKind::Photo;
+                }
                 AttachmentMaterialization::RetryTransient => {
                     return UpdateDisposition::RetryTransient;
                 }
             }
+        }
+
+        if dropped_photo
+            && let Some(chat_id) = anchor_message
+                .get("chat")
+                .and_then(|chat| chat.get("id"))
+                .and_then(serde_json::Value::as_i64)
+                .map(|id| id.to_string())
+        {
+            let thread_id = Self::topic_thread_id(anchor_message);
+            self.notify_routed_photo_drop(&chat_id, thread_id.as_deref())
+                .await;
         }
 
         if contents.is_empty() {
@@ -5695,6 +5837,39 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
+    /// Tell an authorized sender when Telegram permanently rejects a routed
+    /// photo. Transient failures remain retries and do not send duplicate
+    /// notices.
+    async fn notify_routed_photo_drop(&self, chat_id: &str, thread_id: Option<&str>) {
+        let notice = i18n::get_required_cli_string("channel-telegram-photo-drop-failed");
+        let attempt = self.send_text_chunks(&notice, chat_id, thread_id, 0);
+        match tokio::time::timeout(self.voice_drop_notice_timeout, attempt).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": zeroclaw_runtime::security::scrub(&format!("{error}")),
+                        })),
+                    "Failed to notify sender about skipped Telegram photo"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "timeout_secs": self.voice_drop_notice_timeout.as_secs_f64(),
+                        })),
+                    "Timed out notifying sender about skipped Telegram photo"
+                );
+            }
+        }
+    }
+
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
     /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
@@ -5705,15 +5880,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// never received the recording. Transient failures stay silent — the same
     /// update is retried, and a notice per attempt would be spam.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> UpdateDisposition {
-        if self.text_only {
+        let config = self.transcription.as_ref();
+        let manager = self.transcription_manager.as_deref();
+        if !self.text_only && (config.is_none() || manager.is_none()) {
             return UpdateDisposition::SkipPermanent;
         }
-        let Some(config) = self.transcription.as_ref() else {
-            return UpdateDisposition::SkipPermanent;
-        };
-        let Some(manager) = self.transcription_manager.as_deref() else {
-            return UpdateDisposition::SkipPermanent;
-        };
         let Some(message) = update.get("message") else {
             return UpdateDisposition::SkipPermanent;
         };
@@ -5765,21 +5936,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        if duration > config.max_duration_secs {
+        if config.is_some_and(|config| duration > config.max_duration_secs) {
+            let limit_secs = config.map_or(0, |config| config.max_duration_secs);
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Skipping voice message: duration {duration}s exceeds limit {}s",
-                    config.max_duration_secs
+                    limit_secs
                 )
             );
             self.notify_voice_drop(
                 &chat_id,
                 thread_id.as_deref(),
-                VoiceDropReason::TooLong {
-                    limit_secs: config.max_duration_secs,
-                },
+                VoiceDropReason::TooLong { limit_secs },
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        if message
+            .get("voice")
+            .or_else(|| message.get("audio"))
+            .and_then(|media| media.get("file_size"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|size| size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES)
+        {
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::FileUnavailable,
             )
             .await;
             return UpdateDisposition::SkipPermanent;
@@ -5824,7 +6010,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let audio_data = match self.download_file(&file_path).await {
             Ok(d) => d,
-            Err(e) => {
+            Err(TelegramDownloadError::TooLarge) => {
+                self.notify_voice_drop(
+                    &chat_id,
+                    thread_id.as_deref(),
+                    VoiceDropReason::FileUnavailable,
+                )
+                .await;
+                return UpdateDisposition::SkipPermanent;
+            }
+            Err(TelegramDownloadError::Failed(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5836,6 +6031,98 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
+        if config
+            .and_then(|config| config.max_audio_bytes)
+            .is_some_and(|limit| audio_data.len() > limit)
+        {
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::FileUnavailable,
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        if self.text_only {
+            let extension = std::path::Path::new(&file_name)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .filter(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "ogg"
+                            | "oga"
+                            | "opus"
+                            | "mp3"
+                            | "mpeg"
+                            | "mpga"
+                            | "wav"
+                            | "flac"
+                            | "m4a"
+                            | "mp4"
+                            | "webm"
+                    )
+                })
+                .unwrap_or("ogg");
+            let mime_type = message
+                .get("voice")
+                .or_else(|| message.get("audio"))
+                .and_then(|media| media.get("mime_type"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("audio/ogg".to_string()));
+            let attachment = zeroclaw_api::media::MediaAttachment {
+                file_name: format!("telegram_voice.{}", extension.to_ascii_lowercase()),
+                data: audio_data,
+                mime_type,
+                marker: None,
+            };
+
+            if let Ok(mut voice_chats) = self.voice_chats.lock() {
+                voice_chats.insert(reply_target.clone());
+            }
+
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .filter(|caption| !caption.trim().is_empty());
+            let mut content = caption.map_or_else(
+                || "[Voice message]".to_string(),
+                |caption| format!("[Voice message]\n\n{caption}"),
+            );
+            if let Some(quote) = self.extract_reply_context(message) {
+                content = format!("{quote}\n\n{content}");
+            }
+            if let Some(attr) = Self::format_forward_attribution(message) {
+                content = Self::prepend_forward_attribution(&attr, content);
+            }
+
+            return UpdateDisposition::Parsed(Box::new(ChannelMessage {
+                id: format!("telegram_{chat_id}_{message_id}"),
+                sender: sender_identity,
+                platform_sender_id: sender_id,
+                reply_target,
+                content,
+                channel: "telegram".into(),
+                channel_alias: Some(self.alias.clone()),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                thread_ts: thread_id,
+                interruption_scope_id: None,
+                attachments: vec![attachment],
+                subject: None,
+                conversation_scope: self.conversation_scope_for(message),
+                voice_origin: true,
+                ..Default::default()
+            }));
+        }
+
+        let Some(manager) = manager else {
+            return UpdateDisposition::SkipPermanent;
+        };
         let text = match manager.transcribe(&audio_data, &file_name).await {
             Ok(t) => t,
             Err(e) => {
@@ -25386,12 +25673,11 @@ mod tests {
         ]
     }
 
-    /// A routed alias is text-only: an authorized photo, document, voice note,
-    /// or album is dropped before `getFile`, and nothing is written under the
-    /// shared channel workspace. The same photo on an ordinary alias does call
-    /// `getFile`, so the mock would have seen the request.
+    /// Routed photos and voice notes are downloaded only after authorization,
+    /// then dispatched as typed bytes without writing into the shared alias
+    /// workspace. Documents and unknown senders never trigger `getFile`.
     #[tokio::test]
-    async fn text_only_alias_drops_media_before_get_file_or_workspace_write() {
+    async fn routed_photo_and_voice_are_typed_bytes_after_admission() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -25416,14 +25702,6 @@ mod tests {
             )
             .mount(&mock_server)
             .await;
-        let transcription = zeroclaw_config::schema::TranscriptionConfig {
-            enabled: true,
-            api_key: Some("test_key".to_string()),
-            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
-            max_duration_secs: 120,
-            ..Default::default()
-        };
-
         let workspace = tempfile::tempdir().unwrap();
         let routed = TelegramChannel::new(
             "fake-token".into(),
@@ -25432,13 +25710,12 @@ mod tests {
             false,
         )
         .with_mock_api_base(mock_server.uri())
-        .with_transcription(transcription)
         .with_workspace_dir(workspace.path().to_path_buf())
         .with_text_only(true);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
         let mut transient_retry = None;
-        for update in routed_media_updates() {
+        for update in routed_media_updates().into_iter().take(3) {
             let outcome = routed
                 .process_update(&update, &tx, &mut transient_retry)
                 .await;
@@ -25454,18 +25731,52 @@ mod tests {
                 }})
             })
             .collect();
-        assert!(matches!(
-            routed
-                .try_parse_media_group_with_unsupported(&album, &[])
-                .await,
-            UpdateDisposition::SkipPermanent
-        ));
+        let album_message = routed
+            .try_parse_media_group_with_unsupported(&album, &[])
+            .await
+            .expect_parsed("photo album is dispatched as typed media");
+        assert_eq!(album_message.attachments.len(), 2);
+        assert!(
+            album_message
+                .attachments
+                .iter()
+                .all(|item| item.marker.is_none())
+        );
 
-        assert!(rx.try_recv().is_err(), "no media message may be dispatched");
+        let photo = rx.try_recv().expect("authorized photo is dispatched");
+        assert_eq!(photo.attachments.len(), 1);
+        assert_eq!(photo.attachments[0].data, tiny_jpeg());
+        assert!(photo.attachments[0].marker.is_none());
+        assert!(photo.content.contains("what is this?"));
+        let voice = rx.try_recv().expect("authorized voice is dispatched");
+        assert_eq!(voice.attachments.len(), 1);
+        assert!(voice.voice_origin);
+        assert_eq!(voice.attachments[0].data, tiny_jpeg());
+        assert!(voice.content.contains("[Voice message]"));
+        assert!(rx.try_recv().is_err(), "documents are not dispatched");
+
+        let unknown_sender = serde_json::json!({ "update_id": 21, "message": {
+            "message_id": 21,
+            "chat": { "id": 9001, "type": "private" },
+            "from": { "id": 9001, "username": "unknown" },
+            "photo": [ { "file_id": "private_photo", "file_size": 20 } ]
+        }});
+        routed
+            .process_update(&unknown_sender, &tx, &mut transient_retry)
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown sender media is not dispatched"
+        );
+
         let requests = mock_server.received_requests().await.unwrap();
         assert!(
-            requests.is_empty(),
-            "text-only alias must not call getFile, download, or transcribe: {:?}",
+            requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/getFile"))
+                .count()
+                == 4,
+            "only admitted photo, voice, and photo album should call getFile: {:?}",
             requests
                 .iter()
                 .map(|r| r.url.path().to_string())
@@ -25474,7 +25785,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(workspace.path()).unwrap().count(),
             0,
-            "text-only alias must not write into the channel workspace"
+            "routed media bytes must not be written into the shared channel workspace"
         );
 
         // Text on the same alias still flows.
@@ -25491,37 +25802,138 @@ mod tests {
         assert_eq!(delivered.content, "hello");
         assert_eq!(delivered.reply_target, "1001");
         assert_eq!(delivered.platform_sender_id.as_deref(), Some("1001"));
+    }
 
-        // Control: an ordinary alias downloads the same photo.
-        let ordinary = TelegramChannel::new(
+    #[tokio::test]
+    async fn routed_voice_limit_applies_without_an_alias_transcription_manager() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/too-long.ogg" }
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 8 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let routed = TelegramChannel::new(
             "fake-token".into(),
-            "other",
+            "home",
+            Arc::new(|| vec!["1001".into()]),
+            false,
+        )
+        .with_transcription_manager(config, None)
+        .with_mock_api_base(mock_server.uri())
+        .with_text_only(true);
+        assert!(routed.transcription.is_some());
+        assert!(routed.transcription_manager.is_none());
+
+        let update = serde_json::json!({ "update_id": 1, "message": {
+            "message_id": 2,
+            "voice": { "file_id": "voice_file", "duration": 121, "file_size": 100 },
+            "from": { "id": 1001, "username": "owner" },
+            "chat": { "id": 1001, "type": "private" }
+        }});
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        let mut transient_retry = None;
+        let outcome = routed
+            .process_update(&update, &tx, &mut transient_retry)
+            .await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert!(rx.try_recv().is_err(), "over-limit voice is not dispatched");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "only the explanatory notice is sent");
+        assert!(requests[0].url.path().ends_with("/sendMessage"));
+    }
+
+    #[tokio::test]
+    async fn routed_photo_permanent_download_failure_notifies_sender() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/too-large.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/.*$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-length",
+                        (TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1).to_string(),
+                    )
+                    .set_body_bytes(Vec::<u8>::new()),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 10 } }),
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "home",
             Arc::new(|| vec!["1001".into()]),
             false,
         )
         .with_mock_api_base(mock_server.uri())
-        .with_workspace_dir(workspace.path().to_path_buf());
-        ordinary
+        .with_text_only(true);
+
+        let disposition = channel
             .try_parse_attachment_message(&routed_media_updates()[0])
-            .await
-            .expect_parsed("ordinary alias materializes the photo");
+            .await;
+        assert!(matches!(disposition, UpdateDisposition::SkipPermanent));
         let requests = mock_server.received_requests().await.unwrap();
-        assert!(
-            requests
-                .iter()
-                .any(|request| request.url.path().ends_with("/getFile")),
-            "control must observe getFile"
-        );
+        let notice = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("/sendMessage"))
+            .expect("authorized sender receives a concise failure notice");
+        let body: serde_json::Value = notice.body_json().unwrap();
+        let expected = i18n::get_required_cli_string("channel-telegram-photo-drop-failed")
+            .replace('\'', "&#39;");
+        assert_eq!(body["text"].as_str(), Some(expected.as_str()));
     }
 
     #[test]
-    fn text_only_alias_does_not_treat_media_as_processable() {
+    fn routed_alias_admission_recognizes_photo_and_voice_but_not_documents() {
         let ch = TelegramChannel::new("t".into(), "home", Arc::new(|| vec!["1001".into()]), false)
             .with_workspace_dir(std::env::temp_dir());
-        let photo = &routed_media_updates()[0]["message"];
-        assert!(ch.message_has_processable_content(photo));
         let ch = ch.with_text_only(true);
-        assert!(!ch.message_has_processable_content(photo));
+        let updates = routed_media_updates();
+        assert!(ch.message_has_processable_content(&updates[0]["message"]));
+        assert!(!ch.message_has_processable_content(&updates[1]["message"]));
+        assert!(ch.message_has_processable_content(&updates[2]["message"]));
     }
 
     /// A routed alias has no single owning agent, so the model picker (which

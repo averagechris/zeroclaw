@@ -16,6 +16,7 @@ pub struct MediaPipeline<'a> {
     config: &'a MediaPipelineConfig,
     transcription_manager: Option<&'a TranscriptionManager>,
     vision_available: bool,
+    workspace_dir: Option<&'a std::path::Path>,
 }
 
 impl<'a> MediaPipeline<'a> {
@@ -32,7 +33,16 @@ impl<'a> MediaPipeline<'a> {
             config,
             transcription_manager,
             vision_available,
+            workspace_dir: None,
         }
+    }
+
+    /// Store unmarked image uploads under the workspace selected for the
+    /// already-resolved agent. The returned path can be reused by later tools
+    /// in that agent without granting another routed chat access to it.
+    pub fn with_workspace_dir(mut self, workspace_dir: &'a std::path::Path) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
     }
 
     /// Process a message's attachments and return enriched text.
@@ -94,7 +104,7 @@ impl<'a> MediaPipeline<'a> {
                     annotations.push(annotation);
                 }
                 MediaKind::Image if self.config.describe_images => {
-                    let annotation = self.process_image(attachment);
+                    let annotation = self.process_image(attachment).await;
                     annotations.push(annotation);
                 }
                 MediaKind::Video if self.config.summarize_video => {
@@ -129,7 +139,7 @@ impl<'a> MediaPipeline<'a> {
     /// Transcribe an audio attachment using the existing transcription infra.
     async fn process_audio(&self, attachment: &MediaAttachment) -> String {
         let Some(manager) = self.transcription_manager else {
-            return "[Audio: attached]".to_string();
+            return "[Audio transcription unavailable. Do not guess the recording's contents; tell the user transcription is unavailable and ask them to resend it as text.]".to_string();
         };
 
         match manager
@@ -146,12 +156,22 @@ impl<'a> MediaPipeline<'a> {
             }
             Err(err) => {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"file": attachment.file_name, "error": format!("{}", err)})), "Media pipeline: audio transcription failed");
-                "[Audio: transcription failed]".to_string()
+                "[Audio transcription failed. Do not guess the recording's contents; tell the user and ask them to resend it as text.]".to_string()
             }
         }
     }
 
-    fn process_image(&self, attachment: &MediaAttachment) -> String {
+    async fn process_image(&self, attachment: &MediaAttachment) -> String {
+        if let Some(workspace_dir) = self.workspace_dir
+            && let Ok(path) = persist_image_attachment(workspace_dir, attachment).await
+        {
+            let path = path.display();
+            if self.vision_available && attachment.provider_loadable_image_mime().is_some() {
+                return format!("[Image saved for this agent: {path}]\n[IMAGE:{path}]");
+            }
+            return format!("[Image saved for this agent: {path}]");
+        }
+
         if self.vision_available {
             let (mime, data) = image_payload_for_vision(attachment);
             let b64 = STANDARD.encode(data.as_ref());
@@ -170,6 +190,49 @@ impl<'a> MediaPipeline<'a> {
     fn process_video(&self, attachment: &MediaAttachment) -> String {
         format!("[Video: {} attached]", attachment.file_name)
     }
+}
+
+/// Persist image bytes under the resolved agent's private workspace. The
+/// filename is generated locally, writes never overwrite an existing entry,
+/// and the canonical storage directory must remain inside the workspace.
+async fn persist_image_attachment(
+    workspace_dir: &std::path::Path,
+    attachment: &MediaAttachment,
+) -> anyhow::Result<std::path::PathBuf> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let workspace_root = tokio::fs::canonicalize(workspace_dir).await?;
+    let media_dir = workspace_dir.join("telegram_files");
+    tokio::fs::create_dir_all(&media_dir).await?;
+    let media_root = tokio::fs::canonicalize(&media_dir).await?;
+    anyhow::ensure!(
+        media_root.starts_with(&workspace_root),
+        "agent media directory escapes its workspace"
+    );
+
+    let extension = attachment
+        .file_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
+        .unwrap_or_else(|| "img".to_string());
+    let path = media_root.join(format!("telegram_{}.{}", uuid::Uuid::new_v4(), extension));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await?;
+    if let Err(error) = file.write_all(&attachment.data).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error.into());
+    }
+    if let Err(error) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error.into());
+    }
+    Ok(path)
 }
 
 fn remove_last_channel_image_marker(text: &str, target: &str) -> String {
@@ -362,6 +425,44 @@ mod tests {
             "expected image data marker, got: {result}"
         );
         assert!(result.contains("check this"));
+    }
+
+    #[tokio::test]
+    async fn routed_images_are_persisted_inside_each_resolved_agent_workspace() {
+        let config = default_pipeline_config(true);
+        let owner = tempfile::tempdir().unwrap();
+        let friend = tempfile::tempdir().unwrap();
+        let attachment = sample_image();
+
+        let owner_pipeline =
+            MediaPipeline::new(&config, None, true).with_workspace_dir(owner.path());
+        let owner_prompt = owner_pipeline
+            .process("what is this?", std::slice::from_ref(&attachment))
+            .await;
+        let owner_path = image_marker_path(&owner_prompt);
+        assert!(owner_path.starts_with(owner.path().canonicalize().unwrap()));
+        assert_eq!(std::fs::read(&owner_path).unwrap(), attachment.data);
+        assert!(owner_prompt.contains("[Image saved for this agent:"));
+
+        let friend_pipeline =
+            MediaPipeline::new(&config, None, true).with_workspace_dir(friend.path());
+        let friend_prompt = friend_pipeline
+            .process("what is this?", std::slice::from_ref(&attachment))
+            .await;
+        let friend_path = image_marker_path(&friend_prompt);
+        assert!(friend_path.starts_with(friend.path().canonicalize().unwrap()));
+        assert_ne!(owner_path, friend_path);
+        assert_eq!(std::fs::read(&friend_path).unwrap(), attachment.data);
+        assert!(!friend_prompt.contains(owner_path.to_str().unwrap()));
+    }
+
+    fn image_marker_path(prompt: &str) -> std::path::PathBuf {
+        let path = prompt
+            .split("[IMAGE:")
+            .nth(1)
+            .and_then(|suffix| suffix.split(']').next())
+            .expect("loadable routed image has an IMAGE marker");
+        std::path::PathBuf::from(path)
     }
 
     #[tokio::test]
@@ -691,7 +792,8 @@ mod tests {
         let pipeline = MediaPipeline::new(&config, None, false);
 
         let result = pipeline.process("", &[sample_audio()]).await;
-        assert_eq!(result, "[Audio: attached]");
+        assert!(result.contains("Audio transcription unavailable"));
+        assert!(result.contains("Do not guess the recording's contents"));
     }
 
     #[tokio::test]
@@ -703,7 +805,7 @@ mod tests {
         let result = pipeline.process("context", &attachments).await;
 
         assert!(
-            result.contains("[Audio: attached]"),
+            result.contains("[Audio transcription unavailable."),
             "missing audio annotation"
         );
         assert!(
