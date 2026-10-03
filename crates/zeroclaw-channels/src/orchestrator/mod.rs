@@ -9729,6 +9729,7 @@ async fn process_channel_message_body(
                 history: &mut history,
                 history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
                 injected_memory_preamble: &mut channel_injected_memory_preamble,
+                workspace_dir: Some(ctx.workspace_dir.as_path()),
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),

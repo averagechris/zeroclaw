@@ -62,6 +62,7 @@ pub(crate) async fn finish_after_max_iterations(
     crumb_present: &mut bool,
     token_counter: super::DispatchTokenCounter,
     observer: &dyn crate::observability::Observer,
+    workspace: Option<&std::path::Path>,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -137,6 +138,7 @@ pub(crate) async fn finish_after_max_iterations(
             multimodal_config,
             degrade_strip_images,
             None,
+            workspace,
         )
         .await?
         .messages;
@@ -471,6 +473,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
     }
@@ -749,6 +752,7 @@ mod graceful_summary_metering_tests {
             &mut crumb_present,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect_err("summary prompt must be included in the floor decision");
@@ -828,6 +832,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -899,6 +904,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -974,6 +980,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1057,6 +1064,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1137,6 +1145,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             super::super::DispatchTokenCounter::default(),
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");

@@ -177,6 +177,7 @@ pub async fn maybe_run_skill_review(
                 // so no crumb exists and none can outlive this scoped loop.
                 history_has_trim_breadcrumb: &mut fork_crumb_present,
                 injected_memory_preamble: &mut None,
+                workspace_dir: None,
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,

@@ -259,6 +259,10 @@ pub struct ToolLoop<'a> {
     /// same recorded-not-inferred principle as
     /// `history_has_trim_breadcrumb`.
     pub injected_memory_preamble: &'a mut Option<String>,
+    /// File-access root for this turn. The Agent/session/channel transport
+    /// owns this boundary; `None` preserves the configured agent-workspace
+    /// fallback for legacy and isolated callers.
+    pub workspace_dir: Option<&'a std::path::Path>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -320,12 +324,14 @@ async fn projected_provider_facing_tokens(
     image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
     tool_schema_tokens: usize,
     ratio: f64,
+    workspace: Option<&std::path::Path>,
 ) -> usize {
     let prepared = match prepare_messages_for_iteration(
         history,
         multimodal_config,
         degrade_strip_images,
         image_cache,
+        workspace,
     )
     .await
     {
@@ -523,6 +529,7 @@ async fn enforce_reported_budget(
     // as synthetic for the whole runtime lifetime. Set to true when this pass
     // inserts a fresh crumb so the owner stays authoritative.
     crumb_present: &mut bool,
+    workspace: Option<&std::path::Path>,
 ) {
     if context_token_budget == 0 {
         return;
@@ -561,6 +568,7 @@ async fn enforce_reported_budget(
         image_cache.as_deref_mut(),
         tool_schema_tokens,
         ratio,
+        workspace,
     )
     .await;
     let mut result = crate::agent::history_trim::trim_to_reported_budget_with_crumb(
@@ -620,6 +628,7 @@ async fn enforce_reported_budget(
             image_cache.as_deref_mut(),
             tool_schema_tokens,
             ratio,
+            workspace,
         )
         .await;
         if tokens_after <= decision_budget {
@@ -649,6 +658,7 @@ async fn enforce_reported_budget(
                 image_cache.as_deref_mut(),
                 tool_schema_tokens,
                 ratio,
+                workspace,
             )
             .await;
             if tokens_after <= decision_budget {
@@ -740,6 +750,7 @@ async fn enforce_reported_budget(
             image_cache,
             tool_schema_tokens,
             ratio,
+            workspace,
         )
         .await;
         // `tokens_before` is the projected provider-facing population of the
@@ -999,6 +1010,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         history: raw_history,
         history_has_trim_breadcrumb,
         injected_memory_preamble,
+        workspace_dir,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -1056,6 +1068,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
+    let configured_image_workspace = config
+        .zip(agent_alias)
+        .map(|(config, alias)| config.agent_workspace_dir(alias));
+    let image_workspace = workspace_dir.or(configured_image_workspace.as_deref());
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
@@ -1321,6 +1337,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
+            image_workspace,
         )
         .await?;
         let mut provider_request_messages = prepared_messages.messages;
@@ -1346,6 +1363,23 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     anyhow::bail!("LLM call cancelled by hook: {reason}");
                 }
             }
+        }
+        if let Some(workspace) = image_workspace
+            && (provider_request_messages.len() != pre_hook_messages.len()
+                || provider_request_messages
+                    .iter()
+                    .zip(&pre_hook_messages)
+                    .any(|(a, b)| a.role != b.role || a.content != b.content))
+        {
+            provider_request_messages = prepare_messages_for_iteration(
+                &provider_request_messages,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+                Some(workspace),
+            )
+            .await?
+            .messages;
         }
         // Capture hook-added suffix (messages appended after the original
         // prepared messages, with that original population otherwise intact
@@ -2179,6 +2213,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     use_native_tools,
                     0,
                     &mut turn_state.crumb_present,
+                    image_workspace,
                 ))
                 .await;
             }
@@ -2495,6 +2530,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 event_tx.clone(),
                 turn_state.canonical.as_deref_mut(),
                 image_cache.as_deref_mut(),
+                image_workspace,
                 agent_alias,
                 parent_agent_alias,
                 sop_reassembly,
@@ -2540,6 +2576,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         &mut turn_state.crumb_present,
         DispatchTokenCounter::for_route(pending_reported_usage, provider_name, model),
         observer,
+        image_workspace,
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2975,6 +3012,7 @@ async fn drive_live_sop_actions(
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
+    workspace_dir: Option<&std::path::Path>,
     agent_alias: Option<&str>,
     parent_agent_alias: Option<&str>,
     sop_reassembly: Option<SopStepReassembly<'_>>,
@@ -3297,6 +3335,15 @@ async fn drive_live_sop_actions(
                                     history: nested_history,
                                     history_has_trim_breadcrumb: &mut nested_crumb_present,
                                     injected_memory_preamble: &mut None,
+                                    // Same-agent steps retain the current
+                                    // transport/session boundary. A delegated
+                                    // agent resolves its own canonical
+                                    // workspace through the config fallback.
+                                    workspace_dir: if owned.is_some() {
+                                        None
+                                    } else {
+                                        workspace_dir
+                                    },
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -3673,6 +3720,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
         assert!(
@@ -3709,6 +3757,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3738,6 +3787,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -3766,6 +3816,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3793,6 +3844,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -3856,6 +3908,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -3920,7 +3973,7 @@ mod reported_budget_tests {
         // The measured population is the PREPARED one, exactly as the runtime
         // measures it (`reported_population_estimated` from `prepared_messages`).
         let prepared =
-            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache))
+            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache), None)
                 .await
                 .expect("preparation must succeed for the regression");
         let prepared_estimated = crate::agent::history::estimate_history_tokens(&prepared.messages);
@@ -3948,6 +4001,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -3972,7 +4026,7 @@ mod reported_budget_tests {
         // (breadcrumb included) — the exact next provider request — not the raw
         // retained marker estimate.
         let retained_prepared =
-            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache))
+            prepare_messages_for_iteration(&history, &config, false, Some(&mut image_cache), None)
                 .await
                 .expect("preparation of the retained history must succeed");
         let ratio = reported as f64 / prepared_estimated.max(1) as f64;
@@ -4035,6 +4089,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -4109,6 +4164,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -4177,6 +4233,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut crumb_present,
+            None,
         )
         .await;
         assert!(
@@ -4259,6 +4316,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -4376,6 +4434,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut crumb_present,
+            None,
         )
         .await;
 
@@ -4484,6 +4543,7 @@ mod reported_budget_tests {
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
             None,
+            None,
         )
         .await
         .expect("preparation must succeed for the regression");
@@ -4523,6 +4583,7 @@ mod reported_budget_tests {
             false,
             hook_reserve_tokens,
             &mut false,
+            None,
         )
         .await;
 
@@ -4558,6 +4619,7 @@ mod reported_budget_tests {
             &history,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
+            None,
             None,
         )
         .await
@@ -4612,6 +4674,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            None,
         )
         .await;
 
@@ -4647,6 +4710,7 @@ mod reported_budget_tests {
             &taken_snapshot,
             &zeroclaw_config::schema::MultimodalConfig::default(),
             false,
+            None,
             None,
         )
         .await
@@ -5251,6 +5315,7 @@ vision_model_provider = "custom.vision"
             history: &mut history,
             history_has_trim_breadcrumb: &mut false,
             injected_memory_preamble: &mut None,
+            workspace_dir: None,
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
@@ -5996,6 +6061,7 @@ mod sop_step_reassembly_tests {
             None,
             None,
             new_messages_out,
+            None,
             None,
             agent_alias,
             None,
@@ -7118,6 +7184,7 @@ mod tool_lifecycle_abandonment_tests {
             history,
             history_has_trim_breadcrumb: &mut crumb_present,
             injected_memory_preamble: &mut injected_preamble,
+            workspace_dir: None,
             channel_name: "cli",
             channel_reply_target: None,
             cancellation_token,

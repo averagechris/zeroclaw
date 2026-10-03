@@ -139,6 +139,7 @@ pub(crate) async fn prepare_messages_for_iteration(
     multimodal_config: &MultimodalConfig,
     degrade_strip_images: bool,
     image_cache: Option<&mut multimodal::LocalImageCache>,
+    workspace: Option<&std::path::Path>,
 ) -> Result<multimodal::PreparedMessages> {
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
@@ -170,6 +171,15 @@ pub(crate) async fn prepare_messages_for_iteration(
                 content: multimodal::strip_media_markers_model_visible(m),
             })
             .collect();
+        if let Some(workspace) = workspace {
+            return multimodal::prepare_messages_for_provider_scoped(
+                &stripped,
+                multimodal_config,
+                workspace,
+                image_cache,
+            )
+            .await;
+        }
         match image_cache {
             Some(cache) => {
                 multimodal::prepare_messages_for_provider_cached(
@@ -182,6 +192,15 @@ pub(crate) async fn prepare_messages_for_iteration(
             None => multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await,
         }
     } else {
+        if let Some(workspace) = workspace {
+            return multimodal::prepare_messages_for_provider_scoped(
+                history,
+                multimodal_config,
+                workspace,
+                image_cache,
+            )
+            .await;
+        }
         match image_cache {
             Some(cache) => {
                 multimodal::prepare_messages_for_provider_cached(history, multimodal_config, cache)
@@ -209,7 +228,7 @@ mod tests {
         let cfg = MultimodalConfig::default();
 
         let mut cache = multimodal::LocalImageCache::new();
-        let first = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
+        let first = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache), None)
             .await
             .unwrap();
         assert!(first.contains_images);
@@ -217,16 +236,86 @@ mod tests {
 
         // A later iteration/turn re-walks the same history; the cache serves it
         // without growing (no second disk read + encode).
-        let _second = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
+        let _second = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache), None)
             .await
             .unwrap();
         assert_eq!(cache.len(), 1, "subsequent preps reuse the cached entry");
 
         // The cache-less path (channels/CLI pass None) still resolves images.
-        let uncached = prepare_messages_for_iteration(&history, &cfg, false, None)
+        let uncached = prepare_messages_for_iteration(&history, &cfg, false, None, None)
             .await
             .unwrap();
         assert!(uncached.contains_images);
+    }
+
+    #[tokio::test]
+    async fn scoped_iteration_preparation_caches_owned_images_and_rejects_cached_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("agent");
+        let sibling = temp.path().join("sibling");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let owned_image = workspace.join("owned.png");
+        let sibling_image = sibling.join("other.png");
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        std::fs::write(&owned_image, png).unwrap();
+        std::fs::write(&sibling_image, png).unwrap();
+        let config = MultimodalConfig::default();
+        let mut cache = multimodal::LocalImageCache::new();
+
+        let owned_history = vec![ChatMessage::user(format!(
+            "owned [IMAGE:{}]",
+            owned_image.display()
+        ))];
+        let owned = prepare_messages_for_iteration(
+            &owned_history,
+            &config,
+            false,
+            Some(&mut cache),
+            Some(&workspace),
+        )
+        .await
+        .unwrap();
+        assert!(owned.contains_images);
+        assert_eq!(cache.len(), 1);
+
+        // Seed the same cache with a sibling image using the legacy unscoped
+        // provider entrypoint. Runtime preparation must reject it before a
+        // cache hit can reuse the already encoded bytes.
+        multimodal::prepare_messages_for_provider_cached(
+            &[ChatMessage::user(format!(
+                "[IMAGE:{}]",
+                sibling_image.display()
+            ))],
+            &config,
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        let sibling_history = vec![ChatMessage::user(format!(
+            "sibling [IMAGE:{}]",
+            sibling_image.display()
+        ))];
+        let rejected = prepare_messages_for_iteration(
+            &sibling_history,
+            &config,
+            false,
+            Some(&mut cache),
+            Some(&workspace),
+        )
+        .await
+        .unwrap();
+        assert!(!rejected.contains_images);
+        assert!(
+            !rejected.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !rejected.messages[0]
+                .content
+                .contains(sibling_image.to_str().unwrap())
+        );
     }
 
     #[tokio::test]
@@ -238,7 +327,7 @@ mod tests {
             ChatMessage::user("actual user"),
         ];
         let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None, None)
             .await
             .unwrap();
         let first_non_system = prepared
@@ -264,7 +353,7 @@ mod tests {
             ChatMessage::tool("[AUDIO:/tmp/clip.wav] recorded 3:00 PM"),
         ];
         let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None)
+        let prepared = prepare_messages_for_iteration(&history, &cfg, false, None, None)
             .await
             .unwrap();
         let joined = prepared
@@ -312,7 +401,7 @@ mod tests {
             ChatMessage::tool("done"),
         ];
         let cfg = MultimodalConfig::default();
-        let prepared = prepare_messages_for_iteration(&history, &cfg, true, None)
+        let prepared = prepare_messages_for_iteration(&history, &cfg, true, None, None)
             .await
             .unwrap();
 
@@ -368,7 +457,7 @@ mod tests {
 
         // Pure system history.
         let system_only = vec![ChatMessage::system("sys")];
-        let err = prepare_messages_for_iteration(&system_only, &cfg, false, None)
+        let err = prepare_messages_for_iteration(&system_only, &cfg, false, None, None)
             .await
             .expect_err("system-only history must not reach the provider");
         assert!(
@@ -384,7 +473,7 @@ mod tests {
             ChatMessage::assistant("[tool_call] fire"),
             ChatMessage::tool("result"),
         ];
-        let err = prepare_messages_for_iteration(&no_user, &cfg, false, None)
+        let err = prepare_messages_for_iteration(&no_user, &cfg, false, None, None)
             .await
             .expect_err("no-user history must not reach the provider");
         assert!(

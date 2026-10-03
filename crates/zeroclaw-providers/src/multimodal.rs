@@ -3,7 +3,7 @@ use reqwest::Client;
 use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroclaw_api::media::{
     PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
     is_provider_image_mime,
@@ -142,6 +142,12 @@ pub enum MultimodalError {
 
     #[error("multimodal image source not found or unreadable: '{input}'")]
     ImageSourceNotFound { input: String },
+
+    #[error("multimodal image workspace is unavailable")]
+    ImageWorkspaceUnavailable,
+
+    #[error("multimodal image is outside the current workspace")]
+    ImageOutsideWorkspace,
 
     #[error("invalid multimodal image marker '{input}': {reason}")]
     InvalidMarker { input: String, reason: String },
@@ -972,6 +978,7 @@ async fn normalize_native_tool_result_json(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     cache: Option<&mut LocalImageCache>,
+    workspace: Option<&mut LocalImageWorkspaceScope<'_>>,
 ) -> Option<(String, bool)> {
     let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str::<serde_json::Value>(content)
     else {
@@ -987,8 +994,16 @@ async fn normalize_native_tool_result_json(
         return None;
     }
 
-    let normalized =
-        normalize_image_references(&refs, config, max_bytes, remote_client, ctx, cache).await;
+    let normalized = normalize_image_references(
+        &refs,
+        config,
+        max_bytes,
+        remote_client,
+        ctx,
+        cache,
+        workspace,
+    )
+    .await;
     let new_inner = compose_multimodal_content(
         &cleaned_text,
         &normalized.data_uris,
@@ -1007,7 +1022,7 @@ pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
 ) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_inner(messages, config, None).await
+    prepare_messages_inner(messages, config, None, None).await
 }
 
 /// Like [`prepare_messages_for_provider`] but reuses a [`LocalImageCache`]
@@ -1018,13 +1033,27 @@ pub async fn prepare_messages_for_provider_cached(
     config: &MultimodalConfig,
     cache: &mut LocalImageCache,
 ) -> anyhow::Result<PreparedMessages> {
-    prepare_messages_inner(messages, config, Some(cache)).await
+    prepare_messages_inner(messages, config, Some(cache), None).await
+}
+
+/// Prepare provider messages while limiting local image reads to `workspace`.
+/// The workspace is resolved for this call only, and every local reference is
+/// canonicalized and checked before disk metadata, content, or cache entries
+/// are accessed.
+pub async fn prepare_messages_for_provider_scoped(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    workspace: &Path,
+    cache: Option<&mut LocalImageCache>,
+) -> anyhow::Result<PreparedMessages> {
+    prepare_messages_inner(messages, config, cache, Some(workspace)).await
 }
 
 async fn prepare_messages_inner(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
     mut cache: Option<&mut LocalImageCache>,
+    workspace: Option<&Path>,
 ) -> anyhow::Result<PreparedMessages> {
     // Strip loadable audio markers before any provider sees the history. Left
     // in place, an audio path reaches the model as literal text and fails
@@ -1060,6 +1089,11 @@ async fn prepare_messages_inner(
         });
     }
 
+    let mut workspace_scope = workspace.map(|root| LocalImageWorkspaceScope {
+        root,
+        canonical_root: None,
+    });
+
     // Normalize every image marker first, then enforce the per-request image
     // cap further below based only on images that *successfully* normalize.
     // Trimming the oldest images *before* normalization is unsafe: a newer
@@ -1094,6 +1128,7 @@ async fn prepare_messages_inner(
                     role: &message.role,
                 },
                 cache.as_deref_mut(),
+                workspace_scope.as_mut(),
             )
             .await
         {
@@ -1121,6 +1156,7 @@ async fn prepare_messages_inner(
                 role: &message.role,
             },
             cache.as_deref_mut(),
+            workspace_scope.as_mut(),
         )
         .await;
         let content = compose_multimodal_content(
@@ -1364,6 +1400,52 @@ struct NormalizedImageReferences {
     skipped_count: usize,
 }
 
+struct LocalImageWorkspaceScope<'a> {
+    root: &'a Path,
+    canonical_root: Option<PathBuf>,
+}
+
+impl LocalImageWorkspaceScope<'_> {
+    async fn resolve_image(&mut self, source: &str) -> anyhow::Result<PathBuf> {
+        if self.canonical_root.is_none() {
+            let canonical_root = tokio::fs::canonicalize(self.root)
+                .await
+                .map_err(|_| MultimodalError::ImageWorkspaceUnavailable)?;
+            let metadata = tokio::fs::metadata(&canonical_root)
+                .await
+                .map_err(|_| MultimodalError::ImageWorkspaceUnavailable)?;
+            if !metadata.is_dir() {
+                return Err(MultimodalError::ImageWorkspaceUnavailable.into());
+            }
+            self.canonical_root = Some(canonical_root);
+        }
+
+        let canonical_path = tokio::fs::canonicalize(source).await.map_err(|_| {
+            MultimodalError::ImageSourceNotFound {
+                input: "<scoped image>".to_string(),
+            }
+        })?;
+        let Some(canonical_root) = self.canonical_root.as_deref() else {
+            return Err(MultimodalError::ImageWorkspaceUnavailable.into());
+        };
+        if !canonical_path.starts_with(canonical_root) {
+            return Err(MultimodalError::ImageOutsideWorkspace.into());
+        }
+        let metadata = tokio::fs::metadata(&canonical_path).await.map_err(|_| {
+            MultimodalError::ImageSourceNotFound {
+                input: "<scoped image>".to_string(),
+            }
+        })?;
+        if !metadata.is_file() {
+            return Err(MultimodalError::ImageSourceNotFound {
+                input: "<scoped image>".to_string(),
+            }
+            .into());
+        }
+        Ok(canonical_path)
+    }
+}
+
 /// Context attached to image-skip log events so callers can be identified.
 struct ImageNormalizeCtx<'a> {
     /// Zero-based index of this message in the conversation history.
@@ -1379,6 +1461,7 @@ async fn normalize_image_references(
     remote_client: &Client,
     ctx: &ImageNormalizeCtx<'_>,
     mut cache: Option<&mut LocalImageCache>,
+    mut workspace: Option<&mut LocalImageWorkspaceScope<'_>>,
 ) -> NormalizedImageReferences {
     let mut data_uris = Vec::with_capacity(refs.len());
     let mut skipped_count = 0usize;
@@ -1390,6 +1473,7 @@ async fn normalize_image_references(
             max_bytes,
             remote_client,
             cache.as_deref_mut(),
+            workspace.as_deref_mut(),
         )
         .await
         {
@@ -1408,10 +1492,20 @@ async fn normalize_image_references(
                 if !should_report {
                     continue;
                 }
-                let error_reason = multimodal_error_reason(&error);
+                let sensitive_local_path =
+                    workspace.is_some() && image_reference_kind(reference) == "local";
+                let error_reason = if sensitive_local_path {
+                    None
+                } else {
+                    multimodal_error_reason(&error)
+                };
                 // Truncate the raw reference so we don't dump a full base64
                 // payload into the log, but keep enough to identify the source.
-                let marker_preview: String = reference.chars().take(120).collect();
+                let marker_preview: String = if sensitive_local_path {
+                    "<scoped image>".to_string()
+                } else {
+                    reference.chars().take(120).collect()
+                };
                 let attrs = ::serde_json::json!({
                     "message_index": ctx.message_index,
                     "message_role": ctx.role,
@@ -1509,6 +1603,8 @@ fn multimodal_error_kind(error: &anyhow::Error) -> &'static str {
         Some(MultimodalError::UnsupportedMime { .. }) => "unsupported_mime",
         Some(MultimodalError::RemoteFetchDisabled { .. }) => "remote_fetch_disabled",
         Some(MultimodalError::ImageSourceNotFound { .. }) => "image_source_not_found",
+        Some(MultimodalError::ImageWorkspaceUnavailable) => "image_workspace_unavailable",
+        Some(MultimodalError::ImageOutsideWorkspace) => "image_outside_workspace",
         Some(MultimodalError::InvalidMarker { .. }) => "invalid_marker",
         Some(MultimodalError::RemoteFetchFailed { .. }) => "remote_fetch_failed",
         Some(MultimodalError::LocalReadFailed { .. }) => "local_read_failed",
@@ -1533,6 +1629,7 @@ async fn normalize_image_reference(
     max_bytes: usize,
     remote_client: &Client,
     cache: Option<&mut LocalImageCache>,
+    workspace: Option<&mut LocalImageWorkspaceScope<'_>>,
 ) -> anyhow::Result<String> {
     if source.starts_with("data:") {
         return normalize_data_uri(source, max_bytes);
@@ -1549,8 +1646,20 @@ async fn normalize_image_reference(
         return normalize_remote_image(source, max_bytes, remote_client).await;
     }
 
+    if let Some(workspace) = workspace {
+        // Canonicalize and enforce workspace membership before either reading
+        // metadata or consulting the image cache. Cache keys use the resolved
+        // path so path aliases cannot bypass the check.
+        let canonical_path = workspace.resolve_image(source).await?;
+        let canonical_source = canonical_path.to_string_lossy().into_owned();
+        return match cache {
+            Some(cache) => normalize_local_image_cached(&canonical_source, max_bytes, cache).await,
+            None => normalize_local_image(&canonical_source, max_bytes).await,
+        };
+    }
+
     match cache {
-        Some(c) => normalize_local_image_cached(source, max_bytes, c).await,
+        Some(cache) => normalize_local_image_cached(source, max_bytes, cache).await,
         None => normalize_local_image(source, max_bytes).await,
     }
 }
@@ -2917,6 +3026,161 @@ mod tests {
         assert!(cleaned.contains("Generated image"));
         assert_eq!(refs.len(), 1);
         assert!(refs[0].starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn scoped_preparation_allows_owned_images_in_restored_history_and_tool_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("agent");
+        std::fs::create_dir(&workspace).unwrap();
+        let image_path = workspace.join("owned.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        // This is the shape received after restoring a session: the image is
+        // in an earlier user message and still goes through provider prep.
+        let restored_history = vec![
+            ChatMessage::user(format!("old attachment [IMAGE:{}]", image_path.display())),
+            ChatMessage::user("what was in that picture?"),
+        ];
+        let prepared = prepare_messages_for_provider_scoped(
+            &restored_history,
+            &MultimodalConfig::default(),
+            &workspace,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(prepared.contains_images);
+        assert!(
+            prepared.messages[0]
+                .content
+                .contains("data:image/png;base64,")
+        );
+        assert!(
+            !prepared.messages[0]
+                .content
+                .contains(image_path.to_str().unwrap())
+        );
+
+        // Native tool-result JSON follows the same scope check and keeps its
+        // envelope fields when the owned image is expanded.
+        let native_result = serde_json::json!({
+            "tool_call_id": "call-safe",
+            "content": format!("generated [IMAGE:{}]", image_path.display()),
+        });
+        let native = prepare_messages_for_provider_scoped(
+            &[ChatMessage::tool(native_result.to_string())],
+            &MultimodalConfig::default(),
+            &workspace,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(native.contains_images);
+        let envelope: serde_json::Value =
+            serde_json::from_str(&native.messages[0].content).unwrap();
+        assert_eq!(envelope["tool_call_id"], "call-safe");
+        assert!(
+            envelope["content"]
+                .as_str()
+                .unwrap()
+                .contains("data:image/png;base64,")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_preparation_rejects_sibling_and_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("agent");
+        let sibling = temp.path().join("sibling");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let outside_image = sibling.join("outside.png");
+        std::fs::write(
+            &outside_image,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+        let escaped_link = workspace.join("link.png");
+        symlink(&outside_image, &escaped_link).unwrap();
+
+        let messages = [ChatMessage::user(format!(
+            "sibling [IMAGE:{}] symlink [IMAGE:{}]",
+            outside_image.display(),
+            escaped_link.display()
+        ))];
+        let prepared = prepare_messages_for_provider_scoped(
+            &messages,
+            &MultimodalConfig::default(),
+            &workspace,
+            None,
+        )
+        .await
+        .unwrap();
+        let content = &prepared.messages[0].content;
+        assert!(!prepared.contains_images);
+        assert!(!content.contains("data:image/png;base64,"));
+        assert!(!content.contains(outside_image.to_str().unwrap()));
+        assert!(!content.contains(escaped_link.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn scoped_preparation_rejects_cached_outside_image_and_resolves_lazily() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("agent");
+        let sibling = temp.path().join("sibling");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+        let outside_image = sibling.join("cached.png");
+        std::fs::write(
+            &outside_image,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let mut cache = LocalImageCache::new();
+        let cached_data = "data:image/png;base64,AA==";
+        cache.insert(
+            outside_image.to_string_lossy().into_owned(),
+            0,
+            0,
+            cached_data.to_string(),
+        );
+        let prepared = prepare_messages_for_provider_scoped(
+            &[ChatMessage::user(format!(
+                "[IMAGE:{}]",
+                outside_image.display()
+            ))],
+            &MultimodalConfig::default(),
+            &workspace,
+            Some(&mut cache),
+        )
+        .await
+        .unwrap();
+        assert!(!prepared.contains_images);
+        assert!(!prepared.messages[0].content.contains(cached_data));
+        assert_eq!(
+            cache.len(),
+            1,
+            "the rejected entry was not replaced or evicted"
+        );
+
+        let text_only = prepare_messages_for_provider_scoped(
+            &[ChatMessage::user("plain text")],
+            &MultimodalConfig::default(),
+            &temp.path().join("workspace-not-created"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(text_only.messages[0].content, "plain text");
     }
 
     #[tokio::test]
