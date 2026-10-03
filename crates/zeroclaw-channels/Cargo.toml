@@ -52,6 +52,7 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = [
+  "std",
   "sink",
 ] }
 hmac = "0.12"

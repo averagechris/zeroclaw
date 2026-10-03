@@ -250,9 +250,14 @@ external_peers = ["111111111", "222222222"]
   agent. There is no default or fallback agent.
 - The table is the alias's only agent binding. Do not also list
   `telegram.home` in any `agents.<alias>.channels`.
-- A routed alias is text-only. Photos, documents, albums, and voice notes are
-  dropped before any download, and nothing is written to the channel's
-  workspace directory. Text-to-speech replies are not bound on a routed alias.
+- Routed aliases accept text, photos, and voice notes. The listener admits a
+  sender and resolves the owning agent before saving photo bytes; photos live
+  under that agent's workspace. Voice bytes are transcribed by the resolved
+  agent's configured transcription provider. Keep `media_pipeline.enabled`,
+  `media_pipeline.describe_images`, and `media_pipeline.transcribe_audio`
+  enabled to make those attachments available to the model. Photo albums are
+  supported; documents and videos are not. Text-to-speech replies are not
+  bound on a routed alias.
 - The `/model` picker does not open on a routed alias. `/model <hint>` still
   changes the model for the current session in the routed agent. In a group
   with `per_user_session = false`, that change applies to the whole group.
@@ -334,7 +339,9 @@ link as a temporary access credential: whoever redeems it first gets access.
 
 Enrollment controls bypass the model. Edited, forwarded, anonymous-admin,
 and bot-authored enrollment commands cannot grant access. Explicit peer deny
-entries still apply. This mode is text-only, like static routed aliases.
+entries still apply. After an invitation is redeemed, authorized photos and
+voice notes follow the same agent-scoped media path as static routes. Photo
+albums are supported; documents and videos remain unsupported.
 
 When `reaction` is allowed, it can only target a message in the current
 Telegram conversation; the runtime supplies the chat and channel alias. The

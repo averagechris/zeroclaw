@@ -500,6 +500,25 @@ mod tests {
     }
 
     #[test]
+    fn telegram_photo_drop_notice_exists_in_every_builtin_locale() {
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value =
+                format_ftl_message(source, locale, "channel-telegram-photo-drop-failed", &[])
+                    .unwrap_or_else(|| panic!("photo-drop notice should format in {locale}"));
+            assert!(
+                !value.trim().is_empty(),
+                "photo-drop notice is empty in {locale}"
+            );
+        }
+    }
+
+    #[test]
     fn status_cli_strings_format_dynamic_entries() {
         let keys = [
             (
