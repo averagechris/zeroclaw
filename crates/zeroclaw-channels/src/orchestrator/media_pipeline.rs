@@ -288,6 +288,23 @@ impl<'a> MediaPipeline<'a> {
         }
 
         let mut annotations = Vec::new();
+        match persist_video_attachment(workspace_dir, attachment).await {
+            Ok(path) => annotations.push(format!(
+                "[Original video saved for this agent: {}]",
+                path.display()
+            )),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{error:#}")})),
+                    "Media pipeline: could not persist video in agent workspace"
+                );
+                annotations
+                    .push("[Original video could not be saved for later editing.]".to_string());
+            }
+        }
         if self.vision_available {
             match extract_video_frames(
                 &self.ffmpeg_program,
@@ -686,14 +703,59 @@ fn split_mjpeg_frames(data: &[u8]) -> Vec<Vec<u8>> {
     frames
 }
 
-/// Persist image bytes under the resolved agent's private workspace. The
-/// filename is generated locally, writes never overwrite an existing entry,
-/// and the canonical storage directory must remain inside the workspace.
+/// Persist an image attachment using the media writer scoped to the resolved
+/// agent's private workspace.
 async fn persist_image_attachment(
     workspace_dir: &std::path::Path,
     attachment: &MediaAttachment,
 ) -> anyhow::Result<std::path::PathBuf> {
+    let extension = attachment
+        .file_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .filter(|ext| matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
+        .unwrap_or_else(|| "img".to_string());
+    persist_media_bytes(workspace_dir, &attachment.data, &extension).await
+}
+
+async fn persist_video_attachment(
+    workspace_dir: &std::path::Path,
+    attachment: &MediaAttachment,
+) -> anyhow::Result<std::path::PathBuf> {
+    persist_media_bytes(
+        workspace_dir,
+        &attachment.data,
+        safe_video_extension(attachment),
+    )
+    .await
+}
+
+/// Write supported media under the agent's canonical workspace. Generated
+/// names and create-new preserve existing source files and avoid path input.
+async fn persist_media_bytes(
+    workspace_dir: &std::path::Path,
+    data: &[u8],
+    extension: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     use tokio::io::AsyncWriteExt as _;
+
+    anyhow::ensure!(
+        matches!(
+            extension,
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "img"
+                | "mp4"
+                | "mov"
+                | "mkv"
+                | "avi"
+                | "webm"
+        ),
+        "unsupported media extension"
+    );
 
     let workspace_root = tokio::fs::canonicalize(workspace_dir).await?;
     let media_dir = workspace_dir.join("telegram_files");
@@ -704,19 +766,13 @@ async fn persist_image_attachment(
         "agent media directory escapes its workspace"
     );
 
-    let extension = attachment
-        .file_name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .filter(|ext| matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
-        .unwrap_or_else(|| "img".to_string());
     let path = media_root.join(format!("telegram_{}.{}", uuid::Uuid::new_v4(), extension));
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .await?;
-    if let Err(error) = file.write_all(&attachment.data).await {
+    if let Err(error) = file.write_all(data).await {
         drop(file);
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error.into());
@@ -1378,6 +1434,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let config = default_pipeline_config(true);
         let pipeline = MediaPipeline::new(&config, None, true).with_workspace_dir(workspace.path());
+        let original_bytes = bytes.clone();
         let attachment = MediaAttachment {
             file_name: "clip.mp4".to_string(),
             data: bytes,
@@ -1396,6 +1453,13 @@ mod tests {
             result.contains("use one of these saved frame paths as an image_gen reference"),
             "{result}"
         );
+        let video_path_hint = result
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("[Original video saved for this agent: ")?
+                    .strip_suffix(']')
+            })
+            .expect("a valid bounded video should be retained in its agent workspace");
         let (cleaned_result, marker_paths) =
             zeroclaw_providers::multimodal::parse_image_markers(&result);
         assert_eq!(marker_paths.len(), 4, "{marker_paths:?}");
@@ -1425,11 +1489,24 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         let mut frame_hashes = std::collections::HashSet::new();
+        let mut retained_video = false;
         for entry in entries {
             let path = tokio::fs::canonicalize(entry.path()).await.unwrap();
             let path_text = path.display().to_string();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("mp4") {
+                assert_eq!(path_text, video_path_hint);
+                assert!(cleaned_result.contains(&format!(
+                    "[Original video saved for this agent: {path_text}]"
+                )));
+                assert!(prepared_text.contains(&format!(
+                    "[Original video saved for this agent: {path_text}]"
+                )));
+                assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+                retained_video = true;
+                continue;
+            }
             assert!(
                 result.contains(&format!("[Image saved for this agent: {path_text}]")),
                 "the frame path should be explicit in model-visible text: {result}"
@@ -1458,10 +1535,14 @@ mod tests {
             frame_hashes.len() > 1,
             "samples should span changing frames"
         );
+        assert!(
+            retained_video,
+            "the source clip should remain in the agent workspace"
+        );
         assert_eq!(
             std::fs::read_dir(workspace.path()).unwrap().count(),
             1,
-            "only persistent agent-owned frame images should remain"
+            "only the persistent agent-owned media directory should remain"
         );
     }
 
@@ -1674,7 +1755,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ffmpeg_output_limit_kills_child_and_cleans_staged_video() {
+    async fn ffmpeg_output_limit_kills_child_preserves_source_and_cleans_staged_video() {
         let workspace = tempfile::tempdir().unwrap();
         let probe = executable_script(
             workspace.path(),
@@ -1689,23 +1770,45 @@ mod tests {
             .with_ffprobe_program(probe)
             .with_ffmpeg_program(noisy_ffmpeg);
 
-        let result = pipeline.process("inspect", &[sample_video()]).await;
+        let video = sample_video();
+        let source_bytes = video.data.clone();
+        let result = pipeline.process("inspect", &[video]).await;
 
         assert!(
             result.contains("Video frames could not be extracted"),
             "{result}"
         );
+        assert!(result.contains("[Original video saved for this agent:"));
         let entries = std::fs::read_dir(workspace.path())
             .unwrap()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert!(entries.iter().all(|entry| {
             matches!(
                 entry.file_name().to_string_lossy().as_ref(),
-                "fake-ffprobe" | "noisy-ffmpeg"
+                "fake-ffprobe" | "noisy-ffmpeg" | "telegram_files"
             )
         }));
+        let media_entries = std::fs::read_dir(workspace.path().join("telegram_files"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(media_entries.len(), 1);
+        assert_eq!(
+            std::fs::read(media_entries[0].path()).unwrap(),
+            source_bytes
+        );
+        assert!(
+            std::fs::read_dir(workspace.path())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("telegram-video-")),
+            "temporary video input must be removed while the scoped source copy remains"
+        );
     }
 
     #[tokio::test]
