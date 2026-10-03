@@ -6402,14 +6402,15 @@ pub struct PiperTtsProviderConfig {
 
 // ── Transcription providers (typed-family split, mirrors models/tts) ────
 //
-// Six family slots: `groq`, `openai`, `deepgram`, `assemblyai`, `google`,
-// `local_whisper`. Each is a `HashMap<String, *TranscriptionProviderConfig>`
-// keyed by operator-chosen alias. The shared `TranscriptionProviderConfig`
-// base carries `api_key` + `language` since every cloud STT family takes
-// both; `local_whisper` skips the base because it's a self-hosted endpoint
-// with its own auth token, not a vendor API key.
+// Seven family slots: `groq`, `opencode_go`, `openai`, `deepgram`,
+// `assemblyai`, `google`, `local_whisper`. Each is a `HashMap<String, *TranscriptionProviderConfig>`
+// keyed by operator-chosen alias. Most cloud families compose the shared
+// `TranscriptionProviderConfig` base for vendor keys and optional language
+// hints. `opencode_go` has a direct key/model config for its native chat audio
+// request; `local_whisper` uses its own endpoint and optional bearer token.
 
-/// Shared base for cloud transcription providers. Each cloud family
+/// Shared base for cloud transcription providers that accept common key and
+/// language-hint fields. Most cloud families
 /// composes this via `#[serde(flatten)] base: TranscriptionProviderConfig`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6462,6 +6463,23 @@ pub struct GroqTranscriptionProviderConfig {
     #[serde(flatten)]
     pub base: TranscriptionProviderConfig,
     /// Whisper model name (default: `"whisper-large-v3-turbo"`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// OpenCode Go native audio transcription provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.transcription.opencode_go"]
+pub struct OpenCodeGoTranscriptionProviderConfig {
+    /// OpenCode Go API key. This is resolved through the normal secret sources.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Go audio-capable chat model (`mimo-v2.6-flash` or `mimo-v2.6-pro`,
+    /// default: `mimo-v2.6-flash`).
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -43306,6 +43324,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
 
         let tr = toml::Value::try_from(crate::providers::TranscriptionProviders {
             groq: std::iter::once(("a".to_string(), Default::default())).collect(),
+            opencode_go: std::iter::once(("a".to_string(), Default::default())).collect(),
             openai: std::iter::once(("a".to_string(), Default::default())).collect(),
             deepgram: std::iter::once(("a".to_string(), Default::default())).collect(),
             assemblyai: std::iter::once(("a".to_string(), Default::default())).collect(),
@@ -44437,6 +44456,10 @@ allowed_users = []
             "default".into(),
             OpenAiTranscriptionProviderConfig::default(),
         );
+        config.providers.transcription.opencode_go.insert(
+            "default".into(),
+            OpenCodeGoTranscriptionProviderConfig::default(),
+        );
         config.providers.transcription.local_whisper.insert(
             "default".into(),
             LocalWhisperTranscriptionProviderConfig::default(),
@@ -44501,6 +44524,10 @@ allowed_users = []
             "default".into(),
             LocalWhisperTranscriptionProviderConfig::default(),
         );
+        config.providers.transcription.opencode_go.insert(
+            "default".into(),
+            OpenCodeGoTranscriptionProviderConfig::default(),
+        );
         config
             .channels
             .matrix
@@ -44520,6 +44547,10 @@ allowed_users = []
         );
         assert_eq!(
             class_for("providers.tts.openai.default.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+        assert_eq!(
+            class_for("providers.transcription.opencode_go.default.api_key"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert_eq!(
