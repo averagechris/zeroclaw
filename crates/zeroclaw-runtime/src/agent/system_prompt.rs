@@ -34,7 +34,7 @@ fn load_openclaw_bootstrap_files(
     inject_memory: bool,
 ) {
     prompt.push_str(
-        "The following workspace files define your identity, behavior, and context. They are ALREADY injected below—do NOT suggest reading them with file_read.\n\n",
+        "The workspace files below define your identity, behavior, and context. They are already included. Do not suggest reading them with file_read.\n\n",
     );
 
     let bootstrap_files = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md"];
@@ -267,7 +267,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
              NEVER narrate, announce, describe, or explain your tool usage to the user. \
              Do NOT say things like 'Let me check...', 'I will use http_request to...', \
              'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
-             The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
+             The user must ONLY see the final answer. Tool calls stay invisible. \
              never reference them. If you catch yourself starting a sentence about what tool \
              you are about to use or just used, DELETE it and give the answer directly.\n\n",
         );
@@ -278,7 +278,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         prompt.push_str(
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
-             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - If a tool call fails, report the error. Never invent data to fill the gap.\n\
              - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
         );
     }
@@ -316,8 +316,8 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
             "## Hardware Access\n\n\
              You HAVE direct access to connected hardware (Arduino, Nucleo, etc.). The user owns this system and has configured it.\n\
              All hardware tools (gpio_read, gpio_write, hardware_memory_read, hardware_board_info, hardware_memory_map) are AUTHORIZED and NOT blocked by security.\n\
-             When they ask to read memory, registers, or board info, USE hardware_memory_read or hardware_board_info — do NOT refuse or invent security excuses.\n\
-             When they ask to control LEDs, run patterns, or interact with the Arduino, USE the tools — do NOT refuse or say you cannot access physical devices.\n\
+             When they ask to read memory, registers, or board info, use hardware_memory_read or hardware_board_info. Do not refuse or invent security excuses.\n\
+             When they ask to control LEDs, run patterns, or interact with the Arduino, use the tools. Do not refuse or claim you cannot access physical devices.\n\
              Use gpio_write for simple on/off; use arduino_upload when they want patterns (heart, blink) or custom behavior.\n\n",
         );
     }
@@ -351,7 +351,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
                     .unwrap_or(&[]),
             ));
             prompt.push_str(
-                "When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly unless it is listed in `always_ask` — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
+                "When the user asks you to run a shell command, write or edit a file, or act through these tools, call the tool unless it is listed in `always_ask`. Do not preemptively refuse with claims like \"blocked by security policy\" or \"restricted in this environment\" just because the request uses shell or file-write tooling.\n\
                  Full autonomy auto-approves uncovered tools; it does not remove runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
             );
         }
@@ -377,7 +377,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         prompt.push_str(NATIVE_TOOLS_TASK_FRAMING);
         prompt.push_str(
             " (running commands, reading files, etc.).\n\
-             For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
+             For questions, explanations, or follow-ups about prior messages, answer from conversation context. Do not ask the user to repeat themselves.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
     } else {
@@ -529,8 +529,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-        prompt
-            .push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+        prompt.push_str("- Respond directly. You do not need permission to send a reply.\n");
         prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
@@ -546,12 +545,12 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         }
     });
         prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-        prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-        prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+        prompt.push_str("- If a tool output contains credentials, they have already been redacted. Do not mention them.\n");
+        prompt.push_str("- Voice notes are transcribed automatically. Text replies are converted to voice notes by the channel. Do not generate audio yourself.\n");
         if !show_tool_calls {
-            prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+            prompt.push_str("- Never narrate or describe tool use. Do not announce searches or name tools. Give the final answer without progress updates.\n");
         }
-        prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
+        prompt.push_str("- When a message calls for an answer, give one. Use memory to shape the answer, not to decide whether to respond.\n\n");
     } // end if !compact_context (full Channel Capabilities copy)
 
     // Emitted unconditionally: small local models mistake the enrichment
@@ -569,8 +568,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     prompt = finalize_system_prompt(prompt, max_system_prompt_chars);
 
     if prompt.is_empty() {
-        "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
-            .to_string()
+        "This assistant runs in ZeroClaw. Be helpful, concise, and direct.".to_string()
     } else {
         prompt
     }
@@ -655,7 +653,7 @@ fn inject_workspace_file(
                 prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... {filename} truncated at {max_chars} chars — use `read {filename}` for full file]\n"
+                    "\n\n[... {filename} truncated at {max_chars} chars. Use `read {filename}` for the full file.]\n"
                 );
             } else {
                 prompt.push_str(trimmed);
