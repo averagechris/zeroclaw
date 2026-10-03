@@ -123,6 +123,50 @@ fn parse(chat_id: i64, from_id: i64, text: &str) -> ChannelMessage {
         .expect("authorized text parses")
 }
 
+#[test]
+fn parsed_private_chat_bypasses_reply_intent_while_group_still_classifies() {
+    use zeroclaw_api::channel::Channel;
+
+    let channel = home_parser();
+    let private = channel
+        .parse_update_message(&telegram_update(OWNER, OWNER, "hello"))
+        .expect("authorized private message parses");
+    let group = channel
+        .parse_update_message(&telegram_update(GROUP, OWNER, "hello"))
+        .expect("authorized group message parses");
+    let mismatched_private = channel
+        .parse_update_message(&telegram_update(OWNER, PARTNER, "hello"))
+        .expect("authorized message in another user's private chat parses");
+    let mut topic_update = telegram_update(GROUP, OWNER, "hello");
+    topic_update["message"]["message_thread_id"] = serde_json::json!(9);
+    topic_update["message"]["is_topic_message"] = serde_json::json!(true);
+    let topic = channel
+        .parse_update_message(&topic_update)
+        .expect("authorized forum-topic message parses");
+
+    assert!(channel.is_direct_message(&private));
+    assert!(should_bypass_reply_intent_precheck(
+        &private,
+        channel.is_direct_message(&private)
+    ));
+
+    assert!(!channel.is_direct_message(&group));
+    assert!(!should_bypass_reply_intent_precheck(
+        &group,
+        channel.is_direct_message(&group)
+    ));
+    assert!(!channel.is_direct_message(&topic));
+    assert!(!channel.is_direct_message(&mismatched_private));
+
+    let missing_identity = ChannelMessage {
+        channel: "telegram".into(),
+        channel_alias: Some("home".into()),
+        reply_target: OWNER.to_string(),
+        ..ChannelMessage::default()
+    };
+    assert!(!channel.is_direct_message(&missing_identity));
+}
+
 fn named_ctx(alias: &str) -> Arc<ChannelRuntimeContext> {
     Arc::new(ChannelRuntimeContext {
         agent_alias: Arc::new(alias.to_string()),
