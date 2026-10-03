@@ -35,6 +35,7 @@ use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
     GoogleTranscriptionProviderConfig, GroqTranscriptionProviderConfig,
     LocalWhisperTranscriptionProviderConfig, OpenAiTranscriptionProviderConfig,
+    OpenCodeGoTranscriptionProviderConfig,
 };
 use super::schema::{
     EdgeTtsProviderConfig, ElevenLabsTtsProviderConfig, GoogleTtsProviderConfig,
@@ -567,8 +568,8 @@ impl TtsProviders {
 }
 
 /// Typed transcription-provider container — one slot per STT family.
-/// Mirrors `ModelProviders` / `TtsProviders`. Closed set of 6 families:
-/// groq, openai, deepgram, assemblyai, google, local_whisper.
+/// Mirrors `ModelProviders` / `TtsProviders`. Closed set of 7 families:
+/// groq, opencode_go, openai, deepgram, assemblyai, google, local_whisper.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.transcription"]
@@ -576,6 +577,9 @@ pub struct TranscriptionProviders {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub groq: HashMap<String, GroqTranscriptionProviderConfig>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub opencode_go: HashMap<String, OpenCodeGoTranscriptionProviderConfig>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub openai: HashMap<String, OpenAiTranscriptionProviderConfig>,
@@ -595,6 +599,7 @@ pub struct TranscriptionProviders {
 
 pub enum TranscriptionProviderEntry<'a> {
     Groq(&'a GroqTranscriptionProviderConfig),
+    OpenCodeGo(&'a OpenCodeGoTranscriptionProviderConfig),
     OpenAi(&'a OpenAiTranscriptionProviderConfig),
     Deepgram(&'a DeepgramTranscriptionProviderConfig),
     AssemblyAi(&'a AssemblyAiTranscriptionProviderConfig),
@@ -606,6 +611,7 @@ impl TranscriptionProviders {
     /// True when no slot has any entry.
     pub fn is_empty(&self) -> bool {
         self.groq.is_empty()
+            && self.opencode_go.is_empty()
             && self.openai.is_empty()
             && self.deepgram.is_empty()
             && self.assemblyai.is_empty()
@@ -613,11 +619,14 @@ impl TranscriptionProviders {
             && self.local_whisper.is_empty()
     }
 
-    /// Iterate every configured (family, alias) pair across all six slots.
+    /// Iterate every configured (family, alias) pair across all seven slots.
     pub fn iter_aliases(&self) -> impl Iterator<Item = (&'static str, &str)> {
         let mut out: Vec<(&'static str, &str)> = Vec::new();
         for k in self.groq.keys() {
             out.push(("groq", k.as_str()));
+        }
+        for k in self.opencode_go.keys() {
+            out.push(("opencode_go", k.as_str()));
         }
         for k in self.openai.keys() {
             out.push(("openai", k.as_str()));
@@ -647,6 +656,13 @@ impl TranscriptionProviders {
                         "groq",
                         alias.as_str(),
                         TranscriptionProviderEntry::Groq(config),
+                    )
+                }))
+                .chain(self.opencode_go.iter().map(|(alias, config)| {
+                    (
+                        "opencode_go",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::OpenCodeGo(config),
                     )
                 }))
                 .chain(self.openai.iter().map(|(alias, config)| {
@@ -781,6 +797,10 @@ mod tests {
         providers
             .groq
             .insert("fast".into(), GroqTranscriptionProviderConfig::default());
+        providers.opencode_go.insert(
+            "native".into(),
+            OpenCodeGoTranscriptionProviderConfig::default(),
+        );
         providers.openai.insert(
             "whisper".into(),
             OpenAiTranscriptionProviderConfig::default(),
@@ -807,6 +827,7 @@ mod tests {
             .map(|(family, alias, entry)| {
                 let variant = match entry {
                     TranscriptionProviderEntry::Groq(_) => "groq",
+                    TranscriptionProviderEntry::OpenCodeGo(_) => "opencode_go",
                     TranscriptionProviderEntry::OpenAi(_) => "openai",
                     TranscriptionProviderEntry::Deepgram(_) => "deepgram",
                     TranscriptionProviderEntry::AssemblyAi(_) => "assemblyai",
@@ -821,6 +842,7 @@ mod tests {
             entries,
             vec![
                 ("groq", "fast".into(), "groq"),
+                ("opencode_go", "native".into(), "opencode_go"),
                 ("openai", "whisper".into(), "openai"),
                 ("deepgram", "nova".into(), "deepgram"),
                 ("assemblyai", "default".into(), "assemblyai"),
@@ -935,6 +957,7 @@ macro_rules! for_each_transcription_provider_slot {
         $mac! {
             $rate_ty,
             (groq, "groq"),
+            (opencode_go, "opencode_go"),
             (openai, "openai"),
             (deepgram, "deepgram"),
             (assemblyai, "assemblyai"),

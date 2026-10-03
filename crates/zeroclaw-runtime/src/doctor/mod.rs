@@ -1293,7 +1293,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Transcription provider api_key presence — same shape as the TTS check
-    // above. `groq`, `openai`, `deepgram`, `assemblyai`, and `google` all
+    // above. `groq`, `opencode_go`, `openai`, `deepgram`, `assemblyai`, and `google` all
     // gate registration on `api_key` in
     // `crates/zeroclaw-channels/src/transcription.rs`. `local_whisper` has
     // no api_key concept (its optional `bearer_token` is a different field)
@@ -1304,6 +1304,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.transcription.iter_entries() {
             let api_key = match entry {
                 TranscriptionProviderEntry::Groq(c) => c.base.api_key.as_deref(),
+                TranscriptionProviderEntry::OpenCodeGo(c) => c.api_key.as_deref(),
                 TranscriptionProviderEntry::OpenAi(c) => c.base.api_key.as_deref(),
                 TranscriptionProviderEntry::Deepgram(c) => c.base.api_key.as_deref(),
                 TranscriptionProviderEntry::AssemblyAi(c) => c.base.api_key.as_deref(),

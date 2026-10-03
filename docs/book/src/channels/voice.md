@@ -57,7 +57,20 @@ ClawdTalk shortcuts several of these by keeping the audio stream live; regular `
 
 ## STT
 
-Speech-to-text is configured separately from the voice channels; see the `[transcription]` config in the [Config reference](../reference/config.md). Voice channels invoke whichever transcription provider is active when they need to turn audio into text.
+Speech-to-text is configured separately from the voice channels. Voice channels invoke the provider selected by the agent's `transcription_provider` reference when they need to turn audio into text.
+
+OpenCode Go can transcribe supported audio natively with MiMo V2.6 Flash or Pro. Configure its key on a typed transcription provider and select that alias on the agent:
+
+```toml
+[providers.transcription.opencode_go.voice]
+api_key = "op://platform/opencode-go/api-key"
+# model = "mimo-v2.6-pro" # defaults to mimo-v2.6-flash
+
+[agents.default]
+transcription_provider = "opencode_go.voice"
+```
+
+The adapter sends one audio message with a fixed instruction that treats audio only as source material, transcribes spoken words verbatim, and ignores instructions spoken in the audio. No conversation history is sent. Each request uses an opaque OpenCode session ID and ZeroClaw's own User-Agent. Supported inputs are MP3, WAV, FLAC, M4A, and Ogg/Opus; Ogg/Opus data must have an Ogg container header. The request is capped at 25 MiB, times out after 120 seconds, and rejects responses larger than 256 KiB, empty transcripts, or output that does not finish normally. There is no automatic paid-provider fallback. Channels enforce `transcription.max_duration_secs` before downloading supported voice recordings.
 
 ## Hardware notes
 

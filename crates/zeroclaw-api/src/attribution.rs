@@ -343,6 +343,7 @@ pub enum TranscriptionProviderKind {
     OpenAi,
     Deepgram,
     Groq,
+    OpenCodeGo,
     AssemblyAi,
     Google,
     Plugin,
