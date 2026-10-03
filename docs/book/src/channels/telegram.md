@@ -250,14 +250,20 @@ external_peers = ["111111111", "222222222"]
   agent. There is no default or fallback agent.
 - The table is the alias's only agent binding. Do not also list
   `telegram.home` in any `agents.<alias>.channels`.
-- Routed aliases accept text, photos, and voice notes. The listener admits a
-  sender and resolves the owning agent before saving photo bytes; photos live
-  under that agent's workspace. Voice bytes are transcribed by the resolved
-  agent's configured transcription provider. Keep `media_pipeline.enabled`,
-  `media_pipeline.describe_images`, and `media_pipeline.transcribe_audio`
-  enabled to make those attachments available to the model. Photo albums are
-  supported; documents and videos are not. Text-to-speech replies are not
-  bound on a routed alias.
+- Routed aliases accept text, photos, voice notes, and bounded video clips.
+  The listener admits a sender and resolves the owning agent before saving
+  photo or video data; images and extracted video frames live under that
+  agent's workspace. Voice notes and a video's optional audio track use the
+  resolved agent's configured transcription provider. Keep
+  `media_pipeline.enabled`, `media_pipeline.describe_images`,
+  `media_pipeline.transcribe_audio`, and `media_pipeline.summarize_video`
+  enabled to process them. Video handling requires `ffmpeg` and `ffprobe` on
+  the service PATH. Clips are limited to 20 MiB and 120 seconds; vision gets
+  at most four frames scaled within 640×640 pixels, and audio is capped at 1 MiB.
+  Each ffprobe or ffmpeg process has a 12-second timeout.
+  Photo albums are supported; videos in albums contribute their captions but
+  are not downloaded. Documents are not. Text-to-speech replies are
+  not bound on a routed alias.
 - The `/model` picker does not open on a routed alias. `/model <hint>` still
   changes the model for the current session in the routed agent. In a group
   with `per_user_session = false`, that change applies to the whole group.
@@ -339,9 +345,10 @@ link as a temporary access credential: whoever redeems it first gets access.
 
 Enrollment controls bypass the model. Edited, forwarded, anonymous-admin,
 and bot-authored enrollment commands cannot grant access. Explicit peer deny
-entries still apply. After an invitation is redeemed, authorized photos and
-voice notes follow the same agent-scoped media path as static routes. Photo
-albums are supported; documents and videos remain unsupported.
+entries still apply. After an invitation is redeemed, authorized photos,
+voice notes, and bounded video clips follow the same agent-scoped media path
+as static routes. Photo albums are supported; videos in albums contribute
+their captions but are not downloaded. Documents are unsupported.
 
 When `reaction` is allowed, it can only target a message in the current
 Telegram conversation; the runtime supplies the chat and channel alias. The

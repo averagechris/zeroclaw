@@ -529,7 +529,7 @@ enum QueuedTelegramUpdatePayload {
     MediaGroup(MediaGroupKey),
 }
 
-/// Metadata for an incoming document or photo attachment.
+/// Metadata for an incoming document, photo, or video attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncomingAttachment {
     file_id: String,
@@ -538,14 +538,16 @@ struct IncomingAttachment {
     caption: Option<String>,
     /// Sender-declared MIME type (documents only; Telegram photos carry none).
     mime_type: Option<String>,
+    duration_secs: Option<u64>,
     kind: IncomingAttachmentKind,
 }
 
-/// The kind of incoming attachment (document vs photo).
+/// The kind of incoming attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
+    Video,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Telegram Bot API allows at most 100 commands via setMyCommands.
@@ -1270,6 +1272,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+/// Maximum video duration accepted from Telegram. ffmpeg receives the same
+/// hard decode limit even when Telegram omits duration metadata.
+const TELEGRAM_MAX_VIDEO_DURATION_SECS: u64 = 120;
 
 #[derive(Debug)]
 enum TelegramDownloadError {
@@ -1305,7 +1310,7 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
-    /// When `true`, only photos and voice notes are admitted as bounded bytes;
+    /// When `true`, only photos, videos, and voice notes are admitted as bounded bytes;
     /// documents stay unsupported and no upload is written under this alias's
     /// workspace. The resolved agent owns persistent image storage later.
     text_only: bool,
@@ -3711,7 +3716,7 @@ impl TelegramChannel {
         update
             .get("message")
             .and_then(Self::parse_attachment_metadata)
-            .is_some()
+            .is_some_and(|attachment| attachment.kind != IncomingAttachmentKind::Video)
     }
 
     fn is_context_only_media_group_update(update: &serde_json::Value) -> bool {
@@ -4852,7 +4857,7 @@ impl TelegramChannel {
     /// than from raw JSON key presence, so this predicate cannot drift
     /// from what the parsers accept: `text` must deserialize as a string
     /// (`parse_update_message`), a `voice`/`audio` payload must yield
-    /// metadata via `parse_voice_metadata`, and a `document`/`photo`
+    /// metadata via `parse_voice_metadata`, and a `document`/`photo`/`video`
     /// payload must yield an `IncomingAttachment` via
     /// `parse_attachment_metadata` (which rejects a missing/non-string
     /// `file_id` and an empty `photo` array). Telegram response JSON is
@@ -4861,9 +4866,9 @@ impl TelegramChannel {
     ///
     /// The live config gates are retained alongside the typed checks:
     /// ordinary aliases require their channel transcription manager for voice
-    /// and an alias workspace for documents/photos; routed aliases accept only
-    /// photos and voice because those stay in memory until the owning agent is
-    /// resolved.
+    /// and an alias workspace for attachments; routed aliases accept photos,
+    /// videos, and voice because those stay in memory until the owning agent
+    /// is resolved.
     ///
     /// This covers the config-shaped and shape-shaped bails; the
     /// content-shaped permanent bails — over-`max_duration_secs`
@@ -4882,9 +4887,12 @@ impl TelegramChannel {
             return true;
         }
         if self.text_only {
-            return Self::parse_attachment_metadata(message)
-                .is_some_and(|attachment| attachment.kind == IncomingAttachmentKind::Photo)
-                || Self::parse_voice_metadata(message).is_some();
+            return Self::parse_attachment_metadata(message).is_some_and(|attachment| {
+                matches!(
+                    attachment.kind,
+                    IncomingAttachmentKind::Photo | IncomingAttachmentKind::Video
+                )
+            }) || Self::parse_voice_metadata(message).is_some();
         }
         if self.transcription.is_some()
             && self.transcription_manager.is_some()
@@ -4901,7 +4909,8 @@ impl TelegramChannel {
     /// `try_parse_voice_message`'s over-`max_duration_secs` bail (using
     /// the same `self.transcription` config the parser reads) and
     /// `try_parse_attachment_message`'s over-`TELEGRAM_MAX_FILE_DOWNLOAD_BYTES`
-    /// bail (the same constant the parser checks). An authorized sender's
+    /// or `TELEGRAM_MAX_VIDEO_DURATION_SECS` bail (the same limits the parser
+    /// checks). An authorized sender's
     /// identical update would be silently dropped for this reason, so an
     /// unauthorized sender must not receive the approval notice for it
     /// either. Deliberately excluded from `message_has_processable_content`
@@ -4918,6 +4927,14 @@ impl TelegramChannel {
         if let Some(attachment) = Self::parse_attachment_metadata(message)
             && let Some(size) = attachment.file_size
             && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            return true;
+        }
+        if let Some(attachment) = Self::parse_attachment_metadata(message)
+            && attachment.kind == IncomingAttachmentKind::Video
+            && attachment
+                .duration_secs
+                .is_some_and(|duration| duration > TELEGRAM_MAX_VIDEO_DURATION_SECS)
         {
             return true;
         }
@@ -5291,6 +5308,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 file_size,
                 caption,
                 mime_type,
+                duration_secs: None,
                 kind: IncomingAttachmentKind::Document,
             });
         }
@@ -5310,7 +5328,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 file_size,
                 caption,
                 mime_type: None,
+                duration_secs: None,
                 kind: IncomingAttachmentKind::Photo,
+            });
+        }
+
+        if let Some(video) = message.get("video").or_else(|| message.get("video_note")) {
+            let file_id = video.get("file_id")?.as_str()?.to_string();
+            let file_name = video
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let file_size = video.get("file_size").and_then(serde_json::Value::as_u64);
+            let mime_type = video
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+                .or_else(|| Some("video/mp4".to_string()));
+            let duration_secs = video.get("duration").and_then(serde_json::Value::as_u64);
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name,
+                file_size,
+                caption,
+                mime_type,
+                duration_secs,
+                kind: IncomingAttachmentKind::Video,
             });
         }
 
@@ -5334,7 +5381,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         message_id: i64,
         disambiguate_document_name: bool,
     ) -> AttachmentMaterialization {
-        if self.text_only && attachment.kind != IncomingAttachmentKind::Photo {
+        if self.text_only
+            && !matches!(
+                attachment.kind,
+                IncomingAttachmentKind::Photo | IncomingAttachmentKind::Video
+            )
+        {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5357,12 +5409,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return AttachmentMaterialization::SkipPermanent;
         }
 
+        if attachment.kind == IncomingAttachmentKind::Video
+            && attachment
+                .duration_secs
+                .is_some_and(|duration| duration > TELEGRAM_MAX_VIDEO_DURATION_SECS)
+        {
+            return AttachmentMaterialization::SkipPermanent;
+        }
+
+        if self.text_only
+            && disambiguate_document_name
+            && attachment.kind == IncomingAttachmentKind::Video
+        {
+            return AttachmentMaterialization::SkipPermanent;
+        }
+
         // Routed aliases cannot safely write here: one Telegram listener serves
         // several agents, and this workspace belongs to the alias, not the
         // selected chat. Keep those image bytes in the typed message envelope;
         // the resolved agent's media pipeline owns persistent materialization.
         if self.text_only {
-            return self.download_routed_photo(attachment).await;
+            return self.download_routed_media(attachment).await;
         }
 
         // Ensure workspace directory is configured for a single-owner alias.
@@ -5490,14 +5557,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
-    /// Download a routed photo into memory only. The agent that owns the chat
+    /// Download routed media into memory only. The agent that owns the chat
     /// has not been resolved yet, so durable storage belongs to the later
     /// agent-scoped media pipeline.
-    async fn download_routed_photo(
+    async fn download_routed_media(
         &self,
         attachment: &IncomingAttachment,
     ) -> AttachmentMaterialization {
-        if attachment.kind != IncomingAttachmentKind::Photo {
+        if !matches!(
+            attachment.kind,
+            IncomingAttachmentKind::Photo | IncomingAttachmentKind::Video
+        ) {
             return AttachmentMaterialization::SkipPermanent;
         }
         let file_path = match self.get_file_path(&attachment.file_id).await {
@@ -5544,17 +5614,47 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let ext = file_path
             .rsplit_once('.')
             .map(|(_, ext)| ext.to_ascii_lowercase())
-            .filter(|ext| matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif"))
-            .unwrap_or_else(|| "jpg".to_string());
-        let mime_type = match ext.as_str() {
-            "png" => "image/png",
-            "webp" => "image/webp",
-            "gif" => "image/gif",
+            .filter(|ext| match attachment.kind {
+                IncomingAttachmentKind::Photo => {
+                    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif")
+                }
+                IncomingAttachmentKind::Video => {
+                    matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "webm")
+                }
+                IncomingAttachmentKind::Document => false,
+            })
+            .unwrap_or_else(|| {
+                if attachment.kind == IncomingAttachmentKind::Video {
+                    "mp4".to_string()
+                } else {
+                    "jpg".to_string()
+                }
+            });
+        let fallback_mime = match (attachment.kind, ext.as_str()) {
+            (IncomingAttachmentKind::Video, "webm") => "video/webm",
+            (IncomingAttachmentKind::Video, "mov") => "video/quicktime",
+            (IncomingAttachmentKind::Video, _) => "video/mp4",
+            (_, "png") => "image/png",
+            (_, "webp") => "image/webp",
+            (_, "gif") => "image/gif",
             _ => "image/jpeg",
         };
-        let display_name = format!("telegram_photo_{}.{ext}", uuid::Uuid::new_v4());
+        let mime_type = attachment
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| fallback_mime.to_string());
+        let prefix = if attachment.kind == IncomingAttachmentKind::Video {
+            "telegram_video"
+        } else {
+            "telegram_photo"
+        };
+        let display_name = format!("{prefix}_{}.{ext}", uuid::Uuid::new_v4());
         AttachmentMaterialization::Ready {
-            content: "[Photo attached]".to_string(),
+            content: if attachment.kind == IncomingAttachmentKind::Video {
+                "[Video attached]".to_string()
+            } else {
+                "[Photo attached]".to_string()
+            },
             attachment: zeroclaw_api::media::MediaAttachment {
                 file_name: display_name,
                 data,
@@ -5669,10 +5769,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 attachment,
             } => (content, attachment),
             AttachmentMaterialization::SkipPermanent => {
-                if self.text_only && attachment.kind == IncomingAttachmentKind::Photo {
+                if self.text_only
+                    && matches!(
+                        attachment.kind,
+                        IncomingAttachmentKind::Photo | IncomingAttachmentKind::Video
+                    )
+                {
                     let thread_id = Self::topic_thread_id(message);
-                    self.notify_routed_photo_drop(&chat_id, thread_id.as_deref())
-                        .await;
+                    if attachment.kind == IncomingAttachmentKind::Video {
+                        self.notify_routed_video_drop(&chat_id, thread_id.as_deref())
+                            .await;
+                    } else {
+                        self.notify_routed_photo_drop(&chat_id, thread_id.as_deref())
+                            .await;
+                    }
                 }
                 return UpdateDisposition::SkipPermanent;
             }
@@ -5778,6 +5888,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let mut contents = Vec::with_capacity(ordered.len());
         let mut attachments = Vec::with_capacity(ordered.len());
         let mut dropped_photo = false;
+        let mut dropped_video = false;
         for update in ordered {
             let Some(message) = update.get("message") else {
                 continue;
@@ -5802,6 +5913,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 AttachmentMaterialization::SkipPermanent => {
                     dropped_photo |=
                         self.text_only && attachment.kind == IncomingAttachmentKind::Photo;
+                    dropped_video |=
+                        self.text_only && attachment.kind == IncomingAttachmentKind::Video;
                 }
                 AttachmentMaterialization::RetryTransient => {
                     return UpdateDisposition::RetryTransient;
@@ -5818,6 +5931,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         {
             let thread_id = Self::topic_thread_id(anchor_message);
             self.notify_routed_photo_drop(&chat_id, thread_id.as_deref())
+                .await;
+        }
+
+        if dropped_video
+            && let Some(chat_id) = anchor_message
+                .get("chat")
+                .and_then(|chat| chat.get("id"))
+                .and_then(serde_json::Value::as_i64)
+                .map(|id| id.to_string())
+        {
+            let thread_id = Self::topic_thread_id(anchor_message);
+            self.notify_routed_video_drop(&chat_id, thread_id.as_deref())
                 .await;
         }
 
@@ -5890,7 +6015,33 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// photo. Transient failures remain retries and do not send duplicate
     /// notices.
     async fn notify_routed_photo_drop(&self, chat_id: &str, thread_id: Option<&str>) {
-        let notice = i18n::get_required_cli_string("channel-telegram-photo-drop-failed");
+        self.notify_routed_media_drop(
+            chat_id,
+            thread_id,
+            "channel-telegram-photo-drop-failed",
+            "photo",
+        )
+        .await;
+    }
+
+    async fn notify_routed_video_drop(&self, chat_id: &str, thread_id: Option<&str>) {
+        self.notify_routed_media_drop(
+            chat_id,
+            thread_id,
+            "channel-telegram-video-drop-failed",
+            "video",
+        )
+        .await;
+    }
+
+    async fn notify_routed_media_drop(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        notice_key: &str,
+        media_kind: &str,
+    ) {
+        let notice = i18n::get_required_cli_string(notice_key);
         let attempt = self.send_text_chunks(&notice, chat_id, thread_id, 0);
         match tokio::time::timeout(self.voice_drop_notice_timeout, attempt).await {
             Ok(Ok(_)) => {}
@@ -5901,8 +6052,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "error": zeroclaw_runtime::security::scrub(&format!("{error}")),
+                            "media_kind": media_kind,
                         })),
-                    "Failed to notify sender about skipped Telegram photo"
+                    "Failed to notify sender about skipped Telegram media"
                 );
             }
             Err(_) => {
@@ -5912,8 +6064,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
                             "timeout_secs": self.voice_drop_notice_timeout.as_secs_f64(),
+                            "media_kind": media_kind,
                         })),
-                    "Timed out notifying sender about skipped Telegram photo"
+                    "Timed out notifying sender about skipped Telegram media"
                 );
             }
         }

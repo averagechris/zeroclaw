@@ -7433,7 +7433,7 @@ pub struct MediaPipelineConfig {
     #[serde(default = "default_true")]
     pub describe_images: bool,
 
-    /// Summarize video attachments (placeholder — requires external API).
+    /// Inspect bounded video attachments with local ffmpeg/ffprobe processing.
     #[serde(default = "default_true")]
     pub summarize_video: bool,
 }

@@ -1110,6 +1110,7 @@ channel-telegram-voice-drop-too-long = ⚠️ 音声メッセージをスキッ�
 channel-telegram-voice-drop-file-unavailable = ⚠️ 音声メッセージをスキップしました: Telegram からファイルを取得できませんでした。大きすぎるか、すでに利用できない可能性があります。より小さいか短いファイルでお試しください。
 channel-telegram-voice-drop-empty-transcript = ⚠️ 音声メッセージをスキップしました: 録音から何も認識できませんでした。より明瞭な録音でもう一度お試しください。
 channel-telegram-photo-drop-failed = ⚠️ 写真を読み取れませんでした。もう一度送信してください。
+channel-telegram-video-drop-failed = ⚠️ 動画を処理できませんでした。2分未満、20 MB 未満の動画を送信してください。
 channel-discord-approval-btn-allow-once = 今回のみ許可
 channel-discord-approval-btn-allow-session = このセッションのみ許可
 channel-discord-approval-btn-allow-always = 常に許可
