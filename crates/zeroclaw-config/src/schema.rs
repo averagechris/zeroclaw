@@ -5081,9 +5081,13 @@ impl Config {
                 !profile.allowed_tools.is_empty()
                     && profile.allowed_tools.iter().all(|tool| matches!(
                         tool.as_str(),
-                        "memory_recall" | "memory_store" | "memory_forget" | "web_search_tool"
+                        "memory_recall"
+                            | "memory_store"
+                            | "memory_forget"
+                            | "web_search_tool"
+                            | "reaction"
                     )),
-                "Telegram invitation templates only allow memory tools and web search"
+                "Telegram invitation templates only allow memory tools, web search, and scoped reactions"
             );
             anyhow::ensure!(
                 !tg.routes

@@ -673,13 +673,26 @@ fn build_telegram_ack_reaction_request(
     message_id: i64,
     emoji: &str,
 ) -> serde_json::Value {
+    build_telegram_reaction_request(chat_id, message_id, Some(emoji))
+}
+
+fn build_telegram_reaction_request(
+    chat_id: &str,
+    message_id: i64,
+    emoji: Option<&str>,
+) -> serde_json::Value {
+    let reaction = emoji
+        .map(|emoji| {
+            vec![serde_json::json!({
+                "type": "emoji",
+                "emoji": emoji,
+            })]
+        })
+        .unwrap_or_default();
     serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
-        "reaction": [{
-            "type": "emoji",
-            "emoji": emoji
-        }]
+        "reaction": reaction,
     })
 }
 
@@ -3202,6 +3215,76 @@ impl TelegramChannel {
         } else {
             (reply_target.to_string(), None)
         }
+    }
+
+    fn parse_reaction_chat_id(channel_id: &str) -> anyhow::Result<(String, i64)> {
+        let (chat_id, thread_id) = Self::parse_reply_target(channel_id);
+        if let Some(thread_id) = thread_id.as_deref()
+            && (thread_id.contains(':') || thread_id.parse::<i64>().is_err())
+        {
+            anyhow::bail!("Telegram reaction target has an invalid thread identifier");
+        }
+        let numeric_chat_id = chat_id
+            .parse::<i64>()
+            .context("Telegram reaction target is not a numeric chat ID")?;
+        Ok((numeric_chat_id.to_string(), numeric_chat_id))
+    }
+
+    fn parse_reaction_message_id(chat_id: i64, message_id: &str) -> anyhow::Result<i64> {
+        let platform_message_id = if let Some(synthetic) = message_id.strip_prefix("telegram_") {
+            let (synthetic_chat_id, platform_message_id) = synthetic
+                .rsplit_once('_')
+                .ok_or_else(|| anyhow::Error::msg("invalid synthetic Telegram message ID"))?;
+            let synthetic_chat_id = synthetic_chat_id
+                .parse::<i64>()
+                .context("synthetic Telegram message ID has an invalid chat ID")?;
+            if synthetic_chat_id != chat_id {
+                anyhow::bail!("synthetic Telegram message ID belongs to a different chat");
+            }
+            platform_message_id
+        } else {
+            message_id
+        };
+        let platform_message_id = platform_message_id
+            .parse::<i64>()
+            .context("Telegram reaction message ID is not numeric")?;
+        if platform_message_id <= 0 {
+            anyhow::bail!("Telegram reaction message ID must be positive");
+        }
+        Ok(platform_message_id)
+    }
+
+    async fn set_message_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (chat_id, numeric_chat_id) = Self::parse_reaction_chat_id(channel_id)?;
+        let message_id = Self::parse_reaction_message_id(numeric_chat_id, message_id)?;
+        let body = build_telegram_reaction_request(&chat_id, message_id, emoji);
+        let response = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| error.without_url())?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("Telegram setMessageReaction failed with HTTP status {status}");
+        }
+        let response_body: serde_json::Value =
+            response.json().await.map_err(|error| error.without_url())?;
+        if !Self::telegram_api_envelope_ok(&response_body)
+            || response_body
+                .get("result")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            anyhow::bail!("Telegram setMessageReaction returned a non-ok response");
+        }
+        Ok(())
     }
 
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
@@ -7598,6 +7681,29 @@ impl Channel for TelegramChannel {
         self.stream_mode == StreamMode::MultiMessage
     }
 
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.set_message_reaction(channel_id, message_id, Some(emoji))
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        // The Bot API sets the bot's chosen reaction set; an empty set clears
+        // the bot reaction. Telegram bots can choose only one reaction per
+        // message, so there is no separate per-emoji removal operation.
+        self.set_message_reaction(channel_id, message_id, None)
+            .await
+    }
+
     fn supports_turn_flush_narration(&self) -> bool {
         // Telegram is the only channel that implements `flush_draft_turn` /
         // `discard_draft_turn`; scope the orchestrator's narration-policy +
@@ -9280,6 +9386,146 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_reaction_target_preserves_forum_chat_and_validates_message_scope() {
+        let (chat_id, numeric_chat_id) = TelegramChannel::parse_reaction_chat_id("-100200300:9")
+            .expect("forum target should resolve to its chat");
+        assert_eq!(chat_id, "-100200300");
+        assert_eq!(numeric_chat_id, -100200300);
+        assert_eq!(
+            TelegramChannel::parse_reaction_message_id(numeric_chat_id, "42")
+                .expect("native message ID should parse"),
+            42
+        );
+        assert_eq!(
+            TelegramChannel::parse_reaction_message_id(numeric_chat_id, "telegram_-100200300_43")
+                .expect("matching synthetic message ID should parse"),
+            43
+        );
+        assert!(
+            TelegramChannel::parse_reaction_message_id(numeric_chat_id, "telegram_-100200301_43")
+                .is_err()
+        );
+        assert!(TelegramChannel::parse_reaction_chat_id("-100200300:9:10").is_err());
+    }
+
+    #[test]
+    fn telegram_reaction_request_supports_add_and_clear() {
+        let add = build_telegram_reaction_request("-100200300", 42, Some("😆"));
+        assert_eq!(add["chat_id"], "-100200300");
+        assert_eq!(add["message_id"], 42);
+        assert_eq!(add["reaction"][0]["type"], "emoji");
+        assert_eq!(add["reaction"][0]["emoji"], "😆");
+
+        let remove = build_telegram_reaction_request("-100200300", 42, None);
+        assert_eq!(remove["chat_id"], "-100200300");
+        assert_eq!(remove["message_id"], 42);
+        assert_eq!(remove["reaction"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_tool_methods_call_api_for_private_group_and_thread_targets() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/botfake-token/setMessageReaction"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = request.body_json().expect("valid request JSON");
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true,
+                    "received": body,
+                }))
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "home",
+            Arc::new(Vec::<String>::new),
+            false,
+        )
+        .with_mock_api_base(server.uri());
+
+        channel
+            .add_reaction("12345", "42", "😆")
+            .await
+            .expect("private chat reaction should succeed");
+        channel
+            .add_reaction("-100200300:9", "telegram_-100200300_43", "😆")
+            .await
+            .expect("group forum reaction should retain the chat and message");
+        channel
+            .remove_reaction("-100200300:9", "44", "😆")
+            .await
+            .expect("group forum reaction removal should succeed");
+        assert!(
+            channel
+                .add_reaction("-100200300:9", "telegram_-100200301_45", "😆")
+                .await
+                .is_err()
+        );
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 3);
+        let bodies = requests
+            .iter()
+            .map(|request| {
+                request
+                    .body_json::<serde_json::Value>()
+                    .expect("request JSON")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bodies[0]["chat_id"], "12345");
+        assert_eq!(bodies[0]["message_id"], 42);
+        assert_eq!(bodies[1]["chat_id"], "-100200300");
+        assert_eq!(bodies[1]["message_id"], 43);
+        assert_eq!(bodies[2]["chat_id"], "-100200300");
+        assert_eq!(bodies[2]["message_id"], 44);
+        assert_eq!(bodies[2]["reaction"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_tool_propagates_http_and_api_failures() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for response in [
+            ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "service unavailable",
+            })),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "failure at https://api.telegram.org/botfake-token/hidden",
+            })),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/botfake-token/setMessageReaction"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "home",
+                Arc::new(Vec::<String>::new),
+                false,
+            )
+            .with_mock_api_base(server.uri());
+            let error = channel
+                .add_reaction("12345", "42", "😆")
+                .await
+                .expect_err("Telegram API failure should propagate")
+                .to_string();
+            assert!(!error.contains("fake-token"));
+        }
     }
 
     #[test]
