@@ -285,9 +285,9 @@ static routes take precedence and cannot be changed by enrollment commands.
 
 Use an exact positive numeric owner ID, plus two enabled, unbound agent
 templates. Templates must use private default workspaces, no cross-agent
-memory grants or external bundles, and a risk profile allowing only memory
-and optional `web_search_tool` tools. Full autonomy is rejected. Generated
-agents cannot delegate to other agents.
+memory grants or external bundles, and a risk profile allowing memory tools
+and optional `web_search_tool` and `reaction` tools. Full autonomy is rejected.
+Generated agents cannot delegate to other agents.
 
 ```toml
 [agents.guest_template]
@@ -299,7 +299,7 @@ model_provider = "openai.codex"
 risk_profile = "guests"
 
 [risk_profiles.guests]
-allowed_tools = ["memory_recall", "memory_store", "memory_forget"]
+allowed_tools = ["memory_recall", "memory_store", "memory_forget", "reaction"]
 auto_approve = ["memory_recall", "memory_store"]
 
 [channels.telegram.home]
@@ -335,6 +335,13 @@ link as a temporary access credential: whoever redeems it first gets access.
 Enrollment controls bypass the model. Edited, forwarded, anonymous-admin,
 and bot-authored enrollment commands cannot grant access. Explicit peer deny
 entries still apply. This mode is text-only, like static routed aliases.
+
+When `reaction` is allowed, it can only target a message in the current
+Telegram conversation; the runtime supplies the chat and channel alias. The
+agent may choose a message and emoji, but should react sparingly, only when
+funny or contextually relevant. Reactions are never automatic receipt
+acknowledgments. Use the risk profile's normal approval settings to decide
+whether each reaction needs approval.
 
 Memberships and hashed invite tokens live in
 `<data_dir>/telegram-memberships/<alias>.sqlite3`, outside the declarative
@@ -418,6 +425,7 @@ logging is enabled, events are also written under the install directory at
 | A routed alias ignores one chat | The chat has no exact route. The log says `dropping inbound message: no agent owns this channel`. Check the chat's numeric ID, and for a private chat that the sender's ID is the same number. |
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
 | Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
+| Partial streaming shows typing before a reply appears | Telegram waits for a useful answer chunk before creating the visible message. Short replies are sent when generation finishes. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |
 | Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). The shared session shares its controls: any member's `/new` resets the conversation for the whole group/topic, and a session-level `/model` override applies to every member, while `/stop` stays personal to each sender. Direct messages are unaffected. |
 

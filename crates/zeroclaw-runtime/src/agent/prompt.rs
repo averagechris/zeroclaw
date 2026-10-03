@@ -93,7 +93,7 @@ pub struct InteractionContext {
     persistence: SessionPersistence,
 }
 
-pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user. A leading `[CURRENT DATE & TIME: ...]` line is timestamp metadata added by the runtime, not log or API data. Treat it as part of the conversation and respond naturally and directly.\n\n";
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
@@ -150,7 +150,7 @@ fn full_autonomy_safety_lines(always_ask: &[String]) -> String {
     } else if always_ask.is_empty() {
         lines.push_str(
             "- No tools are listed in `always_ask`.\n\
-             - Execute tools and actions directly — no extra approval needed.\n\
+             - Execute tools and actions directly. No extra approval is needed.\n\
              - You have full access to all configured tools. Use them confidently to accomplish tasks.\n",
         );
     } else {
@@ -159,11 +159,11 @@ fn full_autonomy_safety_lines(always_ask: &[String]) -> String {
         );
         lines.push_str(&always_ask.join(", "));
         lines.push_str(
-            ".\n- Execute uncovered tools directly — no extra approval needed for those.\n",
+            ".\n- Execute uncovered tools directly. No extra approval is needed for them.\n",
         );
     }
     lines.push_str(
-        "- Only refuse an action if the runtime explicitly rejects it — do not preemptively decline.",
+        "- Refuse an action only when the runtime rejects it. Do not preemptively decline.",
     );
     lines
 }
@@ -368,7 +368,7 @@ impl PromptSection for ToolHonestySection {
         Ok(
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
-             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - If a tool call fails, report the error. Never invent data to fill the gap.\n\
              - When unsure whether a tool call succeeded, ask the user rather than guessing."
                 .into(),
         )
@@ -452,7 +452,7 @@ impl PromptSection for SafetySection {
             AutonomyLevel::Supervised => {
                 out.push_str(
                     "- Ask for approval when the runtime policy requires it for the specific action.\n\
-                     - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
+                     - Do not preemptively refuse actions. Attempt them and let the runtime enforce restrictions.\n\
                      - Use available tools confidently; the security policy will enforce boundaries.",
                 );
             }
@@ -580,9 +580,9 @@ impl PromptSection for ChannelMediaSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok("## Channel Media Markers\n\n\
             Messages from channels may contain media markers:\n\
-            - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
-            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
-            - `[Document: <name>] <path>` — A file attachment saved to the workspace."
+            - `[Voice] <text>`: The user sent a voice or audio message that has already been transcribed. Respond to its content directly.\n\
+            - `[IMAGE:<path>]`: An image attachment processed by the vision pipeline.\n\
+            - `[Document: <name>] <path>`: A file attachment saved to the workspace."
             .into())
     }
 }

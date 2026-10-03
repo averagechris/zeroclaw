@@ -33,9 +33,11 @@ impl Tool for ReactionTool {
     }
 
     fn description(&self) -> &str {
-        "Add or remove an emoji reaction on a message in any active channel. \
-         Provide the channel name (e.g. 'discord', 'slack'), the platform channel ID, \
-         the platform message ID, and the emoji (Unicode character or platform shortcode)."
+        "Add or remove an emoji reaction on a message in the current conversation. \
+         The runtime binds the channel and recipient to the incoming conversation; \
+         choose a message in that same conversation and an emoji. Use reactions \
+         sparingly, only when funny or contextually relevant. Never react as an \
+         automatic acknowledgment or receipt."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -44,11 +46,11 @@ impl Tool for ReactionTool {
             "properties": {
                 "channel": {
                     "type": "string",
-                    "description": "Name of the channel to react in (e.g. 'discord', 'slack', 'telegram')"
+                    "description": "Runtime-provided current channel; any supplied value is ignored"
                 },
                 "channel_id": {
                     "type": "string",
-                    "description": "Platform-specific channel/conversation identifier (e.g. Discord channel snowflake, Slack channel ID)"
+                    "description": "Runtime-provided current conversation; any supplied value is ignored"
                 },
                 "message_id": {
                     "type": "string",
@@ -64,7 +66,7 @@ impl Tool for ReactionTool {
                     "description": "Whether to add or remove the reaction (default: 'add')"
                 }
             },
-            "required": ["channel", "channel_id", "message_id", "emoji"]
+            "required": ["message_id", "emoji"]
         })
     }
 
@@ -316,8 +318,8 @@ mod tests {
         assert!(schema["properties"]["emoji"].is_object());
         assert!(schema["properties"]["action"].is_object());
         let required = schema["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "channel"));
-        assert!(required.iter().any(|v| v == "channel_id"));
+        assert!(!required.iter().any(|v| v == "channel"));
+        assert!(!required.iter().any(|v| v == "channel_id"));
         assert!(required.iter().any(|v| v == "message_id"));
         assert!(required.iter().any(|v| v == "emoji"));
         // action is optional (defaults to "add")
@@ -435,7 +437,8 @@ mod tests {
             Arc::new(MockChannel::new()) as Arc<dyn Channel>,
         )]);
 
-        // Missing channel
+        // Channel scope is injected by call preparation and is unavailable to
+        // direct execution without that runtime context.
         let result = tool
             .execute(json!({"channel_id": "c1", "message_id": "1", "emoji": "x"}))
             .await;

@@ -4,7 +4,9 @@
 
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
-use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
+use super::delivery_defaults::{
+    maybe_inject_channel_delivery_defaults, scope_reaction_to_current_conversation,
+};
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
 use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
@@ -226,6 +228,44 @@ pub(crate) async fn prepare_tool_calls(
             ctx.channel_reply_target,
         );
 
+        if let Err(reason) = scope_reaction_to_current_conversation(
+            &tool_name,
+            &mut tool_args,
+            ctx.channel_name,
+            ctx.channel
+                .map(zeroclaw_api::attribution::Attributable::alias),
+            ctx.channel_reply_target,
+        ) {
+            abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+            let message = crate::i18n::get_required_cli_string(reason.message_key());
+            let outcome = ToolExecutionOutcome {
+                output: message.clone(),
+                success: false,
+                error_reason: Some(message),
+                duration: Duration::ZERO,
+                receipt: None,
+                output_data: None,
+            };
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name,
+                        "trace_id": ctx.turn_id,
+                    })),
+                "reaction tool call rejected outside an active channel conversation"
+            );
+            if let Some(tx) = ctx.event_tx {
+                emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            ordered_results[idx] = Some((tool_name, call.tool_call_id.clone(), outcome));
+            continue;
+        }
+
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
 
         let requires_prompt = ctx
@@ -407,6 +447,7 @@ mod tests {
     use crate::agent::turn::context::TurnCtx;
     use crate::agent::turn::post_exec::record_executed_outcomes;
     use crate::agent::turn::{DraftEvent, StreamDelta};
+    use crate::hooks::{HookHandler, HookResult, HookRunner};
     use crate::observability::NoopObserver;
     use crate::skills::SkillTool;
     use crate::tools::skill_tool::SkillBuiltinTool;
@@ -416,7 +457,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
-    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role, ToolProvenance};
+    use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
     use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
     use zeroclaw_tool_call_parser::ParsedToolCall;
 
@@ -467,6 +509,17 @@ mod tests {
         pacing: &'a PacingConfig,
         on_delta: &'a mpsc::Sender<DraftEvent>,
     ) -> TurnCtx<'a> {
+        test_ctx_with_origin(observer, pacing, on_delta, "test", None, None)
+    }
+
+    fn test_ctx_with_origin<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        on_delta: &'a mpsc::Sender<DraftEvent>,
+        channel_name: &'a str,
+        channel_reply_target: Option<&'a str>,
+        channel: Option<&'a dyn Channel>,
+    ) -> TurnCtx<'a> {
         TurnCtx {
             observer,
             provider_name: "test",
@@ -474,8 +527,8 @@ mod tests {
             context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(0),
             temperature: None,
             approval: None,
-            channel_name: "test",
-            channel_reply_target: None,
+            channel_name,
+            channel_reply_target,
             cancellation_token: None,
             on_delta: Some(on_delta),
             event_tx: None,
@@ -483,7 +536,7 @@ mod tests {
             dedup_exempt_tools: &[],
             pacing,
             strict_tool_parsing: false,
-            channel: None,
+            channel,
             draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
@@ -491,6 +544,156 @@ mod tests {
             serving_provider_name: None,
             serving_model: None,
         }
+    }
+
+    struct ScopeChannel;
+
+    impl Attributable for ScopeChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::Telegram)
+        }
+
+        fn alias(&self) -> &str {
+            "home"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ScopeChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SpoofReactionScopeHook;
+
+    #[async_trait]
+    impl HookHandler for SpoofReactionScopeHook {
+        fn name(&self) -> &str {
+            "spoof-reaction-scope"
+        }
+
+        async fn before_tool_call(
+            &self,
+            name: String,
+            mut args: serde_json::Value,
+        ) -> HookResult<(String, serde_json::Value)> {
+            if name == "reaction"
+                && let Some(object) = args.as_object_mut()
+            {
+                object.insert(
+                    "channel".to_string(),
+                    serde_json::Value::String("telegram.other".to_string()),
+                );
+                object.insert(
+                    "channel_id".to_string(),
+                    serde_json::Value::String("-100999".to_string()),
+                );
+            }
+            HookResult::Continue((name, args))
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_call_prep_overrides_model_channel_and_recipient() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let channel = ScopeChannel;
+        let mut ctx = test_ctx_with_origin(
+            &observer,
+            &pacing,
+            &tx,
+            "telegram",
+            Some("-100123:9"),
+            Some(&channel),
+        );
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(SpoofReactionScopeHook));
+        ctx.hooks = Some(&hooks);
+        let tool_calls = [ParsedToolCall {
+            name: "reaction".to_string(),
+            arguments: serde_json::json!({
+                "channel": "telegram.other",
+                "channel_id": "-100999",
+                "message_id": "telegram_-100123_42",
+                "emoji": "😆",
+            }),
+            tool_call_id: Some("reaction-1".to_string()),
+        }];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &tool_calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("scoped reaction should be prepared");
+
+        assert_eq!(prepared.executable_calls.len(), 1);
+        let args = &prepared.executable_calls[0].arguments;
+        assert_eq!(args["channel"], "telegram.home");
+        assert_eq!(args["channel_id"], "-100123:9");
+        assert_eq!(args["message_id"], "telegram_-100123_42");
+        assert_eq!(args["emoji"], "😆");
+    }
+
+    #[tokio::test]
+    async fn reaction_call_prep_rejects_missing_conversation_context() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let ctx = test_ctx(&observer, &pacing, &tx);
+        let tool_calls = [ParsedToolCall {
+            name: "reaction".to_string(),
+            arguments: serde_json::json!({
+                "channel": "telegram.other",
+                "channel_id": "private-chat",
+                "message_id": "42",
+                "emoji": "😆",
+            }),
+            tool_call_id: Some("reaction-2".to_string()),
+        }];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &tool_calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        )
+        .await
+        .expect("unscoped reaction should become a tool result");
+
+        assert!(prepared.executable_calls.is_empty());
+        let (_, _, outcome) = prepared.ordered_results[0]
+            .as_ref()
+            .expect("rejection should occupy the original result slot");
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("active channel conversation"));
     }
 
     async fn emitted_tool_provenance(
