@@ -1080,7 +1080,7 @@ mod tests {
         );
         assert!(prompt.contains("shell"));
         assert!(prompt.contains("authorized to call"));
-        assert!(prompt.contains("simulated"));
+        assert!(prompt.contains("call the tool unless it is listed in `always_ask`"));
     }
 
     #[test]
@@ -1108,7 +1108,7 @@ mod tests {
             "Full-autonomy block must authorize *attempting* the tool"
         );
         assert!(
-            auth.contains("not self-refuse") || auth.contains("do NOT self-refuse"),
+            auth.contains("Do not preemptively refuse with claims"),
             "block must tell the model not to self-refuse merely for using shell/file tooling"
         );
         // Must keep the runtime safeguards explicit.
