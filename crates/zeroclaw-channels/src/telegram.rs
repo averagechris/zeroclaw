@@ -50,6 +50,297 @@ const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 
 /// Prefix for synthetic draft ids returned by `send_draft` in MultiMessage mode.
 const TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+/// Prefix for Telegram Partial drafts that have not necessarily created a
+/// visible Telegram message yet.
+const TELEGRAM_PARTIAL_DRAFT_PREFIX: &str = "partial_draft:";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PartialDraftKey {
+    recipient: String,
+    draft_id: String,
+}
+
+enum PartialDraftCommand {
+    Update {
+        text: String,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<bool>>,
+    },
+    Finish(tokio::sync::oneshot::Sender<PartialDraftFinish>),
+}
+
+#[derive(Debug)]
+struct PartialDraftFinish {
+    message_id: Option<String>,
+    accepted_text: Option<String>,
+    accepted_without_message_id: bool,
+    delivery_unknown: bool,
+}
+
+#[derive(Clone)]
+struct PartialDraftHandle {
+    commands: tokio::sync::mpsc::Sender<PartialDraftCommand>,
+}
+
+impl PartialDraftHandle {
+    fn key(recipient: &str, draft_id: &str) -> PartialDraftKey {
+        PartialDraftKey {
+            recipient: recipient.to_string(),
+            draft_id: draft_id.to_string(),
+        }
+    }
+}
+
+fn is_useful_telegram_partial_chunk(text: &str) -> bool {
+    let text = text.trim();
+    let character_count = text.chars().count();
+    character_count >= 32
+        || (character_count >= 12
+            && text
+                .chars()
+                .last()
+                .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？')))
+}
+
+fn truncate_telegram_partial_text(text: &str) -> &str {
+    if text.len() <= TELEGRAM_MAX_MESSAGE_LENGTH {
+        return text;
+    }
+
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let next = index + character.len_utf8();
+        if next > TELEGRAM_MAX_MESSAGE_LENGTH {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+async fn run_telegram_partial_draft_worker(
+    client: reqwest::Client,
+    send_url: String,
+    edit_url: String,
+    typing_url: String,
+    chat_id: String,
+    thread_id: Option<String>,
+    update_interval: Duration,
+    allow_text_stream: bool,
+    mut commands: tokio::sync::mpsc::Receiver<PartialDraftCommand>,
+) {
+    let mut typing_active = true;
+    let mut typing_interval = tokio::time::interval(Duration::from_secs(4));
+    typing_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut wire_message_id: Option<String> = None;
+    let mut accepted_without_message_id = false;
+    let mut delivery_unknown = false;
+    let mut accepted_text: Option<String> = None;
+    let mut latest_text = String::new();
+    let mut last_edit: Option<tokio::time::Instant> = None;
+    let mut edit_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let no_edit_deadline = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+        let deadline = edit_deadline.unwrap_or(no_edit_deadline);
+        tokio::select! {
+            biased;
+            command = commands.recv() => {
+                let Some(command) = command else { break; };
+                match command {
+                    PartialDraftCommand::Update { text, reply } => {
+                        latest_text = text;
+                        let result = if wire_message_id.is_none()
+                            && !accepted_without_message_id
+                            && !delivery_unknown
+                            && allow_text_stream
+                            && is_useful_telegram_partial_chunk(&latest_text)
+                        {
+                            let mut body = serde_json::json!({
+                                "chat_id": chat_id,
+                                "text": truncate_telegram_partial_text(&latest_text),
+                            });
+                            if let Some(thread_id) = thread_id.as_deref() {
+                                body["message_thread_id"] = serde_json::Value::String(thread_id.to_string());
+                            }
+                            match client.post(&send_url).json(&body).send().await {
+                                Ok(response) if response.status().is_success() => {
+                                    match response.json::<serde_json::Value>().await {
+                                        Ok(value)
+                                            if value
+                                                .get("ok")
+                                                .and_then(serde_json::Value::as_bool)
+                                                == Some(false) =>
+                                        {
+                                            let description = value
+                                                .get("description")
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("Telegram rejected the message");
+                                            ::zeroclaw_log::record!(
+                                                DEBUG,
+                                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                                    .with_attrs(::serde_json::json!({"description": zeroclaw_runtime::security::scrub(description)})),
+                                                "Telegram sendMessage (partial draft) rejected"
+                                            );
+                                            Ok(false)
+                                        }
+                                        Ok(value)
+                                            if value
+                                                .get("ok")
+                                                .and_then(serde_json::Value::as_bool)
+                                                == Some(true) =>
+                                        {
+                                            wire_message_id = value
+                                                .get("result")
+                                                .and_then(|result| result.get("message_id"))
+                                                .and_then(serde_json::Value::as_i64)
+                                                .map(|id| id.to_string());
+                                            accepted_without_message_id = wire_message_id.is_none();
+                                            accepted_text = Some(
+                                                truncate_telegram_partial_text(&latest_text).to_string(),
+                                            );
+                                            typing_active = false;
+                                            last_edit = Some(tokio::time::Instant::now());
+                                            Ok(true)
+                                        }
+                                        Ok(_) | Err(_) => {
+                                            // The response does not prove acceptance, but
+                                            // the send may have reached Telegram. Do not
+                                            // retry a second partial message blindly.
+                                            delivery_unknown = true;
+                                            typing_active = false;
+                                            Ok(false)
+                                        }
+                                    }
+                                }
+                                Ok(response) => {
+                                    let status = response.status();
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                            .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                        "Telegram sendMessage (partial draft) failed"
+                                    );
+                                    Ok(false)
+                                }
+                                Err(_) => {
+                                    delivery_unknown = true;
+                                    typing_active = false;
+                                    Err(anyhow::Error::msg(
+                                        "Telegram partial draft send request failed",
+                                    ))
+                                }
+                            }
+                        } else if let Some(message_id) = wire_message_id.as_deref() {
+                            let now = tokio::time::Instant::now();
+                            let can_edit = last_edit
+                                .is_none_or(|last| now.duration_since(last) >= update_interval);
+                            if can_edit {
+                                let result = edit_telegram_partial_message(
+                                    &client,
+                                    &edit_url,
+                                    &chat_id,
+                                    message_id,
+                                    &latest_text,
+                                ).await;
+                                if matches!(result, Ok(true)) {
+                                    last_edit = Some(tokio::time::Instant::now());
+                                    edit_deadline = None;
+                                }
+                                result.map(|_| false)
+                            } else {
+                                edit_deadline = last_edit.map(|last| last + update_interval);
+                                Ok(false)
+                            }
+                        } else {
+                            Ok(false)
+                        };
+                        let _ = reply.send(result);
+                    }
+                    PartialDraftCommand::Finish(reply) => {
+                        let _ = reply.send(PartialDraftFinish {
+                            message_id: wire_message_id,
+                            accepted_text,
+                            accepted_without_message_id,
+                            delivery_unknown,
+                        });
+                        break;
+                    }
+                }
+            }
+            _ = typing_interval.tick(), if typing_active => {
+                let body = serde_json::json!({"chat_id": chat_id, "action": "typing"});
+                if client.post(&typing_url).json(&body).send().await.is_err() {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "Telegram partial draft typing action failed"
+                    );
+                }
+            }
+            _ = tokio::time::sleep_until(deadline), if edit_deadline.is_some() => {
+                if let Some(message_id) = wire_message_id.as_deref()
+                    && matches!(
+                        edit_telegram_partial_message(
+                            &client,
+                            &edit_url,
+                            &chat_id,
+                            message_id,
+                            &latest_text,
+                        ).await,
+                        Ok(true)
+                    ) {
+                    last_edit = Some(tokio::time::Instant::now());
+                }
+                edit_deadline = None;
+            }
+        }
+    }
+}
+
+async fn edit_telegram_partial_message(
+    client: &reqwest::Client,
+    edit_url: &str,
+    chat_id: &str,
+    message_id: &str,
+    text: &str,
+) -> anyhow::Result<bool> {
+    let id = match message_id.parse::<i64>() {
+        Ok(id) => id,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&error.to_string()), "message_id": message_id})),
+                "Invalid Telegram message_id for partial draft"
+            );
+            return Ok(false);
+        }
+    };
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": id,
+        "text": truncate_telegram_partial_text(text),
+    });
+    let response = client
+        .post(edit_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| anyhow::Error::msg("Telegram partial draft edit request failed"))?;
+    match TelegramChannel::classify_edit_message_response(response).await {
+        EditMessageResult::Success | EditMessageResult::NotModified => Ok(true),
+        EditMessageResult::Failed(status) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                "editMessageText failed"
+            );
+            Ok(false)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct MultiDraftKey {
@@ -943,6 +1234,9 @@ pub struct TelegramChannel {
     stream_mode: StreamMode,
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Active Telegram Partial drafts. The command worker owns the virtual
+    /// draft lifecycle, including its pending text and optional wire message.
+    partial_drafts: Mutex<std::collections::HashMap<PartialDraftKey, PartialDraftHandle>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
@@ -2570,6 +2864,7 @@ impl TelegramChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
+            partial_drafts: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
@@ -2787,6 +3082,36 @@ impl TelegramChannel {
 
     fn is_multi_message_synthetic_draft(message_id: &str) -> bool {
         message_id.starts_with(TELEGRAM_MULTI_MESSAGE_SYNTHETIC_PREFIX)
+    }
+
+    fn is_partial_synthetic_draft(message_id: &str) -> bool {
+        message_id.starts_with(TELEGRAM_PARTIAL_DRAFT_PREFIX)
+    }
+
+    async fn finish_partial_draft(
+        &self,
+        recipient: &str,
+        draft_id: &str,
+    ) -> anyhow::Result<Option<PartialDraftFinish>> {
+        let key = PartialDraftHandle::key(recipient, draft_id);
+        let handle = self.partial_drafts.lock().remove(&key);
+        let Some(handle) = handle else {
+            // A previous finalization or cancellation already claimed this
+            // virtual draft. Treat repeated terminal calls as idempotent.
+            return Ok(None);
+        };
+        let (reply, response) = tokio::sync::oneshot::channel();
+        handle
+            .commands
+            .send(PartialDraftCommand::Finish(reply))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg("Telegram partial draft worker stopped before finalization")
+            })?;
+        let finish = response.await.map_err(|_| {
+            anyhow::Error::msg("Telegram partial draft worker did not acknowledge finalization")
+        })?;
+        Ok(Some(finish))
     }
 
     /// Sleep out the remainder of `multi_message_delay_ms` since the last
@@ -7616,44 +7941,33 @@ impl Channel for TelegramChannel {
             StreamMode::Off => Ok(None),
             StreamMode::Partial => {
                 let (chat_id, thread_id) = Self::parse_reply_target(&message.recipient);
-                let initial_text = if message.content.is_empty() {
-                    "...".to_string()
-                } else {
-                    message.content.clone()
-                };
-
-                let mut body = serde_json::json!({
-                    "chat_id": chat_id,
-                    "text": initial_text,
-                });
-                if let Some(tid) = thread_id {
-                    body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-                }
-
-                let resp = self
-                    .http_client()
-                    .post(self.api_url("sendMessage"))
-                    .json(&body)
-                    .send()
-                    .await?;
-
-                if !resp.status().is_success() {
-                    let err = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("Telegram sendMessage (draft) failed: {err}");
-                }
-
-                let resp_json: serde_json::Value = resp.json().await?;
-                let message_id = resp_json
-                    .get("result")
-                    .and_then(|r| r.get("message_id"))
-                    .and_then(|id| id.as_i64())
-                    .map(|id| id.to_string());
-
-                self.last_draft_edit
-                    .lock()
-                    .insert(chat_id.to_string(), std::time::Instant::now());
-
-                Ok(message_id)
+                let draft_id = format!(
+                    "{TELEGRAM_PARTIAL_DRAFT_PREFIX}{}",
+                    uuid::Uuid::new_v4().as_simple()
+                );
+                let (commands, receiver) = tokio::sync::mpsc::channel(8);
+                self.partial_drafts.lock().insert(
+                    PartialDraftHandle::key(&message.recipient, &draft_id),
+                    PartialDraftHandle { commands },
+                );
+                let client = self.http_client();
+                let send_url = self.api_url("sendMessage");
+                let edit_url = self.api_url("editMessageText");
+                let typing_url = self.api_url("sendChatAction");
+                let update_interval = Duration::from_millis(self.draft_update_interval_ms);
+                let allow_text_stream = !self.destination_is_voice_peer(&message.recipient);
+                zeroclaw_spawn::spawn!(run_telegram_partial_draft_worker(
+                    client,
+                    send_url,
+                    edit_url,
+                    typing_url,
+                    chat_id,
+                    thread_id,
+                    update_interval,
+                    allow_text_stream,
+                    receiver,
+                ));
+                Ok(Some(draft_id))
             }
             StreamMode::MultiMessage => {
                 let draft_id = Self::new_multi_message_draft_id();
@@ -7677,6 +7991,32 @@ impl Channel for TelegramChannel {
             StreamMode::Off => Ok(()),
             StreamMode::Partial => {
                 let (chat_id, _) = Self::parse_reply_target(recipient);
+
+                if Self::is_partial_synthetic_draft(message_id) {
+                    let sender = self
+                        .partial_drafts
+                        .lock()
+                        .get(&PartialDraftHandle::key(recipient, message_id))
+                        .map(|draft| draft.commands.clone());
+                    let Some(sender) = sender else {
+                        return Ok(());
+                    };
+                    let (reply, response) = tokio::sync::oneshot::channel();
+                    if sender
+                        .send(PartialDraftCommand::Update {
+                            text: text.to_string(),
+                            reply,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err(anyhow::Error::msg("Telegram partial draft worker stopped"));
+                    }
+                    let _ = response.await.map_err(|_| {
+                        anyhow::Error::msg("Telegram partial draft worker stopped")
+                    })??;
+                    return Ok(());
+                }
 
                 // Rate-limit edits per chat
                 {
@@ -7819,19 +8159,20 @@ impl Channel for TelegramChannel {
 
     // No `update_draft_progress` override: raw legacy tool-status text (tool
     // name, arguments, paths, credential-shaped values) must never reach the Bot
-    // API, which cannot retract a sent message. The trait default no-op drops it;
-    // typed, policy-checked progress renders through `update_draft_lifecycle`
-    // below. Enforced by `raw_tool_status_never_reaches_telegram`.
+    // API, which cannot retract a sent message. Partial mode reserves its
+    // visible message for sanitized assistant narration; typed lifecycle status
+    // is intentionally ignored below. Enforced by
+    // `raw_tool_status_never_reaches_telegram`.
     async fn update_draft_lifecycle(
         &self,
-        recipient: &str,
-        message_id: &str,
-        event: ProgressEvent,
+        _recipient: &str,
+        _message_id: &str,
+        _event: ProgressEvent,
     ) -> anyhow::Result<()> {
-        if self.stream_mode == StreamMode::Partial {
-            let status_line = crate::util::localized_lifecycle_progress(event);
-            return self.update_draft(recipient, message_id, &status_line).await;
-        }
+        // Partial streams reserve the visible message for sanitized assistant
+        // narration. Replacing it with tool-status text both obscures the
+        // answer and consumes Telegram's edit budget; the per-draft typing loop
+        // communicates that work continues until the first visible chunk.
         Ok(())
     }
 
@@ -7850,6 +8191,44 @@ impl Channel for TelegramChannel {
 
         let text = &strip_tool_call_tags(text);
         let (chat_id, thread_id) = Self::parse_reply_target(recipient);
+        let (resolved_message_id, partial_already_delivered) = if Self::is_partial_synthetic_draft(
+            message_id,
+        ) {
+            let Some(finish) = self.finish_partial_draft(recipient, message_id).await? else {
+                return Ok(());
+            };
+            if finish.accepted_without_message_id {
+                let exact_short_text_match = finish.accepted_text.as_deref() == Some(text.as_str())
+                    && text.len() <= TELEGRAM_MAX_MESSAGE_LENGTH
+                    && parse_attachment_markers(text).1.is_empty()
+                    && parse_path_only_attachment(text).is_none()
+                    && (suppress_voice || self.tts_manager.is_none())
+                    && !self.destination_is_voice_peer(recipient);
+                if exact_short_text_match {
+                    (String::new(), true)
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Telegram accepted a partial draft without returning its message ID; final delivery may duplicate the visible prefix"
+                    );
+                    (String::new(), false)
+                }
+            } else if finish.delivery_unknown {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Telegram partial draft send outcome is unknown; final delivery may duplicate a visible prefix"
+                );
+                (String::new(), false)
+            } else {
+                (finish.message_id.unwrap_or_default(), false)
+            }
+        } else {
+            (message_id.to_string(), false)
+        };
 
         // Queue TTS voice reply — immediate mode since text is already final.
         // Skipped when suppress_voice is set (explicit text-only routing override).
@@ -7863,7 +8242,7 @@ impl Channel for TelegramChannel {
         // Voice-only peers: delete the draft placeholder and let the voice
         // bubble be the sole reply. Bypassed when suppress_voice forces text.
         if !suppress_voice && self.destination_is_voice_peer(recipient) {
-            if let Ok(id) = message_id.parse::<i64>() {
+            if let Ok(id) = resolved_message_id.parse::<i64>() {
                 let _ = self
                     .http_client()
                     .post(self.api_url("deleteMessage"))
@@ -7877,12 +8256,17 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
+        if partial_already_delivered {
+            return Ok(());
+        }
+
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
 
         // Parse message ID once for reuse
-        let msg_id = match message_id.parse::<i64>() {
+        let msg_id = match resolved_message_id.parse::<i64>() {
             Ok(id) => Some(id),
+            Err(_) if resolved_message_id.is_empty() => None,
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -8057,7 +8441,22 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        let message_id = match message_id.parse::<i64>() {
+        let resolved_message_id = if Self::is_partial_synthetic_draft(message_id) {
+            let Some(finish) = self.finish_partial_draft(recipient, message_id).await? else {
+                return Ok(());
+            };
+            if finish.accepted_without_message_id {
+                return Ok(());
+            }
+            let Some(message_id) = finish.message_id else {
+                return Ok(());
+            };
+            message_id
+        } else {
+            message_id.to_string()
+        };
+
+        let message_id = match resolved_message_id.parse::<i64>() {
             Ok(id) => id,
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -9713,7 +10112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_draft_lifecycle_only_edits_partial_streaming_drafts() {
+    async fn update_draft_lifecycle_never_replaces_partial_answer_text() {
         use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9731,7 +10130,7 @@ mod tests {
                 "ok": true,
                 "result": { "message_id": 42 }
             })))
-            .expect(1)
+            .expect(0)
             .mount(&mock_server)
             .await;
 
@@ -9781,10 +10180,11 @@ mod tests {
             .update_draft_lifecycle("123", "42", ProgressEvent::RunningTool)
             .await
             .unwrap();
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
     }
 
-    /// Raw tool status carries the tool name plus a command, path, or query.
-    /// Only the typed lifecycle event may reach Telegram.
+    /// Neither raw tool status nor a typed lifecycle status may replace the
+    /// visible assistant narration in a Partial draft.
     #[tokio::test]
     async fn raw_tool_status_never_reaches_telegram() {
         use wiremock::matchers::{method, path_regex};
@@ -9822,17 +10222,14 @@ mod tests {
             .unwrap();
 
         let requests = mock_server.received_requests().await.unwrap();
-        assert_eq!(
-            requests.len(),
-            1,
-            "only the typed lifecycle event should reach Telegram"
+        assert!(
+            requests.is_empty(),
+            "lifecycle status must not replace the answer"
         );
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(
-            body["text"],
-            crate::util::localized_lifecycle_progress(ProgressEvent::RunningTool)
-        );
-        let raw = String::from_utf8_lossy(&requests[0].body);
+        let raw = requests
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body))
+            .collect::<String>();
         for leaked in [
             "shell",
             "cat ",
@@ -9846,6 +10243,612 @@ mod tests {
                 "tool status detail '{leaked}' leaked to Telegram"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn partial_draft_starts_with_typing_and_buffers_tiny_fragment_until_cancel() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 41 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/deleteMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let recipient = "-100123:7";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", recipient))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel
+            .update_draft(recipient, &draft_id, "sup")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("sendChatAction")),
+            "typing should be visible while the answer is still too small to publish"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("sendMessage")),
+            "neither the placeholder nor a tiny fragment should be sent"
+        );
+        channel.cancel_draft(recipient, &draft_id).await.unwrap();
+        channel.cancel_draft(recipient, &draft_id).await.unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "Cancelled answer.", false)
+            .await
+            .unwrap();
+        assert!(channel.partial_drafts.lock().is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("deleteMessage"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("sendMessage"))
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_publishes_first_useful_chunk_and_finalizes_real_message() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 41 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 41 }
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let recipient = "-100123:7";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", recipient))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        let first_chunk = "This is a useful partial response.";
+        channel
+            .update_draft(recipient, &draft_id, first_chunk)
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "Here is the completed answer.", false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("sendMessage"))
+            .expect("first useful chunk is published");
+        let sent_body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+        assert_eq!(sent_body["chat_id"], "-100123");
+        assert_eq!(sent_body["message_thread_id"], "7");
+        assert_eq!(sent_body["text"], first_chunk);
+        let edited = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("editMessageText"))
+            .expect("final answer edits the real Telegram message");
+        let edited_body: serde_json::Value = serde_json::from_slice(&edited.body).unwrap();
+        assert_eq!(edited_body["message_id"], 41);
+        assert_eq!(edited_body["text"], "Here is the completed answer.");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("sendMessage"))
+                .count(),
+            1,
+            "finalization must edit the first visible message rather than duplicate it"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_finalization_sends_short_answer_without_a_visible_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel.update_draft("123", &draft_id, "sup").await.unwrap();
+        channel
+            .finalize_draft("123", &draft_id, "Hi.", false)
+            .await
+            .unwrap();
+        channel
+            .finalize_draft("123", &draft_id, "Hi.", false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sent = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("sendMessage"))
+            .collect::<Vec<_>>();
+        assert_eq!(sent.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(body["text"], "Hi.");
+    }
+
+    #[tokio::test]
+    async fn partial_draft_worker_exit_is_reported_without_fabricated_delivery() {
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100);
+        let recipient = "123";
+        let draft_id = format!(
+            "{TELEGRAM_PARTIAL_DRAFT_PREFIX}{}",
+            uuid::Uuid::new_v4().as_simple()
+        );
+        let (commands, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        channel.partial_drafts.lock().insert(
+            PartialDraftHandle::key(recipient, &draft_id),
+            PartialDraftHandle { commands },
+        );
+
+        let error = channel
+            .finalize_draft(recipient, &draft_id, "A final answer.", false)
+            .await
+            .expect_err("a dead worker cannot report successful delivery");
+        assert!(error.to_string().contains("worker stopped"));
+        assert!(channel.partial_drafts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_draft_without_message_id_is_skipped_only_for_exact_final_text() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel
+            .update_draft("123", &draft_id, "Hello there.")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft("123", &draft_id, "Hello there.", false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("sendMessage"))
+                .count(),
+            1,
+            "a parsed ok:true response proves this exact short final text was accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_malformed_send_ack_does_not_claim_final_delivery() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel
+            .update_draft("123", &draft_id, "Hello there.")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft("123", &draft_id, "Hello there.", false)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("sendMessage"))
+                .count(),
+            2,
+            "a malformed acknowledgement cannot prove the streamed text was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_without_message_id_tracks_accepted_text_not_later_updates() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        let accepted_prefix = "The first useful streamed prefix is now accepted.";
+        channel
+            .update_draft("123", &draft_id, accepted_prefix)
+            .await
+            .unwrap();
+        channel
+            .update_draft(
+                "123",
+                &draft_id,
+                "The complete answer is different from that prefix.",
+            )
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(
+                "123",
+                &draft_id,
+                "The complete answer is different from that prefix.",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sends = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("sendMessage"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sends.len(),
+            2,
+            "the distinct final answer still gets delivered"
+        );
+        let first: serde_json::Value = serde_json::from_slice(&sends[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&sends[1].body).unwrap();
+        assert_eq!(first["text"], accepted_prefix);
+        assert_eq!(
+            second["text"],
+            "The complete answer is different from that prefix."
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_two_hundred_edit_rejection_is_not_success() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: message not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = edit_telegram_partial_message(
+            &reqwest::Client::new(),
+            &format!("{}/botfake-token/editMessageText", server.uri()),
+            "123",
+            "42",
+            "partial text",
+        )
+        .await
+        .unwrap();
+        assert!(!result, "HTTP 200 with ok:false is a rejected edit");
+    }
+
+    #[tokio::test]
+    async fn partial_draft_voice_only_peer_does_not_publish_text_chunks() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 44 }
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_resolver(Arc::new(|| vec!["123".into()]))
+        .with_streaming(StreamMode::Partial, 100)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel
+            .update_draft("123", &draft_id, "This would be a useful text chunk.")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(
+                "123",
+                &draft_id,
+                "The final answer is delivered by voice.",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("sendMessage")),
+            "voice-only peers must not receive partial text or a final text duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_draft_flushes_latest_throttled_update_without_another_delta() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 43 }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 43 }
+            })))
+            .mount(&server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 120)
+        .with_mock_api_base(server.uri());
+        let draft_id = channel
+            .send_draft(&SendMessage::new("...", "123"))
+            .await
+            .unwrap()
+            .expect("virtual draft id");
+        channel
+            .update_draft(
+                "123",
+                &draft_id,
+                "The first partial answer chunk is useful.",
+            )
+            .await
+            .unwrap();
+        channel
+            .update_draft(
+                "123",
+                &draft_id,
+                "The latest partial answer must be flushed.",
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        channel
+            .finalize_draft(
+                "123",
+                &draft_id,
+                "The latest partial answer must be flushed.",
+                false,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let edits = requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("editMessageText"))
+            .collect::<Vec<_>>();
+        assert_eq!(edits.len(), 2, "timer flush occurs before finalization");
+        let trailing_body: serde_json::Value = serde_json::from_slice(&edits[0].body).unwrap();
+        assert_eq!(
+            trailing_body["text"],
+            "The latest partial answer must be flushed."
+        );
     }
 
     #[test]
