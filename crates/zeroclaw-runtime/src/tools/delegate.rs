@@ -3881,6 +3881,7 @@ impl DelegateTool {
                 // so no crumb exists and none outlives this scoped loop.
                 history_has_trim_breadcrumb: &mut subagent_crumb_present,
                 injected_memory_preamble: &mut subagent_injected_memory_preamble,
+                workspace_dir: None,
                 channel_name: "delegate",
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),
