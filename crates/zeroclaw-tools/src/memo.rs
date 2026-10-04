@@ -11,9 +11,9 @@ use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::{SecurityPolicy, ToolOperation};
 
-const MAX_WAKE_LINES: usize = 96;
+const MAX_WAKE_LINES: usize = 256;
 const MAX_TEXT_BYTES: usize = 280;
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 const CLI_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Exposes only memo's bounded operations, always against one agent workspace.
@@ -120,11 +120,7 @@ impl MemoTool {
                 anyhow::bail!("memo store could not be initialized");
             }
         }
-        let mut operation = operation.to_vec();
-        if operation.first().is_some_and(|op| op == "wake") {
-            operation[2] = self.wake_lines.to_string();
-        }
-        let output = self.run(&data_dir, &workspace, &operation).await?;
+        let output = self.run(&data_dir, &workspace, operation).await?;
         let json_bytes = if output.success {
             &output.stdout
         } else {
@@ -271,7 +267,7 @@ fn sanitize_cli_response(value: &mut Value) {
     }
 }
 
-fn operation_args(args: &Value) -> anyhow::Result<Vec<String>> {
+fn operation_args(args: &Value, wake_lines: usize) -> anyhow::Result<Vec<String>> {
     let object = args
         .as_object()
         .ok_or_else(|| anyhow::Error::msg("memo arguments must be an object"))?;
@@ -291,7 +287,11 @@ fn operation_args(args: &Value) -> anyhow::Result<Vec<String>> {
     );
 
     match action {
-        "wake" => Ok(vec!["wake".into(), "--lines".into(), "96".into()]),
+        "wake" => Ok(vec![
+            "wake".into(),
+            "--lines".into(),
+            wake_lines.to_string(),
+        ]),
         "note" => {
             let text = object
                 .get("text")
@@ -376,7 +376,7 @@ impl Tool for MemoTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let operation = operation_args(&args)?;
+        let operation = operation_args(&args, self.wake_lines)?;
         let read_only = operation.first().is_some_and(|op| op == "wake")
             || (operation.first().is_some_and(|op| op == "nap") && operation.len() == 1);
         let policy_operation = if read_only {
@@ -420,19 +420,97 @@ mod tests {
 
     #[test]
     fn operation_arguments_reject_paths_and_wrong_shapes() {
-        assert!(operation_args(&json!({"action":"wake", "path":"/tmp/outside"})).is_err());
-        assert!(operation_args(&json!({"action":"note", "text":"x", "store":"shared"})).is_err());
-        assert!(operation_args(&json!({"action":"nap", "range":"0-1"})).is_err());
-        assert!(operation_args(&json!({"action":"nap", "range":"2-1", "summary":"x"})).is_err());
+        assert!(operation_args(&json!({"action":"wake", "path":"/tmp/outside"}), 96).is_err());
+        assert!(
+            operation_args(&json!({"action":"note", "text":"x", "store":"shared"}), 96).is_err()
+        );
+        assert!(operation_args(&json!({"action":"nap", "range":"0-1"}), 96).is_err());
+        assert!(
+            operation_args(&json!({"action":"nap", "range":"2-1", "summary":"x"}), 96).is_err()
+        );
     }
 
     #[test]
     fn note_and_summary_limits_are_utf8_bytes_and_single_line() {
         let valid = "é".repeat(140);
-        assert!(operation_args(&json!({"action":"note", "text":valid})).is_ok());
-        assert!(operation_args(&json!({"action":"note", "text":"é".repeat(141)})).is_err());
-        assert!(operation_args(&json!({"action":"note", "text":"first\nsecond"})).is_err());
-        assert!(operation_args(&json!({"action":"nap", "range":"0-1", "summary":"x\r"})).is_err());
+        assert!(operation_args(&json!({"action":"note", "text":valid}), 96).is_ok());
+        assert!(operation_args(&json!({"action":"note", "text":"é".repeat(141)}), 96).is_err());
+        assert!(operation_args(&json!({"action":"note", "text":"first\nsecond"}), 96).is_err());
+        assert!(
+            operation_args(&json!({"action":"nap", "range":"0-1", "summary":"x\r"}), 96).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    fn tool_with_cli_output(wake_lines: usize, output: &[u8]) -> (tempfile::TempDir, MemoTool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let store = workspace.path().join("memo/default");
+        std::fs::create_dir_all(&store).expect("memo store");
+        std::fs::write(store.join("FORMAT_VERSION"), b"1\n").expect("format marker");
+
+        let response = workspace.path().join("response.json");
+        std::fs::write(&response, output).expect("CLI response");
+        let executable = workspace.path().join("memo-cli");
+        let response_path = response.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            "#!/bin/sh\n[ \"$9\" = \"{wake_lines}\" ] || exit 3\nIFS= read -r output < '{response_path}' || :\nprintf '%s' \"$output\"\n"
+        );
+        std::fs::write(&executable, script).expect("fake CLI");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("executable permissions");
+
+        let tool = MemoTool::new(
+            executable.to_string_lossy(),
+            workspace.path(),
+            wake_lines,
+            Arc::new(SecurityPolicy::default()),
+        );
+        (workspace, tool)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_256_line_wake_accepts_escaped_json_over_64_kib() {
+        let escaped_max_length_text = "\u{1}".repeat(MAX_TEXT_BYTES);
+        let items = (0..256)
+            .map(|index| json!({"id":index, "text":escaped_max_length_text}))
+            .collect::<Vec<_>>();
+        let response = serde_json::to_vec(&json!({
+            "command":"wake", "ok":true, "complete":true, "lines":256, "items":items
+        }))
+        .unwrap();
+        assert!(response.len() > 64 * 1024);
+        assert!(response.len() <= MAX_OUTPUT_BYTES);
+
+        let (_workspace, tool) = tool_with_cli_output(256, &response);
+        let result = tool.execute(json!({"action":"wake"})).await.unwrap();
+        assert!(result.success, "{}", result.error.unwrap_or_default());
+        let value = result_value(result);
+        assert_eq!(value["lines"], 256);
+        let items = value["items"].as_array().expect("wake items");
+        assert_eq!(items.len(), 256);
+        assert!(
+            items
+                .iter()
+                .all(|item| item["text"].as_str() == Some(escaped_max_length_text.as_str()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memo_cli_output_above_limit_is_rejected() {
+        let oversized = vec![b' '; MAX_OUTPUT_BYTES + 1];
+        let (_workspace, tool) = tool_with_cli_output(96, &oversized);
+        let result = tool.execute(json!({"action":"wake"})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("memo output exceeded limit")
+        );
     }
 
     #[tokio::test]
