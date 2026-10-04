@@ -347,25 +347,34 @@ Telegram alias through `agents.<alias>.channels`.
 
 | Action | Where | Result |
 |---|---|---|
-| `/invite` | Owner's private chat | A single-use link valid for 24 hours |
-| Open invite and press Start | Friend's private chat | Private enrollment; subsequent messages use their own memory |
+| `/invite` | Owner's private chat | A single-use token link valid for 24 hours; the first person to use it is enrolled |
+| `/invite @handle` | Owner's private chat | Approves that username for 24 hours and returns a generic bot link to copy to them |
+| Open handle invite and press Start | Friend's private chat | Telegram sends `/start join`; a matching current username redeems the grant for its numeric chat ID |
 | `/activate@your_bot` | Group, sent by the owner | All human group members can chat with the bot; memory belongs to this group |
-| `/guests` | Owner's private chat | Active private and group chat IDs |
-| `/revoke <chat-id>` | Owner's private chat | Blocks new requests from that private chat or group |
+| `/guests` | Owner's private chat | Active private and group chat IDs, plus pending handles |
+| `/revoke <chat-id>` | Owner's private chat | Revokes an enrolled private chat or group by its numeric ID |
+| `/revoke @handle` | Owner's private chat | Cancels that username's pending approval; it does not revoke an enrolled chat |
 
 Keep BotFather's `/setjoingroups` enabled to add the bot to new groups.
 Disable `/setprivacy` before adding it if ordinary group messages should reach
 it. Groups stay closed until the owner sends `/activate`; a friend's private
 invite grants no group access. Telegram sends the invite payload through
-[`/start`](https://core.telegram.org/bots/features#deep-linking). Treat the
-link as a temporary access credential: whoever redeems it first gets access.
+[`/start`](https://core.telegram.org/bots/features#deep-linking). Opening a
+handle invite link starts the bot with `/start join`. Sending `/start` with no
+payload in the same private chat also claims a pending handle approval. The
+handle is checked case-insensitively against Telegram's current sender
+username. If `/revoke @handle` reports no pending approval, use `/guests` to
+find an enrolled chat's numeric ID, then revoke it with `/revoke <chat-id>`.
 
-Enrollment controls bypass the model. Edited, forwarded, anonymous-admin,
-and bot-authored enrollment commands cannot grant access. Explicit peer deny
-entries still apply. After an invitation is redeemed, authorized photos,
-voice notes, and bounded video clips follow the same agent-scoped media path
-as static routes. Photo albums are supported; videos in albums contribute
-their captions but are not downloaded. Documents are unsupported.
+Enrollment controls bypass the model. A handle approval grants private access
+only when its matching current username sends a fresh human-authored `/start`
+in that person's own private chat. Forwarded, edited, group, anonymous-admin,
+bot-authored, and denied sender claims are rejected. The owner grants group
+access separately with `/activate` in the group. After an invitation is
+redeemed, authorized photos, voice notes, and bounded video clips follow the
+same agent-scoped media path as static routes. Photo albums are supported;
+videos in albums contribute their captions but are not downloaded. Documents
+are unsupported.
 
 When `reaction` is allowed, it can only target a message in the current
 Telegram conversation; the runtime supplies the chat and channel alias. The
@@ -374,18 +383,20 @@ funny or contextually relevant. Reactions are never automatic receipt
 acknowledgments. Use the risk profile's normal approval settings to decide
 whether each reaction needs approval.
 
-Memberships and hashed invite tokens live in
+Memberships, hashed token invites, and pending handle approvals live in
 `<data_dir>/telegram-memberships/<alias>.sqlite3`, outside the declarative
-TOML. Back up the entire data directory, including memory and session state.
+TOML. Pending handles are case-normalized and expire after 24 hours. Back up
+the entire data directory, including memory and session state.
 Re-rendering configuration or restarting preserves enrollment and memory.
 Keep the channel alias stable: it is part of every generated agent identity.
 Revocation preserves memory; a later invite or activation of the same chat
 restores its identity. A turn already running when revoked may finish.
 
-The store permits at most 512 active chats and 128 outstanding invites per
-alias. Invalid templates or unavailable membership storage deny dynamic
-access. If Telegram converts a group to a supergroup, activate the new chat
-ID; it gets a new memory identity. Existing groups are not migrated implicitly.
+The store permits at most 512 active chats and 128 outstanding token invites
+and handle approvals combined per alias. Invalid templates or unavailable
+membership storage deny dynamic access. If Telegram converts a group to a
+supergroup, activate the new chat ID; it gets a new memory identity. Existing
+groups are not migrated implicitly.
 
 ## Restart and persistence behavior
 

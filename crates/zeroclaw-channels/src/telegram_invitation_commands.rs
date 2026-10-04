@@ -1,6 +1,6 @@
 //! Deterministic Telegram enrollment controls, handled before agent dispatch.
 use super::{TelegramChannel, i18n};
-use crate::telegram_memberships::MembershipKind;
+use crate::telegram_memberships::{MembershipKind, normalize_telegram_username};
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_config::schema::TelegramInvitationsConfig;
 
@@ -315,7 +315,12 @@ impl TelegramChannel {
         let private = Self::invitation_private_chat(message, actor);
         let now = chrono::Utc::now().timestamp();
         let key = match command {
-            "/start" if private && !args.is_empty() && !args.contains(char::is_whitespace) => {
+            "/start"
+                if private
+                    && !args.is_empty()
+                    && args != "join"
+                    && !args.contains(char::is_whitespace) =>
+            {
                 if self.static_invitation_route(chat_id) {
                     "channel-telegram-invitation-static-route"
                 } else if store.redeem(args, actor, now).is_ok() {
@@ -324,7 +329,47 @@ impl TelegramChannel {
                     "channel-telegram-invitation-invalid"
                 }
             }
-            "/invite" if owner && private && args.is_empty() => {
+            "/start" if private && (args.is_empty() || args == "join") => {
+                if self.static_invitation_route(chat_id) {
+                    "channel-telegram-invitation-static-route"
+                } else if store.membership(actor).ok().flatten().is_some() {
+                    "channel-telegram-invitation-welcome"
+                } else if let Some(handle) = message
+                    .pointer("/from/username")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if store.redeem_handle(handle, actor, now).is_ok() {
+                        "channel-telegram-invitation-welcome"
+                    } else {
+                        "channel-telegram-invitation-invalid"
+                    }
+                } else {
+                    "channel-telegram-invitation-required"
+                }
+            }
+            "/invite" if owner && private => {
+                let handle = if args.is_empty() {
+                    None
+                } else if args.starts_with('@') {
+                    match normalize_telegram_username(args) {
+                        Ok(username) => Some(username),
+                        Err(_) => {
+                            self.send_invitation_notice(
+                                "channel-telegram-invitation-invite-usage",
+                                &recipient,
+                            )
+                            .await;
+                            return true;
+                        }
+                    }
+                } else {
+                    self.send_invitation_notice(
+                        "channel-telegram-invitation-invite-usage",
+                        &recipient,
+                    )
+                    .await;
+                    return true;
+                };
                 let Some(username) = self.invitation_bot_username().await else {
                     self.send_invitation_notice(
                         "channel-telegram-invitation-unavailable",
@@ -341,17 +386,33 @@ impl TelegramChannel {
                 {
                     return true;
                 }
-                match store.create_invite(chrono::Utc::now().timestamp()) {
-                    Ok(token) => {
-                        let link = format!("https://t.me/{username}?start={token}");
-                        let text = i18n::get_required_cli_string_with_args(
-                            "channel-telegram-invitation-created",
-                            &[("link", link.as_str())],
-                        );
-                        self.send_invitation_text(text, &recipient).await;
-                        return true;
-                    }
-                    Err(_) => "channel-telegram-invitation-unavailable",
+                let now = chrono::Utc::now().timestamp();
+                match handle {
+                    Some(handle) => match store.create_handle_grant(&handle, now) {
+                        Ok(()) => {
+                            let link = format!("https://t.me/{username}?start=join");
+                            let handle = format!("@{handle}");
+                            let text = i18n::get_required_cli_string_with_args(
+                                "channel-telegram-invitation-handle-created",
+                                &[("handle", handle.as_str()), ("link", link.as_str())],
+                            );
+                            self.send_invitation_text(text, &recipient).await;
+                            return true;
+                        }
+                        Err(_) => "channel-telegram-invitation-unavailable",
+                    },
+                    None => match store.create_invite(now) {
+                        Ok(token) => {
+                            let link = format!("https://t.me/{username}?start={token}");
+                            let text = i18n::get_required_cli_string_with_args(
+                                "channel-telegram-invitation-created",
+                                &[("link", link.as_str())],
+                            );
+                            self.send_invitation_text(text, &recipient).await;
+                            return true;
+                        }
+                        Err(_) => "channel-telegram-invitation-unavailable",
+                    },
                 }
             }
             "/activate" if owner && args.is_empty() => {
@@ -367,40 +428,67 @@ impl TelegramChannel {
                     "channel-telegram-invitation-group-only"
                 }
             }
-            "/guests" if owner && private && args.is_empty() => match store.list() {
-                Ok(memberships) if memberships.is_empty() => {
-                    "channel-telegram-invitation-no-guests"
-                }
-                Ok(memberships) => {
-                    let entries = memberships
-                        .iter()
-                        .map(|membership| membership.chat_id.to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let text = i18n::get_required_cli_string_with_args(
-                        "channel-telegram-invitation-guests",
-                        &[("entries", entries.as_str())],
-                    );
-                    self.send_invitation_text(text, &recipient).await;
-                    return true;
-                }
-                Err(_) => "channel-telegram-invitation-unavailable",
-            },
-            "/revoke" if owner && private => {
-                match args
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|id| *id != 0 && id.to_string() == args)
-                {
-                    Some(target) if self.static_invitation_route(target) => {
-                        "channel-telegram-invitation-static-route"
+            "/guests" if owner && private && args.is_empty() => {
+                match (store.list(), store.pending_handles(now)) {
+                    (Ok(memberships), Ok(pending))
+                        if memberships.is_empty() && pending.is_empty() =>
+                    {
+                        "channel-telegram-invitation-no-guests"
                     }
-                    Some(target) => match store.revoke(target) {
-                        Ok(true) => "channel-telegram-invitation-revoked",
-                        Ok(false) => "channel-telegram-invitation-no-membership",
-                        Err(_) => "channel-telegram-invitation-unavailable",
-                    },
-                    None => "channel-telegram-invitation-revoke-usage",
+                    (Ok(memberships), Ok(pending)) => {
+                        let entries = memberships
+                            .iter()
+                            .map(|membership| membership.chat_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let text = if pending.is_empty() {
+                            i18n::get_required_cli_string_with_args(
+                                "channel-telegram-invitation-guests",
+                                &[("entries", entries.as_str())],
+                            )
+                        } else {
+                            let handles = pending
+                                .iter()
+                                .map(|handle| format!("@{handle}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            i18n::get_required_cli_string_with_args(
+                                "channel-telegram-invitation-guests-pending",
+                                &[("entries", entries.as_str()), ("handles", handles.as_str())],
+                            )
+                        };
+                        self.send_invitation_text(text, &recipient).await;
+                        return true;
+                    }
+                    _ => "channel-telegram-invitation-unavailable",
+                }
+            }
+            "/revoke" if owner && private => {
+                if args.starts_with('@') {
+                    match normalize_telegram_username(args) {
+                        Ok(handle) => match store.revoke_pending_handle(&handle) {
+                            Ok(true) => "channel-telegram-invitation-handle-revoked",
+                            Ok(false) => "channel-telegram-invitation-no-pending-handle",
+                            Err(_) => "channel-telegram-invitation-unavailable",
+                        },
+                        Err(_) => "channel-telegram-invitation-revoke-usage",
+                    }
+                } else {
+                    match args
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|id| *id != 0 && id.to_string() == args)
+                    {
+                        Some(target) if self.static_invitation_route(target) => {
+                            "channel-telegram-invitation-static-route"
+                        }
+                        Some(target) => match store.revoke(target) {
+                            Ok(true) => "channel-telegram-invitation-revoked",
+                            Ok(false) => "channel-telegram-invitation-no-membership",
+                            Err(_) => "channel-telegram-invitation-unavailable",
+                        },
+                        None => "channel-telegram-invitation-revoke-usage",
+                    }
                 }
             }
             "/start" => "channel-telegram-invitation-required",
@@ -495,6 +583,20 @@ mod tests {
         }})
     }
 
+    fn update_with_username(
+        id: i64,
+        actor: i64,
+        username: Option<&str>,
+        chat: i64,
+        text: &str,
+    ) -> serde_json::Value {
+        let mut value = update(id, actor, chat, text);
+        if let Some(username) = username {
+            value["message"]["from"]["username"] = username.into();
+        }
+        value
+    }
+
     async fn process(
         channel: &TelegramChannel,
         update: &serde_json::Value,
@@ -546,6 +648,141 @@ mod tests {
         process(&channel, &update(6, 1001, 1001, "/revoke 23"), &tx).await;
         assert!(store.membership(23).unwrap().is_none());
         process(&channel, &update(7, 23, 23, "after revoke"), &tx).await;
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn username_invite_uses_generic_start_link_and_each_owner_grant_is_single_use() {
+        let server = wiremock::MockServer::start().await;
+        let (_dir, store, _live, channel) = fixture(&server).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        process(
+            &channel,
+            &update(1, 1001, 1001, "/invite @Some_Handle"),
+            &tx,
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            store
+                .pending_handles(chrono::Utc::now().timestamp())
+                .unwrap(),
+            ["some_handle"]
+        );
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let confirmation = body["text"].as_str().unwrap();
+        assert!(confirmation.contains("@some_handle"), "{confirmation}");
+        assert!(confirmation.contains("within 24 hours"));
+        assert!(confirmation.contains("https://t.me/testbot?start=join"));
+
+        process(
+            &channel,
+            &update_with_username(2, 23, Some("SOME_HANDLE"), 23, "/start join"),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            store.membership(23).unwrap().unwrap().kind,
+            MembershipKind::Private
+        );
+        let active_before = store.membership(23).unwrap();
+        process(
+            &channel,
+            &update_with_username(20, 23, Some("SOME_HANDLE"), 23, "/start join"),
+            &tx,
+        )
+        .await;
+        assert_eq!(store.membership(23).unwrap(), active_before);
+        process(&channel, &update(3, 23, 23, "hello"), &tx).await;
+        assert_eq!(rx.try_recv().unwrap().content, "hello");
+
+        store
+            .create_handle_grant("@some_handle", chrono::Utc::now().timestamp())
+            .unwrap();
+        process(
+            &channel,
+            &update_with_username(4, 24, Some("some_handle"), 24, "/start"),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            store.membership(24).unwrap().unwrap().kind,
+            MembershipKind::Private
+        );
+        assert!(store.membership(23).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn username_claim_requires_a_fresh_private_human_dm_and_can_be_revoked() {
+        let server = wiremock::MockServer::start().await;
+        let (_dir, store, _live, channel) = fixture(&server).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        process(&channel, &update(1, 1001, 1001, "/invite @friend"), &tx).await;
+        let grant_time = chrono::Utc::now().timestamp();
+        process(
+            &channel,
+            &update_with_username(9, 23, Some("different"), 23, "/start join"),
+            &tx,
+        )
+        .await;
+        process(&channel, &update(10, 24, 24, "/start join"), &tx).await;
+        let denied = update_with_username(11, 25, Some("blocked"), 25, "/start join");
+        process(&channel, &denied, &tx).await;
+        assert_eq!(store.pending_handles(grant_time).unwrap(), ["friend"]);
+        let mut forwarded = update_with_username(2, 23, Some("friend"), 23, "/start");
+        forwarded["message"]["forward_origin"] = serde_json::json!({"type": "user"});
+        let mut edited = update_with_username(3, 23, Some("friend"), 23, "/start");
+        edited["edited_message"] = edited["message"].clone();
+        edited.as_object_mut().unwrap().remove("message");
+        let group = update_with_username(4, 23, Some("friend"), -42, "/start");
+        let anonymous = {
+            let mut value = update_with_username(5, 23, Some("friend"), 23, "/start");
+            value["message"]["from"]["is_bot"] = true.into();
+            value
+        };
+        for invalid in [forwarded, edited, group, anonymous] {
+            process(&channel, &invalid, &tx).await;
+        }
+        assert!(store.membership(23).unwrap().is_none());
+        assert_eq!(store.pending_handles(grant_time).unwrap(), ["friend"]);
+        process(
+            &channel,
+            &update_with_username(6, 23, Some("friend"), 23, "/start extra"),
+            &tx,
+        )
+        .await;
+        process(&channel, &update(7, 1001, 1001, "/revoke @FRIEND"), &tx).await;
+        assert!(store.pending_handles(grant_time).unwrap().is_empty());
+        process(
+            &channel,
+            &update_with_username(8, 23, Some("friend"), 23, "/start"),
+            &tx,
+        )
+        .await;
+        assert!(store.membership(23).unwrap().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_invites_require_owner_and_valid_single_handle_argument() {
+        let server = wiremock::MockServer::start().await;
+        let (_dir, store, _live, channel) = fixture(&server).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for (id, actor, input) in [
+            (1, 23, "/invite @friend"),
+            (2, 1001, "/invite @friend https://example.org"),
+            (3, 1001, "/invite @bad-name"),
+            (4, 1001, "/invite https://t.me/friend"),
+        ] {
+            process(&channel, &update(id, actor, actor, input), &tx).await;
+        }
+        assert!(
+            store
+                .pending_handles(chrono::Utc::now().timestamp())
+                .unwrap()
+                .is_empty()
+        );
         assert!(rx.try_recv().is_err());
     }
 

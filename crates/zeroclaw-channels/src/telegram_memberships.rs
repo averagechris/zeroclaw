@@ -91,7 +91,13 @@ impl MembershipStore {
                  expires_at INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS telegram_invites_expiry
-                 ON telegram_invites(expires_at);",
+                 ON telegram_invites(expires_at);
+             CREATE TABLE IF NOT EXISTS telegram_pending_handles (
+                 username TEXT PRIMARY KEY,
+                 expires_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS telegram_pending_handles_expiry
+                 ON telegram_pending_handles(expires_at);",
         )
         .context("Failed to initialize Telegram membership store")?;
 
@@ -119,12 +125,22 @@ impl MembershipStore {
             .context("Failed to begin invitation creation")?;
         tx.execute("DELETE FROM telegram_invites WHERE expires_at <= ?1", [now])
             .context("Failed to remove expired Telegram invitations")?;
+        tx.execute(
+            "DELETE FROM telegram_pending_handles WHERE expires_at <= ?1",
+            [now],
+        )
+        .context("Failed to remove expired Telegram handle grants")?;
         let outstanding: i64 = tx
             .query_row("SELECT COUNT(*) FROM telegram_invites", [], |row| {
                 row.get(0)
             })
             .context("Failed to count Telegram invitations")?;
-        if outstanding >= MAX_OUTSTANDING_INVITES {
+        let pending: i64 = tx
+            .query_row("SELECT COUNT(*) FROM telegram_pending_handles", [], |row| {
+                row.get(0)
+            })
+            .context("Failed to count Telegram handle grants")?;
+        if outstanding + pending >= MAX_OUTSTANDING_INVITES {
             bail!("Too many outstanding Telegram invitations");
         }
         tx.execute(
@@ -135,6 +151,105 @@ impl MembershipStore {
         tx.commit()
             .context("Failed to commit Telegram invitation")?;
         Ok(token)
+    }
+
+    /// Approve one current Telegram username for a single private claim.
+    pub(crate) fn create_handle_grant(&self, username: &str, now: i64) -> Result<()> {
+        let username = normalize_telegram_username(username)?;
+        let expires_at = now
+            .checked_add(INVITE_TTL_SECONDS)
+            .context("Invitation expiry timestamp is out of range")?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin Telegram handle grant")?;
+        tx.execute("DELETE FROM telegram_invites WHERE expires_at <= ?1", [now])
+            .context("Failed to remove expired Telegram invitations")?;
+        tx.execute(
+            "DELETE FROM telegram_pending_handles WHERE expires_at <= ?1",
+            [now],
+        )
+        .context("Failed to remove expired Telegram handle grants")?;
+        let outstanding: i64 = tx
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM telegram_invites) +
+                        (SELECT COUNT(*) FROM telegram_pending_handles) -
+                        EXISTS(SELECT 1 FROM telegram_pending_handles WHERE username = ?1)",
+                [&username],
+                |row| row.get(0),
+            )
+            .context("Failed to count outstanding Telegram invitations")?;
+        if outstanding >= MAX_OUTSTANDING_INVITES {
+            bail!("Too many outstanding Telegram invitations");
+        }
+        tx.execute(
+            "INSERT INTO telegram_pending_handles(username, expires_at) VALUES (?1, ?2)
+             ON CONFLICT(username) DO UPDATE SET expires_at = excluded.expires_at",
+            params![username, expires_at],
+        )
+        .context("Failed to store Telegram handle grant")?;
+        tx.commit()
+            .context("Failed to commit Telegram handle grant")
+    }
+
+    /// Claim one current username grant for a numeric Telegram membership.
+    pub(crate) fn redeem_handle(
+        &self,
+        username: &str,
+        user_id: i64,
+        now: i64,
+    ) -> Result<Membership> {
+        validate_private_chat_id(user_id)?;
+        let username = normalize_telegram_username(username)?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin Telegram handle grant redemption")?;
+        let expiry: Option<i64> = tx
+            .query_row(
+                "SELECT expires_at FROM telegram_pending_handles WHERE username = ?1",
+                [&username],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read Telegram handle grant")?;
+        let Some(expiry) = expiry.filter(|expires_at| *expires_at > now) else {
+            bail!("Invalid or expired Telegram invitation");
+        };
+        let existing_active: Option<i64> = tx
+            .query_row(
+                "SELECT active FROM telegram_memberships WHERE chat_id = ?1",
+                [user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read Telegram membership")?;
+        if existing_active == Some(1) {
+            bail!("Telegram user is already an active member");
+        }
+        ensure_active_capacity(&tx, false)?;
+        tx.execute(
+            "INSERT INTO telegram_memberships(chat_id, kind, active, created_at, updated_at)
+             VALUES (?1, 'private', 1, ?2, ?2)
+             ON CONFLICT(chat_id) DO UPDATE SET active = 1, updated_at = excluded.updated_at",
+            params![user_id, now],
+        )
+        .context("Failed to activate Telegram membership")?;
+        let consumed = tx
+            .execute(
+                "DELETE FROM telegram_pending_handles WHERE username = ?1 AND expires_at = ?2",
+                params![username, expiry],
+            )
+            .context("Failed to consume Telegram handle grant")?;
+        if consumed != 1 {
+            bail!("Invalid or expired Telegram invitation");
+        }
+        tx.commit()
+            .context("Failed to commit Telegram handle redemption")?;
+        Ok(Membership {
+            chat_id: user_id,
+            kind: MembershipKind::Private,
+        })
     }
 
     /// Redeem an invitation for a private chat. Failed, expired, and replayed
@@ -257,6 +372,34 @@ impl MembershipStore {
             .context("Failed to read Telegram membership listing")
     }
 
+    pub(crate) fn pending_handles(&self, now: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut statement = conn
+            .prepare(
+                "SELECT username FROM telegram_pending_handles
+                 WHERE expires_at > ?1 ORDER BY username",
+            )
+            .context("Failed to prepare Telegram handle listing")?;
+        let rows = statement
+            .query_map([now], |row| row.get(0))
+            .context("Failed to list Telegram handle grants")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to read Telegram handle listing")
+    }
+
+    pub(crate) fn revoke_pending_handle(&self, username: &str) -> Result<bool> {
+        let username = normalize_telegram_username(username)?;
+        let changed = self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM telegram_pending_handles WHERE username = ?1",
+                [username],
+            )
+            .context("Failed to revoke Telegram handle grant")?;
+        Ok(changed == 1)
+    }
+
     pub(crate) fn revoke(&self, chat_id: i64) -> Result<bool> {
         validate_membership_chat_id(chat_id)?;
         let mut conn = self.conn.lock();
@@ -273,6 +416,20 @@ impl MembershipStore {
             .context("Failed to commit Telegram membership revocation")?;
         Ok(changed == 1)
     }
+}
+
+pub(crate) fn normalize_telegram_username(username: &str) -> Result<String> {
+    let username = username.strip_prefix('@').unwrap_or(username);
+    let valid = !username.is_empty()
+        && username.len() <= 32
+        && username.as_bytes()[0].is_ascii_alphabetic()
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid {
+        bail!("Invalid Telegram username");
+    }
+    Ok(username.to_ascii_lowercase())
 }
 
 fn membership_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Membership> {
@@ -475,6 +632,113 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_grants_are_case_insensitive_persistent_and_single_use() {
+        let dir = temp_data_dir();
+        {
+            let store = open_test_store(&dir);
+            store.create_handle_grant("@Alice_1", 10).unwrap();
+            assert_eq!(store.pending_handles(11).unwrap(), ["alice_1"]);
+        }
+        let store = open_test_store(&dir);
+        let member = store.redeem_handle("ALICE_1", 1234, 11).unwrap();
+        assert_eq!(member.chat_id, 1234);
+        assert_eq!(member.kind, MembershipKind::Private);
+        assert!(store.pending_handles(11).unwrap().is_empty());
+        assert!(store.redeem_handle("alice_1", 5678, 12).is_err());
+        assert_eq!(store.membership(1234).unwrap(), Some(member));
+        assert_eq!(store.membership(5678).unwrap(), None);
+        // A fresh owner approval is required after each claim. Telegram handles
+        // can be reassigned, so the numeric membership remains the identity.
+        store.create_handle_grant("@Alice_1", 20).unwrap();
+        store.redeem_handle("alice_1", 5678, 21).unwrap();
+        assert_eq!(
+            store.membership(1234).unwrap().unwrap().kind,
+            MembershipKind::Private
+        );
+        assert_eq!(
+            store.membership(5678).unwrap().unwrap().kind,
+            MembershipKind::Private
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_grant_rejects_wrong_expired_and_cancelled_claims() {
+        let dir = temp_data_dir();
+        let store = open_test_store(&dir);
+        store.create_handle_grant("@short", 10).unwrap();
+        assert!(store.redeem_handle("other", 1234, 11).is_err());
+        assert!(
+            store
+                .redeem_handle("short", 1234, 10 + INVITE_TTL_SECONDS)
+                .is_err()
+        );
+        assert!(
+            store
+                .pending_handles(10 + INVITE_TTL_SECONDS)
+                .unwrap()
+                .is_empty()
+        );
+        store.create_handle_grant("@cancel_me", 20).unwrap();
+        assert!(store.revoke_pending_handle("CANCEL_ME").unwrap());
+        assert!(!store.revoke_pending_handle("cancel_me").unwrap());
+        assert!(store.redeem_handle("cancel_me", 1234, 21).is_err());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_grants_share_the_outstanding_invite_limit() {
+        let dir = temp_data_dir();
+        let store = open_test_store(&dir);
+        for index in 0..MAX_OUTSTANDING_INVITES - 1 {
+            store
+                .create_handle_grant(&format!("user_{index}"), 10)
+                .unwrap();
+        }
+        store.create_invite(10).unwrap();
+        assert!(store.create_invite(10).is_err());
+        assert!(store.create_handle_grant("overflow", 10).is_err());
+        store.create_handle_grant("user_0", 11).unwrap();
+        // Once the handle grants expire, the older link no longer blocks a new grant.
+        store
+            .create_handle_grant("after_expiry", 24 * 60 * 60 + 10)
+            .unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn telegram_username_validation_is_ascii_and_bounded_without_a_five_char_minimum() {
+        assert_eq!(normalize_telegram_username("@a").unwrap(), "a");
+        assert_eq!(
+            normalize_telegram_username("@Mixed_Name").unwrap(),
+            "mixed_name"
+        );
+        assert_eq!(
+            normalize_telegram_username(&format!("@{}", "a".repeat(32)))
+                .unwrap()
+                .len(),
+            32
+        );
+        for invalid in [
+            "@",
+            "@_starts_with_underscore",
+            "@a-b",
+            "@a.b",
+            "@a/b",
+            "https://t.me/user",
+            "@abcdeabcdeabcdeabcdeabcdeabcdeabc",
+        ] {
+            assert!(
+                normalize_telegram_username(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]

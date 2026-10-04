@@ -4907,9 +4907,9 @@ impl TelegramChannel {
     }
 
     /// Turn Telegram's static location and venue payloads into plain-text
-    /// context. These are sender-shared pins, not claims about where the
-    /// sender lives. Live locations are accepted as a snapshot of this update;
-    /// later edits are not subscribed to or tracked.
+    /// context. A shared pin identifies a place; it does not establish the
+    /// sender's current location or their relationship to it. Live locations
+    /// are accepted as a snapshot of this update; later edits are not tracked.
     fn shared_location_content(message: &serde_json::Value) -> Option<String> {
         let venue = message.get("venue");
         let location = venue
@@ -4927,9 +4927,8 @@ impl TelegramChannel {
             return None;
         }
 
-        let mut content = String::from(
-            "[Shared location snapshot; shared by the sender, not necessarily where they live]\n",
-        );
+        let mut content =
+            String::from("[Shared location snapshot; a place selected by the sender]\n");
         if let Some(title) = venue
             .and_then(|venue| venue.get("title"))
             .and_then(serde_json::Value::as_str)
@@ -16985,7 +16984,11 @@ mod tests {
         assert!(parsed.content.contains("37.4219983, -122.084"));
         assert!(parsed.content.contains("Horizontal accuracy: 12.5 m"));
         assert!(parsed.content.contains("Live location period: 900 seconds"));
-        assert!(parsed.content.contains("not necessarily where they live"));
+        assert!(
+            parsed
+                .content
+                .contains("[Shared location snapshot; a place selected by the sender]")
+        );
 
         let venue = serde_json::json!({
             "message": {
