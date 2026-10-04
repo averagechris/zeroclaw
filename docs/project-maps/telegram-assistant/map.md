@@ -2,24 +2,31 @@
 
 ## Destination
 
-An always-on Michi deployment with isolated invited DMs and groups, useful media
-tools, and workspace-bound memo memory. Finish the memo and owner video-editing
-trial, verify it in Telegram, and keep the deployment reproducible.
+Extend the deployed Telegram assistant with concrete tools. For each capability,
+choose the integration, chat permissions, account ownership, and smallest useful
+end-to-end check before implementation.
 
 ## Notes
 
 Current scope, 2026-10-03:
 
-- Dynamic invitations, isolated agent workspaces, Kagi, media understanding,
-  image generation, and smooth streaming are deployed.
-- Replace native durable memory with [memo](issues/22-memo-trial.md). Start with
-  empty stores, without importing previous memories. Cross-chat sharing is deferred.
-- Enable shell and FFmpeg only for the owner's private agent. Keep the host sandbox.
-- The original V1 decisions below are historical where later decisions supersede them.
-  The live host configuration and rollout procedures live in
+- The [deployed baseline](issues/23-deployed-baseline.md) includes dynamic
+  invitations, isolated memo stores, media understanding, image generation and
+  editing, Kagi search and extraction, location input, and owner video editing.
+- Invitation enrollment and private memory passed the operator's Telegram test.
+  Memo wakes use 256 lines, configured in Nix. Useful memories are saved quietly.
+- Cross-chat memory sharing remains deferred. Owner shell remains private to the
+  owner DM and keeps the host sandbox. Invited DMs and groups do not get shell.
+- The next extension is [owner shell and browser tools](issues/24-remote-codex-control.md),
+  using `rdny` and `gh`. GitHub CLI will use a personal token limited to selected
+  personal repositories. Thorny will use a separate ChatGPT/Codex account. Do not
+  connect work sessions or credentials. Linear, Granola, and Slack are excluded.
+  Native desktop control and Codex task orchestration are deferred.
+- The original V1 decisions below are historical where later decisions supersede
+  them. Live host configuration and rollout procedures live in
   [the host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md).
 
-Standing constraints from the original discovery (Chris):
+Historical constraints from the original discovery:
 
 - One daemon, one host. Hostile multi-tenant isolation is not a goal. The
   goal is that the partner cannot accidentally act through the owner's
@@ -117,6 +124,7 @@ Agents scan this directory for open, unblocked child decisions.
 
 ## Decisions so far
 
+- [Deployed baseline](issues/23-deployed-baseline.md): invitations and isolated memo are verified; media tools, Kagi extraction, owner video editing, and location input are deployed.
 - [Memo trial](issues/22-memo-trial.md): use a workspace-bound CLI tool with empty stores; disable native durable memory and defer sharing.
 
 - [Launch sequence](issues/16-launch-sequence.md): establish the
@@ -194,28 +202,24 @@ Agents scan this directory for open, unblocked child decisions.
 
 ## Not yet specified
 
-None for the text-only V1 plan. Verify the one-bot route contract during
-implementation; if it cannot pass its isolation tests, return to the owner
-before using the three-bot fallback.
+- rdny on Thorny: verify how a dedicated Chromium session can run within the
+  existing service sandbox. See [owner shell and browser tools](issues/24-remote-codex-control.md).
+- Location tools: choose reverse geocoding and native Telegram pin delivery.
+  Coordinate input already works; an exact street address is not supplied by it.
+- Kagi lenses: teach their behavior and choose useful filters before creating
+  named lenses. Default search remains the current preference.
+- Personal account tools: choose a concrete service before resuming
+  [per-principal integrations](issues/09-per-principal-integration-mechanism.md).
 
 ## Out of scope
 
-- Temporary or approved cross-principal integration access. Deferred by the
-   owner to a later version.
-- Personal Google/MCP integrations and their OAuth/token mechanism are
-  deferred beyond V1. Keep the prior research question in
-  [Per-principal integration mechanism](issues/09-per-principal-integration-mechanism.md)
-  for when a concrete service is requested.
-- Meme creation, image manipulation, and audio/video transcription from a URL
-  or file are deferred ideas, not rejected, and are out of scope for the
-  initial launch.
-- Receiving Telegram images, files, and voice is a fast follow after the
-  text-only route has proved agent-owned storage and tool boundaries.
+- Cross-chat memory sharing and temporary access to another principal's account.
+  Both remain deferred until the owner revisits their consent rules.
+- Automatic fallback to paid model APIs. The deployment uses the selected
+  subscription providers and does not silently incur a new provider's charges.
 - Hostile multi-tenant isolation, OIDC login, and gateway or web dashboard
-  authentication. Upstream trackers own that work and it is not needed for a
-  household of two.
-- Upstream branch renaming. The fork's `main` migration and its fork-only CI
-  compatibility commit were explicitly requested separately from this bot
-  discovery. Do not publish the bot plan or implement bot features yet.
-- Bot implementation and upstream proposals. Delivery starts after an
-  explicit human decision to leave discovery.
+  authentication. These are outside the personal assistant's current scope.
+- Broad integration frameworks without a selected tool. Follow
+  [Tool extension DX](issues/15-tool-extension-dx.md) for each concrete addition.
+- Native desktop control and Codex task orchestration from Telegram. The current
+  scope is owner-only shell access with `rdny` and `gh`.
