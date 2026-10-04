@@ -1309,6 +1309,7 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git write commands 
 
 # Durable Telegram invitations and group activation.
 channel-telegram-invitation-created = Share this invitation privately. It expires and can be used once: { $link }
+channel-telegram-invitation-handle-created = { $handle } can join within 24 hours. Copy this link to them and ask them to press Start: { $link }
 channel-telegram-invitation-welcome = You're invited. Send a message to start your private conversation.
 channel-telegram-invitation-invalid = This invitation is invalid, expired, or already used. Ask the owner for a new invitation.
 channel-telegram-invitation-required = Ask the owner for a private invitation to this bot.
@@ -1320,9 +1321,16 @@ channel-telegram-invitation-group-active = This group is approved. Its conversat
 channel-telegram-invitation-group-only = Send /activate in the group you want to approve.
 channel-telegram-invitation-no-guests = There are no active invited chats.
 channel-telegram-invitation-guests = Active invited chats:
-    { $entries }
+{ $entries }
+channel-telegram-invitation-guests-pending = Active invited chats:
+{ $entries }
+Pending handles:
+{ $handles }
 channel-telegram-invitation-revoked = Access revoked. Existing memory and conversation history are retained.
 channel-telegram-invitation-no-membership = This chat has no active invitation membership.
-channel-telegram-invitation-revoke-usage = Use /revoke followed by a numeric chat ID from /guests.
+channel-telegram-invitation-revoke-usage = Use /revoke followed by a numeric chat ID or @handle from /guests.
+channel-telegram-invitation-handle-revoked = Pending access for that handle was cancelled.
+channel-telegram-invitation-no-pending-handle = That handle has no pending invitation. Use /guests to find an active chat ID, then /revoke <chat-id> to revoke access.
+channel-telegram-invitation-invite-usage = Use /invite by itself for a single-use link, or /invite @handle to approve a Telegram username.
 
 channel-telegram-invitation-settings-restricted = The owner manages this chat's model and settings.
