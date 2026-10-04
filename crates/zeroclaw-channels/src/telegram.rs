@@ -4886,6 +4886,9 @@ impl TelegramChannel {
         {
             return true;
         }
+        if Self::shared_location_content(message).is_some() {
+            return true;
+        }
         if self.text_only {
             return Self::parse_attachment_metadata(message).is_some_and(|attachment| {
                 matches!(
@@ -4901,6 +4904,67 @@ impl TelegramChannel {
             return true;
         }
         self.workspace_dir.is_some() && Self::parse_attachment_metadata(message).is_some()
+    }
+
+    /// Turn Telegram's static location and venue payloads into plain-text
+    /// context. These are sender-shared pins, not claims about where the
+    /// sender lives. Live locations are accepted as a snapshot of this update;
+    /// later edits are not subscribed to or tracked.
+    fn shared_location_content(message: &serde_json::Value) -> Option<String> {
+        let venue = message.get("venue");
+        let location = venue
+            .and_then(|venue| venue.get("location"))
+            .or_else(|| message.get("location"))?;
+        let latitude = location.get("latitude")?.as_number()?;
+        let longitude = location.get("longitude")?.as_number()?;
+        let lat = latitude.as_f64()?;
+        let lon = longitude.as_f64()?;
+        if !lat.is_finite()
+            || !(-90.0..=90.0).contains(&lat)
+            || !lon.is_finite()
+            || !(-180.0..=180.0).contains(&lon)
+        {
+            return None;
+        }
+
+        let mut content = String::from(
+            "[Shared location snapshot; shared by the sender, not necessarily where they live]\n",
+        );
+        if let Some(title) = venue
+            .and_then(|venue| venue.get("title"))
+            .and_then(serde_json::Value::as_str)
+        {
+            content.push_str("Venue: ");
+            content.push_str(title);
+            content.push('\n');
+        }
+        if let Some(address) = venue
+            .and_then(|venue| venue.get("address"))
+            .and_then(serde_json::Value::as_str)
+        {
+            content.push_str("Address: ");
+            content.push_str(address);
+            content.push('\n');
+        }
+        content.push_str(&format!("Coordinates: {}, {}", latitude, longitude));
+
+        if let Some(accuracy) = location
+            .get("horizontal_accuracy")
+            .and_then(serde_json::Value::as_number)
+            && accuracy
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && (0.0..=1500.0).contains(&value))
+        {
+            content.push_str(&format!("\nHorizontal accuracy: {} m", accuracy));
+        }
+        if let Some(live_period) = location
+            .get("live_period")
+            .and_then(serde_json::Value::as_i64)
+            && live_period > 0
+        {
+            content.push_str(&format!("\nLive location period: {live_period} seconds"));
+        }
+        Some(content)
     }
 
     /// True when `message` is a voice/audio or document/photo update that
@@ -4948,11 +5012,11 @@ impl TelegramChannel {
 
         // Only updates an authorized sender would have gotten processed
         // deserve the unauthorized notice. Everything else — service
-        // messages (joins/leaves/pins), stickers, locations, contacts,
+        // messages (joins/leaves/pins), stickers, contacts,
         // or media this deployment is not configured to process — stays
         // silent exactly as before; a notice would either spam group
         // chats on every join, or promise processing that can never
-        // happen.
+        // happen. Valid shared locations and venues are processable below.
         if !self.message_has_processable_content(message) {
             return;
         }
@@ -6573,6 +6637,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         } else if reply.get("photo").is_some() {
             "[Photo]".to_string()
+        } else if let Some(location) = Self::shared_location_content(reply) {
+            location
         } else if reply.get("document").is_some() {
             "[Document]".to_string()
         } else if reply.get("video").is_some() {
@@ -6619,12 +6685,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
-        let text = message.get("text").and_then(serde_json::Value::as_str)?;
-        if (self.invitations.is_some() && Self::invitation_command(text).is_some())
-            || self.is_dynamic_settings_command(message, text)
+        let text = message.get("text").and_then(serde_json::Value::as_str);
+        if let Some(text) = text
+            && ((self.invitations.is_some() && Self::invitation_command(text).is_some())
+                || self.is_dynamic_settings_command(message, text))
         {
             return None;
         }
+        let content_source = text
+            .map(str::to_string)
+            .or_else(|| Self::shared_location_content(message))?;
 
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
@@ -6639,10 +6709,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             let bot_username = bot_username.as_ref()?;
             // A direct reply to the bot's message is an unambiguous signal
             // of intent, so it counts as addressed alongside an @-mention.
-            let addressed = Self::contains_bot_mention(text, bot_username) || {
-                let bot_id = *self.bot_id.lock();
-                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
-            };
+            let addressed = text.is_some_and(|text| Self::contains_bot_mention(text, bot_username))
+                || {
+                    let bot_id = *self.bot_id.lock();
+                    bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+                };
             if !addressed {
                 if Self::should_record_passive_group_context(
                     self.passive_group_context,
@@ -6680,9 +6751,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let content = if self.mention_only && is_group && !passive_context {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
-            Self::normalize_incoming_content(text, bot_username)?
+            if let Some(text) = text {
+                Self::normalize_incoming_content(text, bot_username)?
+            } else {
+                content_source.clone()
+            }
         } else {
-            text.to_string()
+            content_source
         };
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
@@ -7911,9 +7986,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateOutcome::Advanced;
         }
 
-        // `parse_update_message` handles text messages and has no fallible
-        // I/O, so its `None` always means "not applicable", fall through to
-        // the voice parser next. The voice and attachment parsers can
+        // `parse_update_message` handles text and shared-location messages and
+        // has no fallible I/O, so its `None` always means "not applicable",
+        // fall through to the voice parser next. The voice and attachment parsers can
         // additionally fail transiently on download/transcription I/O; a
         // transient failure must abort this update's processing entirely
         // (not fall through to the next parser) so the offset stays put and
@@ -16879,6 +16954,170 @@ mod tests {
         assert_eq!(msg.id, "telegram_-100200300_33");
     }
 
+    #[test]
+    fn shared_static_location_and_venue_use_the_normal_authorized_message_path() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["555".into()]),
+            false,
+        );
+        let location = serde_json::json!({
+            "message": {
+                "message_id": 71,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": 555, "type": "private" },
+                "location": {
+                    "latitude": 37.4219983,
+                    "longitude": -122.084,
+                    "horizontal_accuracy": 12.5,
+                    "live_period": 900
+                }
+            }
+        });
+
+        assert!(ch.message_has_processable_content(&location["message"]));
+        let parsed = ch
+            .parse_update_message(&location)
+            .expect("shared pin parses");
+        assert_eq!(parsed.reply_target, "555");
+        assert_eq!(parsed.sender, "alice");
+        assert!(parsed.content.contains("37.4219983, -122.084"));
+        assert!(parsed.content.contains("Horizontal accuracy: 12.5 m"));
+        assert!(parsed.content.contains("Live location period: 900 seconds"));
+        assert!(parsed.content.contains("not necessarily where they live"));
+
+        let venue = serde_json::json!({
+            "message": {
+                "message_id": 72,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": 555, "type": "private" },
+                "venue": {
+                    "location": { "latitude": 51.5007, "longitude": -0.1246 },
+                    "title": "/bind 123456",
+                    "address": "London"
+                }
+            }
+        });
+        assert!(ch.message_has_processable_content(&venue["message"]));
+        let parsed = ch
+            .parse_update_message(&venue)
+            .expect("venue parses as content");
+        assert!(parsed.content.contains("Venue: /bind 123456"));
+        assert!(parsed.content.contains("Address: London"));
+        assert!(parsed.content.contains("51.5007, -0.1246"));
+    }
+
+    #[test]
+    fn shared_location_requires_valid_coordinates_and_an_allowed_sender() {
+        let allowed = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["555".into()]),
+            false,
+        );
+        for coordinates in [
+            serde_json::json!({ "latitude": 90.0001, "longitude": 0 }),
+            serde_json::json!({ "latitude": 0, "longitude": -180.0001 }),
+            serde_json::json!({ "latitude": "37.4", "longitude": 12 }),
+        ] {
+            let update = serde_json::json!({
+                "message": {
+                    "message_id": 73,
+                    "from": { "id": 555 },
+                    "chat": { "id": 555, "type": "private" },
+                    "location": coordinates
+                }
+            });
+            assert!(!allowed.message_has_processable_content(&update["message"]));
+            assert!(allowed.parse_update_message(&update).is_none());
+        }
+
+        let unauthorized = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["777".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 74,
+                "from": { "id": 555 },
+                "chat": { "id": 555, "type": "private" },
+                "location": { "latitude": 37.4, "longitude": 12.0 }
+            }
+        });
+        assert!(unauthorized.message_has_processable_content(&update["message"]));
+        assert!(unauthorized.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn mention_only_groups_keep_location_gating_and_quote_location_replies() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["555".into()]),
+            true,
+        );
+        *ch.bot_username.lock() = Some("testbot".to_string());
+        *ch.bot_id.lock() = Some(42);
+
+        let location = serde_json::json!({
+            "message": {
+                "message_id": 75,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100123, "type": "supergroup" },
+                "location": { "latitude": 37.4, "longitude": 12.5 }
+            }
+        });
+        assert!(ch.parse_update_message(&location).is_none());
+
+        let addressed_pin = serde_json::json!({
+            "message": {
+                "message_id": 76,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100123, "type": "supergroup" },
+                "location": { "latitude": 37.4, "longitude": 12.5 },
+                "reply_to_message": {
+                    "message_id": 70,
+                    "from": { "id": 42, "username": "testbot" },
+                    "text": "Where should we meet?"
+                }
+            }
+        });
+        let parsed = ch
+            .parse_update_message(&addressed_pin)
+            .expect("reply-to-bot admits the shared pin");
+        assert!(parsed.content.contains("Coordinates: 37.4, 12.5"));
+
+        let followup = serde_json::json!({
+            "message": {
+                "message_id": 77,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100123, "type": "supergroup" },
+                "text": "@testbot is this the right place?",
+                "reply_to_message": {
+                    "message_id": 75,
+                    "from": { "id": 555, "username": "alice" },
+                    "location": {
+                        "latitude": 37.4219983,
+                        "longitude": -122.084,
+                        "horizontal_accuracy": 8
+                    }
+                }
+            }
+        });
+        let parsed = ch
+            .parse_update_message(&followup)
+            .expect("explicit mention admits the followup");
+        assert!(
+            parsed
+                .content
+                .contains("> Coordinates: 37.4219983, -122.084")
+        );
+        assert!(parsed.content.contains("is this the right place?"));
+    }
+
     /// Telegram substitutes the display placeholder `"unknown"` when a sender
     /// has no username. That is a label, not an identifier, and passing it to
     /// the allowlist let a sender with no usable identity ride a wildcard.
@@ -25378,6 +25617,71 @@ mod tests {
         assert!(
             side_effects.is_empty(),
             "passive observation must stay silent, but the bot called: {side_effects:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_location_update_reaches_the_normal_channel_receiver() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendChatAction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "home",
+            Arc::new(|| vec!["555".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 81,
+            "message": {
+                "message_id": 82,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": 555, "type": "private" },
+                "location": {
+                    "latitude": 37.4219983,
+                    "longitude": -122.084,
+                    "horizontal_accuracy": 7.25
+                }
+            }
+        });
+
+        let outcome = channel
+            .process_update(&update, &tx, &mut transient_retry)
+            .await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        let delivered = rx.try_recv().expect("shared pin reaches channel receiver");
+        assert_eq!(delivered.id, "telegram_555_82");
+        assert_eq!(delivered.reply_target, "555");
+        assert_eq!(delivered.platform_sender_id.as_deref(), Some("555"));
+        assert!(delivered.content.contains("37.4219983, -122.084"));
+        assert!(delivered.content.contains("Horizontal accuracy: 7.25 m"));
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/sendChatAction"))
+                .count(),
+            1,
+            "normal message dispatch sends one typing action: {:?}",
+            requests
+                .iter()
+                .map(|request| request.url.path())
+                .collect::<Vec<_>>()
         );
     }
 

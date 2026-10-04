@@ -287,6 +287,23 @@ Get the IDs from `getUpdates` while no ZeroClaw process is polling the token:
 Converting a group to a supergroup gives it a new `-100…` chat ID, and its
 route stops matching until you update it.
 
+## Shared locations and venues
+
+Authorized senders can share a static location pin or Telegram venue. ZeroClaw
+passes the coordinates to the agent, along with a venue's title and address
+when present. Optional horizontal accuracy and live-period values are included
+when valid. The context labels these as locations shared by the sender; a pin
+does not establish where that person lives.
+
+Coordinates outside latitude `-90…90` or longitude `-180…180`, and malformed
+location payloads, are ignored. A live location is treated as a snapshot of the
+update received. Telegram location edits are not subscribed to, so subsequent
+movement updates are not consumed. No address lookup is performed.
+
+The normal peer allowlist and group `mention_only` rules still apply. In a
+mention-only group, share the pin as a reply to one of the bot's messages, or
+mention the bot in a follow-up reply to the pin.
+
 ## Invite friends and approve groups dynamically
 
 Enable `invitations` to enroll people without editing routes or restarting.
