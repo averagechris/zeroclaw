@@ -129,9 +129,50 @@ async fn run_cron_once(config: Config, overrides: AgentRunOverrides) -> Vec<Stri
 }
 
 fn body_advertises_memory_tool(body: &str) -> bool {
-    zeroclaw_tools::MEMORY_TOOL_NAMES
-        .iter()
-        .any(|name| body.contains(name))
+    let request: serde_json::Value =
+        serde_json::from_str(body).expect("captured provider request is valid JSON");
+    let is_memory_tool = |name: &str| zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&name);
+
+    let native_tool_advertised = request
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| tool.get("name").and_then(serde_json::Value::as_str))
+                    .is_some_and(is_memory_tool)
+            })
+        });
+    if native_tool_advertised {
+        return true;
+    }
+
+    request
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                if message.get("role").and_then(serde_json::Value::as_str) != Some("system") {
+                    return false;
+                }
+                let content = message.get("content");
+                let has_tool_heading = |text: &str| {
+                    zeroclaw_tools::MEMORY_TOOL_NAMES
+                        .iter()
+                        .any(|name| text.contains(&format!("**{name}**:")))
+                };
+                match content {
+                    Some(serde_json::Value::String(text)) => has_tool_heading(text),
+                    Some(serde_json::Value::Array(parts)) => parts.iter().any(|part| {
+                        part.get("text")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(has_tool_heading)
+                    }),
+                    _ => false,
+                }
+            })
+        })
 }
 
 #[tokio::test]

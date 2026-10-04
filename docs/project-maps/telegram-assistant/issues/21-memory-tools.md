@@ -12,6 +12,9 @@ option?
 
 ## Answer
 
+Historical bootstrap decision. Superseded by the owner-authorized
+[memo trial](22-memo-trial.md) on 2026-10-03. The original rationale follows.
+
 Yes. Use ZeroClaw's built-in memory tools on the default SQLite backend for
 all three agents from the first routing stage. Do not add a community memory
 server in V1.

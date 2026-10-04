@@ -308,6 +308,12 @@ pub struct Config {
     #[nested]
     pub memory: MemoryConfig,
 
+    /// Opt-in local memo CLI integration (`[memo]`).
+    #[serde(default, skip_serializing_if = "MemoConfig::is_disabled")]
+    #[nested]
+    #[group = "Agent"]
+    pub memo: MemoConfig,
+
     /// Persistent storage model_provider configuration (`[storage]`).
     #[serde(default)]
     #[nested]
@@ -5084,6 +5090,7 @@ impl Config {
                         "memory_recall"
                             | "memory_store"
                             | "memory_forget"
+                            | "memo"
                             | "web_search_tool"
                             | "reaction"
                             | "image_gen"
@@ -12654,6 +12661,87 @@ pub enum SearchMode {
     /// Weighted combination of keyword + vector (default)
     #[default]
     Hybrid,
+}
+
+/// Local `memo` CLI integration configuration (`[memo]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memo"]
+pub struct MemoConfig {
+    /// Register the scoped `memo` tool for channel agents.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Executable path used for the `memo` CLI. Passed directly without a shell.
+    #[serde(default = "default_memo_executable")]
+    pub executable: String,
+    /// Maximum wake context size in memo's line units (1–96).
+    #[serde(default = "default_memo_wake_lines")]
+    pub wake_lines: usize,
+}
+
+impl MemoConfig {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        !self.enabled
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.executable.trim().is_empty() && !self.executable.contains('\0'),
+            "memo.executable must name an executable"
+        );
+        anyhow::ensure!(
+            (1..=96).contains(&self.wake_lines),
+            "memo.wake_lines must be between 1 and 96"
+        );
+        Ok(())
+    }
+}
+
+impl Default for MemoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executable: default_memo_executable(),
+            wake_lines: default_memo_wake_lines(),
+        }
+    }
+}
+
+fn default_memo_executable() -> String {
+    "memo".into()
+}
+
+fn default_memo_wake_lines() -> usize {
+    96
+}
+
+#[cfg(test)]
+mod memo_config_tests {
+    use super::MemoConfig;
+
+    #[test]
+    fn memo_limits_are_validated() {
+        assert!(MemoConfig::default().validate().is_ok());
+        assert!(
+            MemoConfig {
+                executable: "  ".into(),
+                ..MemoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        for wake_lines in [0, 97] {
+            assert!(
+                MemoConfig {
+                    wake_lines,
+                    ..MemoConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
 }
 
 /// Memory backend configuration (`[memory]` section).
@@ -21205,6 +21293,7 @@ impl Default for Config {
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            memo: MemoConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
@@ -23729,6 +23818,7 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        self.memo.validate()?;
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
 
@@ -32544,6 +32634,7 @@ auto_save = true
                 debounce_ms: 0,
             },
             memory: MemoryConfig::default(),
+            memo: MemoConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
@@ -33780,6 +33871,7 @@ default_temperature = 0.7
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
             memory: MemoryConfig::default(),
+            memo: MemoConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),

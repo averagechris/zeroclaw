@@ -63,6 +63,7 @@ pub mod mcp_resource;
 pub mod mcp_resources_tool;
 pub mod mcp_tool;
 pub mod mcp_transport;
+pub mod memo;
 pub mod memory_export;
 pub mod memory_forget;
 pub mod memory_purge;
@@ -100,6 +101,7 @@ pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_forget",
     "memory_export",
     "memory_purge",
+    "memo",
 ];
 
 /// Shared test-only isolation for the process-global runtime proxy state that
@@ -167,6 +169,12 @@ mod memory_tool_names_guard {
             Box::new(memory_export::MemoryExportTool::new(memory.clone())),
             Box::new(memory_purge::MemoryPurgeTool::new(
                 memory.clone(),
+                security.clone(),
+            )),
+            Box::new(memo::MemoTool::new(
+                "memo",
+                std::path::Path::new("/tmp/memo-test-workspace"),
+                96,
                 security.clone(),
             )),
         ];
