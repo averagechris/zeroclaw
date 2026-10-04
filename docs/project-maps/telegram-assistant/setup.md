@@ -27,6 +27,8 @@ auto_save = false
 hygiene_enabled = false
 ```
 
+`wake_lines` accepts 1 to 256 memo lines and defaults to 96.
+
 Grant and auto-approve `memo` for each participating risk profile. Remove the
 native memory tool grants. Keep `workspace.read_memory_from` empty. Use a
 separate agent alias and workspace for each DM or group; shared aliases share

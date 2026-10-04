@@ -12674,7 +12674,7 @@ pub struct MemoConfig {
     /// Executable path used for the `memo` CLI. Passed directly without a shell.
     #[serde(default = "default_memo_executable")]
     pub executable: String,
-    /// Maximum wake context size in memo's line units (1–96).
+    /// Maximum wake context size in memo line units (1..=256; default 96).
     #[serde(default = "default_memo_wake_lines")]
     pub wake_lines: usize,
 }
@@ -12691,8 +12691,8 @@ impl MemoConfig {
             "memo.executable must name an executable"
         );
         anyhow::ensure!(
-            (1..=96).contains(&self.wake_lines),
-            "memo.wake_lines must be between 1 and 96"
+            (1..=256).contains(&self.wake_lines),
+            "memo.wake_lines must be between 1 and 256"
         );
         Ok(())
     }
@@ -12731,7 +12731,16 @@ mod memo_config_tests {
             .validate()
             .is_err()
         );
-        for wake_lines in [0, 97] {
+        assert_eq!(MemoConfig::default().wake_lines, 96);
+        assert!(
+            MemoConfig {
+                wake_lines: 256,
+                ..MemoConfig::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        for wake_lines in [0, 257] {
             assert!(
                 MemoConfig {
                     wake_lines,
