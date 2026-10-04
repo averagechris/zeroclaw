@@ -48,4 +48,10 @@ policy. The host pins the memo package and supplies its absolute executable path
 
 ## Delivery links
 
-Source and host pull requests will record the verified revision and rollout.
+- [Memo tool](https://github.com/averagechris/zeroclaw/pull/23)
+- [256-line wake support](https://github.com/averagechris/zeroclaw/pull/24)
+- [Initial host rollout](https://github.com/averagechris/dotfiles/pull/37)
+- [Quiet proactive memory and 256-line Nix budget](https://github.com/averagechris/dotfiles/pull/39)
+
+The operator confirmed the isolated memory workflow in Telegram. The verified
+revision is recorded in [Deployed baseline](23-deployed-baseline.md).
