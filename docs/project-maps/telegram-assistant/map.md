@@ -1,27 +1,48 @@
 # Personal Telegram assistant on ZeroClaw
 
-## Destination
+## Current scope
 
-Extend the deployed Telegram assistant with concrete tools. For each capability,
-choose the integration, chat permissions, account ownership, and smallest useful
-end-to-end check before implementation.
+Thorny runs one ZeroClaw daemon for the owner's DM, invited friends' separate
+DMs, and approved groups. Each routed chat has its own agent, workspace,
+conversation, and `memo` store. The deployed baseline includes Kagi search and
+single-page extraction, photo and voice understanding, short-video inspection,
+image generation and editing, Telegram location and venue input, and owner-only
+video editing. Only the owner DM has shell, `gh`, `rdny`, and Codex coding and
+session-inspection commands. Guests and groups never receive owner tools, even
+when the owner speaks there.
+
+The canonical live configuration and operational procedures are in the
+[Thorny host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md)
+and [Nix module](https://github.com/averagechris/dotfiles/blob/main/flakes/hosts/thorny/zeroclaw.nix).
+Keep this public map free of credentials and personal identities. Host-specific
+operational guidance belongs in that runbook; secrets remain in encrypted
+deployment storage. The separate Thorny Codex login and credentials must not be
+mixed with work accounts or workstation credentials.
+
+The immediate frontier is reliable follow-up for Michi-submitted Codex jobs.
+That work is in progress and is not yet part of the deployed baseline. Phone-
+started sessions remain quiet unless explicitly opted in. Scheduling tools
+exist in the fork, but are not granted to any Thorny agent. The scheduler loop
+uses its default enabled setting while heartbeat is disabled; neither fact
+grants a chat the scheduling tools. Enable conversational schedules only after
+validating ownership, isolated context and tools, intended-chat delivery,
+restart and missed-run behavior, timezone handling, and cost limits.
 
 ## Notes
 
-Current scope, 2026-10-03:
+Historical baseline record, 2026-10-03 (superseded by the current scope above):
 
-- The [deployed baseline](issues/23-deployed-baseline.md) includes dynamic
-  invitations, isolated memo stores, media understanding, image generation and
-  editing, Kagi search and extraction, location input, and owner video editing.
+- The [deployed baseline record](issues/23-deployed-baseline.md) documents the
+  earlier rollout; its open-work statements are historical and superseded by
+  the current scope and frontier in this map.
 - Invitation enrollment and private memory passed the operator's Telegram test.
   Memo wakes use 256 lines, configured in Nix. Useful memories are saved quietly.
 - Cross-chat memory sharing remains deferred. Owner shell remains private to the
   owner DM and keeps the host sandbox. Invited DMs and groups do not get shell.
-- The next extension is [owner shell and browser tools](issues/24-remote-codex-control.md),
-  using `rdny` and `gh`. GitHub CLI will use a personal token limited to selected
-  personal repositories. Thorny will use a separate ChatGPT/Codex account. Do not
-  connect work sessions or credentials. Linear, Granola, and Slack are excluded.
-  Native desktop control and Codex task orchestration are deferred.
+- Owner shell, `rdny`, `gh`, Codex job submission, and phone session inspection
+  have since been deployed. See the host runbook for current details.
+  Linear, Granola, and Slack remain excluded. Native desktop control remains
+  deferred; no desktop GUI or general desktop control is installed.
 - The original V1 decisions below are historical where later decisions supersede
   them. Live host configuration and rollout procedures live in
   [the host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md).
@@ -49,9 +70,8 @@ Historical constraints from the original discovery:
   owner's Kagi API usage limit is already configured in his account. Kagi
   misconfiguration fails at startup. If Kagi fails at runtime, the agent asks
   before using DuckDuckGo; the person's "yes" in chat is enough.
-- All three agents get the built-in memory tools (`memory_recall`,
-  `memory_store`, `memory_forget`) on the default SQLite backend. Each
-  agent's memory stays its own.
+- Historical launch choice: all three agents were initially planned to use
+  built-in memory tools and SQLite. This was superseded by the memo trial below.
 - Once the memory-tools-only baseline works, only the owner's private agent may run
   shell from Telegram, without a per-call human prompt. A command denylist
   is not a reliable safety boundary; route isolation and the host-user
@@ -75,9 +95,8 @@ Historical constraints from the original discovery:
   at the default update interval, and disable the bot's group privacy mode in
   BotFather so it sees ordinary group messages. Bootstrap steps live in the
   [setup runbook](setup.md); keep it current as fork features land.
-- V1 processes text-only Telegram messages. Inbound attachments must be
-  rejected or ignored before shared channel storage; multimodal input is the
-  intended fast follow, not part of the first isolation proof.
+- Historical launch constraint: V1 began text-only. Media and location input
+  were added later and are part of the deployed baseline.
 - Keep each agent's long-term memory separate in V1; do not grant the
   household agent `read_memory_from` a personal agent. Use existing logs
   during routing rollout; review richer receipts when account tools arrive.
@@ -200,14 +219,18 @@ Agents scan this directory for open, unblocked child decisions.
   Profiles use explicit per-stage `allowed_tools` lists, never
   `deny_all_tools`.
 
-## Not yet specified
+## Current frontier
 
-- rdny on Thorny: verify how a dedicated Chromium session can run within the
-  existing service sandbox. See [owner shell and browser tools](issues/24-remote-codex-control.md).
-- Location tools: choose reverse geocoding and native Telegram pin delivery.
-  Coordinate input already works; an exact street address is not supplied by it.
-- Kagi lenses: teach their behavior and choose useful filters before creating
-  named lenses. Default search remains the current preference.
+- Reliable follow-up delivery for Michi-submitted Codex jobs is being
+  implemented. This includes terminal outcomes, session association, restart
+  recovery, and retries without model polling. Do not treat it as deployed until
+  the implementation and rollout are complete.
+- Conversational scheduled tasks remain disabled at the tool-grant level.
+  Decide and validate the smallest first set after the Codex follow-up work.
+- Kagi lenses: explain how lenses filter results, then choose useful filters
+  before creating named lenses. Default search remains preferred.
+- Consider `ctx` only if Michi's own coding history needs it; consider
+  `sideshow` if slide creation becomes useful.
 - Personal account tools: choose a concrete service before resuming
   [per-principal integrations](issues/09-per-principal-integration-mechanism.md).
 
@@ -221,5 +244,8 @@ Agents scan this directory for open, unblocked child decisions.
   authentication. These are outside the personal assistant's current scope.
 - Broad integration frameworks without a selected tool. Follow
   [Tool extension DX](issues/15-tool-extension-dx.md) for each concrete addition.
-- Native desktop control and Codex task orchestration from Telegram. The current
-  scope is owner-only shell access with `rdny` and `gh`.
+- Cross-chat memory sharing, temporary access to another principal's account,
+  and native desktop control remain deferred.
+- Unrequested recurring proactive behavior remains undecided. Start with
+  requested Codex follow-ups and schedules; keep unsolicited checks quiet unless
+  a specific behavior is agreed.
