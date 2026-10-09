@@ -1026,7 +1026,12 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn native_default_and_with_shell_are_different() {
         let default = NativeRuntime::new();
-        let configured = NativeRuntime::with_shell("bash".into());
+        let configured_shell = if default.shell == "bash" {
+            "zsh"
+        } else {
+            "bash"
+        };
+        let configured = NativeRuntime::with_shell(configured_shell.into());
         let cwd = std::env::temp_dir();
         let default_debug = format!(
             "{:?}",

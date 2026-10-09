@@ -438,7 +438,8 @@ impl WebSearchTool {
             .header("Accept-Language", headers.accept_language)
             .header("DNT", "1")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("duckduckgo", "request", &error))?;
         let status = response.status();
         let final_url_is_block =
             contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
@@ -450,7 +451,10 @@ impl WebSearchTool {
             return Err(http_search_failure("duckduckgo", status));
         }
 
-        let html = response.text().await?;
+        let html = response
+            .text()
+            .await
+            .map_err(|error| transport_search_failure("duckduckgo", "response", &error))?;
         let html_contains_block = contains_ascii_case_insensitive(&html, "/wr.do?")
             || contains_ascii_case_insensitive(&html, "anomaly-modal");
         if let Some(message) =
@@ -531,13 +535,17 @@ impl WebSearchTool {
             .header("Accept", "application/json")
             .header("X-Subscription-Token", &api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("brave", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("brave", response.status()));
         }
 
-        let json: serde_json::Value = response.json().await?;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| transport_search_failure("brave", "response", &error))?;
         self.parse_brave_results(&json, query)
     }
 
@@ -2071,13 +2079,17 @@ impl WebSearchTool {
             .get(&search_url)
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(|error| transport_search_failure("searxng", "request", &error))?;
 
         if !response.status().is_success() {
             return Err(http_search_failure("searxng", response.status()));
         }
 
-        let json: serde_json::Value = response.json().await?;
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| transport_search_failure("searxng", "response", &error))?;
         self.parse_searxng_results(&json, query)
     }
 
@@ -2871,6 +2883,76 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn searxng_transport_failure_does_not_expose_query_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+        let tool = WebSearchTool::new_with_config(
+            "searxng".into(),
+            None,
+            None,
+            None,
+            Some(format!("http://{address}")),
+            5,
+            1,
+            PathBuf::new(),
+            false,
+        );
+        let query = "synthetic-private 多字节 query";
+        let error = tool.execute(json!({"query": query})).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("searxng search failed"), "{message}");
+        assert!(!message.contains(query), "{message}");
+        assert!(!message.contains("synthetic-private"), "{message}");
+        assert!(!message.contains("%E5%A4%9A"), "{message}");
+        assert!(!message.contains("http://"), "{message}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn searxng_body_failure_does_not_expose_query_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let bytes_read = stream.read(&mut request).await.unwrap();
+            assert!(
+                bytes_read > 0,
+                "expected a search request before responding"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let tool = WebSearchTool::new_with_config(
+            "searxng".into(),
+            None,
+            None,
+            None,
+            Some(format!("http://{address}")),
+            5,
+            1,
+            PathBuf::new(),
+            false,
+        );
+        let query = "synthetic-private 多字节 query";
+        let error = tool.execute(json!({"query": query})).await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("stage=response"), "{message}");
+        assert!(!message.contains("synthetic-private"), "{message}");
+        assert!(!message.contains("%E5%A4%9A"), "{message}");
+        assert!(!message.contains("http://"), "{message}");
+        server.await.unwrap();
+    }
 
     #[test]
     fn test_tool_name() {

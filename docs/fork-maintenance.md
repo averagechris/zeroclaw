@@ -22,8 +22,12 @@ changes deliberately. Do not blind-merge upstream into the maintained fork.
 
 The fork was created from upstream commit `1f12418c` ("docs(developing):
 record the replacement-first integration policy (#11042)") on 2026-09-22.
-Future upstream review starts after that commit. Advance this watermark only
-after reviewing or deliberately excluding every intervening upstream change.
+Upstream was screened through `726a86dfe3b3f6dffaede9de49c2786856736e13`
+on 2026-10-09. The [review record](upstream-review-2026-10-09.md) accounts for
+all 205 intervening commits, selected ports, exclusions, and deferred security
+work. Future review starts after that tip and must carry the recorded deferred
+items forward. Advance this watermark only after reviewing or deliberately
+excluding every intervening upstream change.
 
 Keep fork-specific maintenance notes here and keep upstream project guidance
 in its existing documentation.

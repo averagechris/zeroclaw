@@ -1548,8 +1548,17 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
 
         match arg {
             "--" => return args.get(idx + 1).map(|_| idx + 1),
+            // Global options whose value is a separate following token. Git
+            // consumes that token as the option value, so the real subcommand is
+            // the token after it. Missing any of these lets a value that
+            // resembles a read verb hide the actual (possibly mutating)
+            // subcommand from the approval classifier: `git --attr-source log
+            // commit` runs `commit`, not `log`. `-c`/`--config-env` also take a
+            // separate value and are included so this resolver is correct on its
+            // own, independent of the allowlist gate that separately rejects
+            // them.
             "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--exec-path"
-            | "--super-prefix" => {
+            | "--super-prefix" | "--attr-source" | "-c" | "--config-env" => {
                 idx += 2;
             }
             "--bare"
@@ -1575,7 +1584,9 @@ fn git_effective_subcommand_index(args: &[String]) -> Option<usize> {
                 || arg.starts_with("--work-tree=")
                 || arg.starts_with("--namespace=")
                 || arg.starts_with("--exec-path=")
-                || arg.starts_with("--super-prefix=") =>
+                || arg.starts_with("--super-prefix=")
+                || arg.starts_with("--attr-source=")
+                || arg.starts_with("--config-env=") =>
             {
                 idx += 1;
             }
@@ -5498,6 +5509,59 @@ mod tests {
     }
 
     #[test]
+    fn git_value_taking_global_options_do_not_hide_a_mutating_subcommand() {
+        // Regression for the approval-classification bypass where a value-taking
+        // git global option hid the real subcommand from the risk classifier.
+        //
+        // `--attr-source`, `-c`, and `--config-env` each take a *separate*
+        // following token as their value. Git consumes that token, so the real
+        // subcommand is the one after it. When the resolver skipped only the
+        // flag (not its value), a value that looks like a read verb hid the
+        // actual mutating subcommand and the write was classified Low instead of
+        // Medium, dropping the approval requirement.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            // The value (`log`/`HEAD`) resembles a read verb; the real
+            // subcommand `commit` mutates and must stay Medium.
+            "git --attr-source log commit",
+            "git --attr-source HEAD commit",
+            "git --attr-source=HEAD commit",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Medium,
+                "value-taking global option must not hide the write subcommand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_attr_source_read_stays_low() {
+        // The fix must not over-approximate: an ordinary read behind
+        // `--attr-source` stays Low so it is not needlessly gated.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+
+        for command in [
+            "git --attr-source HEAD status",
+            "git --attr-source=HEAD log",
+            "git --attr-source HEAD diff",
+        ] {
+            assert_eq!(
+                p.command_risk_level(command),
+                CommandRiskLevel::Low,
+                "ordinary read behind --attr-source should stay low: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn command_risk_high_for_dangerous_commands() {
         let p = SecurityPolicy {
             allowed_commands: vec!["rm".into()],
@@ -8334,10 +8398,9 @@ mod tests {
         };
 
         // Path outside workspace should be allowed when workspace_only=false
-        let outside = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/home"))
-            .join("zeroclaw_outside_ws");
+        // HOME can live below a forbidden root (for example /var on service
+        // hosts). Use a synthetic path outside both workspace and deny roots.
+        let outside = PathBuf::from(tp_outside2());
         assert!(
             p.is_resolved_path_allowed(&outside),
             "workspace_only=false must allow resolved paths outside workspace"
