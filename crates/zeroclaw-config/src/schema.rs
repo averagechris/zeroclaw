@@ -15142,9 +15142,24 @@ pub struct SchedulerConfig {
     /// next scheduled occurrence instead.
     #[serde(default = "default_true")]
     pub catch_up_on_startup: bool,
+    /// How to handle tasks missed while the daemon was offline. Review asks
+    /// the owning agent to decide before acting; legacy preserves catch-up.
+    #[serde(default)]
+    pub missed_run_policy: MissedRunPolicy,
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MissedRunPolicy {
+    #[default]
+    Legacy,
+    Review,
 }
 
 fn default_scheduler_enabled() -> bool {
@@ -15166,6 +15181,7 @@ impl Default for SchedulerConfig {
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
             catch_up_on_startup: true,
+            missed_run_policy: MissedRunPolicy::Legacy,
             max_run_history: default_max_run_history(),
         }
     }
@@ -32108,6 +32124,7 @@ recipient = "42"
             max_tasks: 16,
             max_concurrent: 2,
             catch_up_on_startup: false,
+            missed_run_policy: MissedRunPolicy::Review,
             max_run_history: 100,
         };
         let json = serde_json::to_string(&s).unwrap();

@@ -176,6 +176,7 @@ impl Tool for SpawnSubagentTool {
         let session_path = std::path::PathBuf::from(format!("subagent-{run_id}"));
 
         let run_overrides = AgentRunOverrides {
+            approval: None,
             security: Some(subagent_ctx.policy.clone()),
             memory: None,
             is_subagent: true,

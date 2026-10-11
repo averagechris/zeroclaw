@@ -145,6 +145,33 @@ async fn telegram_dynamic_router_builds_once_and_revokes_cached_and_queued_conte
 }
 
 #[tokio::test]
+async fn scheduled_identity_reload_materializes_current_membership_and_rejects_revocation() {
+    let root = tempfile::TempDir::new().unwrap();
+    let cfg = config(root.path());
+    tokio::fs::create_dir_all(&cfg.data_dir).await.unwrap();
+    let store = MembershipStore::open(&cfg.data_dir, "home").unwrap();
+    let membership = store
+        .redeem(&store.create_invite(100).unwrap(), 2001, 101)
+        .unwrap();
+    let agent_alias = membership.agent_alias("home");
+    tokio::fs::write(&cfg.config_path, toml::to_string(&cfg).unwrap())
+        .await
+        .unwrap();
+
+    let reloaded = super::load_scheduled_agent_config(&cfg, &agent_alias)
+        .await
+        .unwrap();
+    assert!(reloaded.agents.contains_key(&agent_alias));
+    assert_eq!(reloaded.data_dir, cfg.data_dir);
+
+    store.revoke(2001).unwrap();
+    let error = super::load_scheduled_agent_config(&cfg, &agent_alias)
+        .await
+        .expect_err("revoked enrollment must not resolve for a scheduled run");
+    assert!(error.to_string().contains("inactive or missing"));
+}
+
+#[tokio::test]
 async fn telegram_dynamic_reload_restores_identity_and_live_policy_can_close_cached_access() {
     let root = tempfile::TempDir::new().unwrap();
     let cfg = config(root.path());

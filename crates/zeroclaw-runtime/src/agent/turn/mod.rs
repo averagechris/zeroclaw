@@ -2291,6 +2291,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
+            config.is_some_and(|config| {
+                config.scheduler.missed_run_policy
+                    == zeroclaw_config::schema::MissedRunPolicy::Review
+            }),
         )
         .await?;
 

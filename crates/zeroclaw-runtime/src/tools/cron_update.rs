@@ -269,6 +269,28 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
+        let current_job = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
+            Ok(job) => job,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        if matches!(current_job.job_type, cron::JobType::Shell)
+            && patch.command.is_some()
+            && !self.security.is_tool_allowed("shell")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "cron-shell-unavailable",
+                )),
+            });
+        }
         let approved = args
             .get("approved")
             .and_then(serde_json::Value::as_bool)
@@ -368,6 +390,33 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("\"enabled\": false"));
+    }
+
+    #[tokio::test]
+    async fn cannot_update_shell_job_when_shell_tool_is_not_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let mut policy = (*test_security(&cfg)).clone();
+        policy.allowed_tools = Some(vec!["file_read".to_string()]);
+        let tool = CronUpdateTool::new_with_runtime(
+            cfg.clone(),
+            Arc::new(policy),
+            TEST_AGENT,
+            Arc::from(crate::platform::NativeRuntime::with_shell("pwsh".into())),
+        );
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "echo changed" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("shell is not available"));
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]

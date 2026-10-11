@@ -19,14 +19,11 @@ operational guidance belongs in that runbook; secrets remain in encrypted
 deployment storage. The separate Thorny Codex login and credentials must not be
 mixed with work accounts or workstation credentials.
 
-The immediate frontier is reliable follow-up for Michi-submitted Codex jobs.
-That work is in progress and is not yet part of the deployed baseline. Phone-
-started sessions remain quiet unless explicitly opted in. Scheduling tools
-exist in the fork, but are not granted to any Thorny agent. The scheduler loop
-uses its default enabled setting while heartbeat is disabled; neither fact
-grants a chat the scheduling tools. Enable conversational schedules only after
-validating ownership, isolated context and tools, intended-chat delivery,
-restart and missed-run behavior, timezone handling, and cost limits.
+The immediate frontier is [conversational scheduling](issues/25-conversational-scheduling.md).
+Codex follow-up changes are merged in dotfiles #53; rollout remains separate.
+Scheduling implementation is under review. The deployed baseline does not
+grant scheduling tools to chats. Enable them only with the matching runtime
+and after checking chat isolation, recovery, and result delivery.
 
 ## Notes
 
@@ -221,12 +218,13 @@ Agents scan this directory for open, unblocked child decisions.
 
 ## Current frontier
 
-- Reliable follow-up delivery for Michi-submitted Codex jobs is being
-  implemented. This includes terminal outcomes, session association, restart
-  recovery, and retries without model polling. Do not treat it as deployed until
-  the implementation and rollout are complete.
-- Conversational scheduled tasks remain disabled at the tool-grant level.
-  Decide and validate the smallest first set after the Codex follow-up work.
+- Codex follow-up changes are merged in dotfiles #53. Confirm the host rollout
+  before treating them as deployed.
+- [Conversational scheduling](issues/25-conversational-scheduling.md): one-off
+  and recurring tasks for every admitted chat, bounded by that chat's tools.
+  Runtime and host changes are being validated for draft review. Due checks
+  use no inference; actual missed tasks receive one bounded judgment. Telegram
+  rollout checks remain outstanding.
 - Kagi lenses: explain how lenses filter results, then choose useful filters
   before creating named lenses. Default search remains preferred.
 - Consider `ctx` only if Michi's own coding history needs it; consider

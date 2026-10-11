@@ -5,7 +5,7 @@ use crate::cron::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
@@ -320,6 +320,20 @@ pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Re
     Ok(job)
 }
 
+/// Check task existence only for its current owner. Used by delivery retry
+/// paths to stop retrying after the owning task has been removed or renamed.
+pub(crate) fn owned_job_exists(config: &Config, job_id: &str, agent_alias: &str) -> Result<bool> {
+    Ok(with_read_connection(config, |conn| {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2)",
+            params![job_id, agent_alias],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    })?
+    .unwrap_or(false))
+}
+
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
@@ -385,11 +399,17 @@ pub fn resolve_job_id_or_name(
 /// so the guard does not become an existence oracle.
 pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
-            params![id, agent_alias],
-        )
-        .context("Failed to delete cron job")
+        let tx = conn.unchecked_transaction()?;
+        super::delivery_queue::cancel_unsent_on(&tx, id, Some(agent_alias))?;
+        super::manual_queue::cancel_pending_on(&tx, id, Some(agent_alias))?;
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+                params![id, agent_alias],
+            )
+            .context("Failed to delete cron job")?;
+        tx.commit()?;
+        Ok(changed)
     })?;
 
     if changed == 0 {
@@ -409,8 +429,14 @@ pub fn remove_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Res
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
-            .context("Failed to delete cron job")
+        let tx = conn.unchecked_transaction()?;
+        super::delivery_queue::cancel_unsent_on(&tx, id, None)?;
+        super::manual_queue::cancel_pending_on(&tx, id, None)?;
+        let changed = tx
+            .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .context("Failed to delete cron job")?;
+        tx.commit()?;
+        Ok(changed)
     })?;
 
     if changed == 0 {
@@ -458,11 +484,24 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
 /// can never run, so the agent-deletion cascade removes it
 pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
-            params![agent_alias],
-        )
-        .context("Failed to delete cron jobs for agent")
+        let tx = conn.unchecked_transaction()?;
+        let job_ids = {
+            let mut stmt = tx.prepare("SELECT id FROM cron_jobs WHERE agent_alias = ?1")?;
+            let rows = stmt.query_map(params![agent_alias], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for job_id in job_ids {
+            super::delivery_queue::cancel_unsent_on(&tx, &job_id, Some(agent_alias))?;
+            super::manual_queue::cancel_pending_on(&tx, &job_id, Some(agent_alias))?;
+        }
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+                params![agent_alias],
+            )
+            .context("Failed to delete cron jobs for agent")?;
+        tx.commit()?;
+        Ok(changed)
     })?;
     Ok(changed)
 }
@@ -613,6 +652,7 @@ fn update_job_inner(
     owner: Option<&str>,
     patch: CronJobPatch,
 ) -> Result<CronJob> {
+    let pausing = patch.enabled == Some(false);
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
@@ -707,6 +747,7 @@ fn update_job_inner(
     }
 
     with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
         // Declarative jobs don't own `shell_output_format` — the config is the
         // canonical source, and `resolve_declarative_shell_output_format()` overlays
         // it on every read. Writing the synthesized (Wrapped) value back into the
@@ -715,11 +756,12 @@ fn update_job_inner(
         // own. Omit the column from the UPDATE for declarative rows so the
         // non-owned shadow stays untouched.
         let changed = if job.source == "declarative" {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14,
+                     last_status = CASE WHEN last_status = 'missed_review' THEN 'review_cancelled' ELSE last_status END
                  WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
                     job.expression,
@@ -741,11 +783,12 @@ fn update_job_inner(
                 ],
             )
         } else {
-            conn.execute(
+            tx.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                      session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
+                     last_status = CASE WHEN last_status = 'missed_review' THEN 'review_cancelled' ELSE last_status END
                  WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
                     job.expression,
@@ -778,6 +821,10 @@ fn update_job_inner(
         if changed == 0 {
             anyhow::bail!("Cron job '{job_id}' not found");
         }
+        if pausing {
+            super::manual_queue::cancel_pending_on(&tx, &job.id, owner)?;
+        }
+        tx.commit().context("Failed to commit cron job update")?;
         Ok(())
     })?;
 
@@ -1014,11 +1061,25 @@ fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Res
     before_update();
 
     let cleared = with_read_connection(config, |conn| {
+        let reviewing_missed_runs =
+            config.scheduler.missed_run_policy == zeroclaw_config::schema::MissedRunPolicy::Review;
+        let (missed_enabled, missed_status, missed_output) = if reviewing_missed_runs {
+            (
+                "CASE WHEN source = 'imperative' AND (last_run IS NULL OR julianday(last_run) < julianday(locked_at)) THEN 0 ELSE enabled END",
+                "CASE WHEN source = 'imperative' AND (last_run IS NULL OR julianday(last_run) < julianday(locked_at)) THEN 'missed_review' ELSE last_status END",
+                "CASE WHEN source = 'imperative' AND (last_run IS NULL OR julianday(last_run) < julianday(locked_at)) THEN 'Execution was interrupted and may already have acted.' ELSE last_output END",
+            )
+        } else {
+            ("enabled", "last_status", "last_output")
+        };
         let changed = if live_tokens.is_empty() {
             conn.execute(
-                "UPDATE cron_jobs
-                 SET locked_at = NULL, lock_token = NULL
-                 WHERE locked_at IS NOT NULL",
+                &format!(
+                    "UPDATE cron_jobs
+                 SET enabled = {missed_enabled}, last_status = {missed_status},
+                     last_output = {missed_output}, locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL"
+                ),
                 [],
             )?
         } else {
@@ -1027,7 +1088,8 @@ fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Res
                 .join(", ");
             let sql = format!(
                 "UPDATE cron_jobs
-                 SET locked_at = NULL, lock_token = NULL
+                 SET enabled = {missed_enabled}, last_status = {missed_status},
+                     last_output = {missed_output}, locked_at = NULL, lock_token = NULL
                  WHERE locked_at IS NOT NULL
                    AND (lock_token IS NULL OR lock_token NOT IN ({placeholders}))"
             );
@@ -1089,6 +1151,16 @@ pub(crate) fn persist_manual_run_result(
 
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
+        if config.scheduler.missed_run_policy == zeroclaw_config::schema::MissedRunPolicy::Review {
+            let owns_job: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE id=?1 AND agent_alias=?2)",
+                params![job.id, job.agent_alias],
+                |row| row.get(0),
+            )?;
+            if !owns_job {
+                return Ok(());
+            }
+        }
 
         insert_run_and_prune(
             &tx,
@@ -1100,6 +1172,17 @@ pub(crate) fn persist_manual_run_result(
             bounded_output.as_deref(),
             duration_ms,
         )?;
+
+        if config.scheduler.missed_run_policy == zeroclaw_config::schema::MissedRunPolicy::Review
+            && let Some(output) = bounded_output.as_deref()
+        {
+            super::delivery_queue::enqueue_on(
+                &tx,
+                job,
+                &format!("{}:{}:manual", job.id, started_at.to_rfc3339()),
+                output,
+            )?;
+        }
 
         apply_last_run_state(
             &tx,
@@ -1131,6 +1214,16 @@ pub(crate) fn persist_run_result(
 
     with_initialized_connection(config, |conn| {
         let tx = conn.unchecked_transaction()?;
+        if config.scheduler.missed_run_policy == zeroclaw_config::schema::MissedRunPolicy::Review {
+            let owns_job: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cron_jobs WHERE id=?1 AND agent_alias=?2)",
+                params![job.id, job.agent_alias],
+                |row| row.get(0),
+            )?;
+            if !owns_job {
+                return Ok(());
+            }
+        }
 
         insert_run_and_prune(
             &tx,
@@ -1142,6 +1235,17 @@ pub(crate) fn persist_run_result(
             bounded_output.as_deref(),
             duration_ms,
         )?;
+
+        if config.scheduler.missed_run_policy == zeroclaw_config::schema::MissedRunPolicy::Review
+            && let Some(output) = bounded_output.as_deref()
+        {
+            super::delivery_queue::enqueue_on(
+                &tx,
+                job,
+                &format!("{}:{}:scheduled", job.id, started_at.to_rfc3339()),
+                output,
+            )?;
+        }
 
         apply_run_completion_state(
             &tx,
@@ -1167,7 +1271,10 @@ pub(crate) fn persist_run_completion_state(
     action: RunCompletionAction,
 ) -> Result<()> {
     with_initialized_connection(config, |conn| {
-        apply_run_completion_state(conn, job, job_state_at, status, output, action)
+        let tx = conn.unchecked_transaction()?;
+        apply_run_completion_state(&tx, job, job_state_at, status, output, action)?;
+        tx.commit()
+            .context("Failed to commit cron run completion state transaction")
     })
 }
 
@@ -1915,53 +2022,95 @@ fn apply_run_completion_state(
     action: RunCompletionAction,
 ) -> Result<()> {
     let bounded_output = output.map(truncate_cron_output);
+    // Completion applies to the occurrence that was selected, while schedule
+    // and owner are live user-controlled state. Resolve them under the same
+    // write transaction as the completion update and never apply a stale
+    // execution's scheduling decision to a replacement schedule.
+    let current = conn
+        .query_row(
+            "SELECT schedule, expression, next_run, delete_after_run
+             FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+            params![job.id, job.agent_alias],
+            |row| {
+                let schedule_raw: Option<String> = row.get(0)?;
+                let expression: String = row.get(1)?;
+                let schedule = decode_schedule(schedule_raw.as_deref(), &expression)
+                    .map_err(sql_conversion_error)?;
+                let next_run: String = row.get(2)?;
+                let next_run = parse_rfc3339(&next_run).map_err(sql_conversion_error)?;
+                let delete_after_run: bool = row.get::<_, i64>(3)? != 0;
+                Ok((schedule, next_run, delete_after_run))
+            },
+        )
+        .optional()
+        .context("Failed to read current cron job completion state")?
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias})
+                    ),
+                "Cron job missing while persisting completion"
+            );
+            anyhow::Error::msg(format!("Cron job '{}' not found", job.id))
+        })?;
 
-    match action {
-        RunCompletionAction::Reschedule => {
-            let next_run = next_run_for_schedule(&job.schedule, job_state_at)?;
+    if current.1 != job.next_run {
+        // The user changed the schedule while this occurrence was running.
+        // Save its outcome without changing that newer schedule or enabled bit.
+        conn.execute(
+            "UPDATE cron_jobs SET last_run = ?1, last_status = ?2, last_output = ?3
+             WHERE id = ?4 AND agent_alias = ?5",
+            params![
+                job_state_at.to_rfc3339(),
+                status,
+                bounded_output.as_deref(),
+                job.id,
+                job.agent_alias
+            ],
+        )
+        .context("Failed to record cron job run state")?;
+        return Ok(());
+    }
+
+    let current_is_one_shot = matches!(current.0, Schedule::At { .. });
+    if current_is_one_shot {
+        // A stale caller may request Delete after a one-shot was edited into a
+        // recurrence. That path was handled above when next_run changed. For
+        // a current one-shot, only a successful explicit auto-delete may drop
+        // the row; failed runs remain visible and disabled.
+        if action == RunCompletionAction::Delete && status == "ok" && current.2 {
             let changed = conn
                 .execute(
-                    "UPDATE cron_jobs
-                     SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
-                     WHERE id = ?5",
-                    params![
-                        next_run.to_rfc3339(),
-                        job_state_at.to_rfc3339(),
-                        status,
-                        bounded_output.as_deref(),
-                        job.id,
-                    ],
+                    "DELETE FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+                    params![job.id, job.agent_alias],
                 )
-                .context("Failed to update cron job run state")?;
-            if changed == 0 {
-                anyhow::bail!("Cron job '{}' not found", job.id);
-            }
-        }
-        RunCompletionAction::Disable => {
-            let changed = conn
-                .execute(
-                    "UPDATE cron_jobs
-                     SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
-                     WHERE id = ?4",
-                    params![
-                        job_state_at.to_rfc3339(),
-                        status,
-                        bounded_output.as_deref(),
-                        job.id,
-                    ],
-                )
-                .context("Failed to disable completed one-shot cron job")?;
-            if changed == 0 {
-                anyhow::bail!("Cron job '{}' not found", job.id);
-            }
-        }
-        RunCompletionAction::Delete => {
-            let changed = conn
-                .execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])
                 .context("Failed to delete completed one-shot cron job")?;
             if changed == 0 {
                 anyhow::bail!("Cron job '{}' not found", job.id);
             }
+        } else {
+            let changed = conn.execute(
+                "UPDATE cron_jobs SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
+                 WHERE id = ?4 AND agent_alias = ?5",
+                params![job_state_at.to_rfc3339(), status, bounded_output.as_deref(), job.id, job.agent_alias],
+            ).context("Failed to disable completed one-shot cron job")?;
+            if changed == 0 {
+                anyhow::bail!("Cron job '{}' not found", job.id);
+            }
+        }
+    } else {
+        let next_run = next_run_for_schedule(&current.0, job_state_at)?;
+        let changed = conn.execute(
+            "UPDATE cron_jobs SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
+             WHERE id = ?5 AND agent_alias = ?6",
+            params![next_run.to_rfc3339(), job_state_at.to_rfc3339(), status,
+                bounded_output.as_deref(), job.id, job.agent_alias],
+        ).context("Failed to update cron job run state")?;
+        if changed == 0 {
+            anyhow::bail!("Cron job '{}' not found", job.id);
         }
     }
 
@@ -2039,6 +2188,9 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
+
+    super::delivery_queue::initialize_schema(conn)?;
+    super::manual_queue::initialize_schema(conn)?;
 
     #[cfg(feature = "plugins-wasm")]
     super::outbox::initialize_schema(conn)?;
@@ -2414,6 +2566,250 @@ mod tests {
         assert_eq!(clear_stale_locks(&config).unwrap(), 0);
         assert!(due_jobs(&config, now).unwrap().is_empty());
         assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn review_recovery_preserves_live_manual_claim_and_marks_unfinished_stale_claim() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.missed_run_policy = zeroclaw_config::schema::MissedRunPolicy::Review;
+        let live = add_job(&config, "owner-agent", "*/5 * * * *", "echo live").unwrap();
+        let stale = add_job(&config, "owner-agent", "*/5 * * * *", "echo stale").unwrap();
+        let now = Utc::now();
+        let token = claim_job_for_agent_with_token(&config, &live.id, "owner-agent", now)
+            .unwrap()
+            .expect("live claim should win");
+        assert!(claim_job(&config, &stale.id, now).unwrap());
+
+        assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+        let live_after = get_job(&config, &live.id).unwrap();
+        assert!(live_after.enabled);
+        assert_eq!(live_after.last_status, None);
+        assert!(
+            due_jobs(&config, now).unwrap().is_empty(),
+            "live claim remains locked"
+        );
+
+        let stale_after = get_job(&config, &stale.id).unwrap();
+        assert!(!stale_after.enabled);
+        assert_eq!(stale_after.last_status.as_deref(), Some("missed_review"));
+        assert!(
+            stale_after
+                .last_output
+                .as_deref()
+                .unwrap()
+                .contains("interrupted")
+        );
+        assert!(release_job_for_token(&config, &live.id, &token).unwrap());
+    }
+
+    #[test]
+    fn review_recovery_only_clears_claim_with_committed_run() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.missed_run_policy = zeroclaw_config::schema::MissedRunPolicy::Review;
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo done").unwrap();
+        let locked_at = Utc::now();
+        assert!(claim_job(&config, &job.id, locked_at).unwrap());
+        record_last_run_with_status(
+            &config,
+            &job.id,
+            locked_at + ChronoDuration::seconds(1),
+            "ok",
+            "committed",
+        )
+        .unwrap();
+
+        assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled);
+        assert_eq!(after.last_status.as_deref(), Some("ok"));
+        assert_eq!(after.last_output.as_deref(), Some("committed"));
+    }
+
+    #[test]
+    fn completion_records_old_run_without_overwriting_edited_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo work").unwrap();
+        let edited = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::Every { every_ms: 120_000 }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        let selected_next_run = job.next_run;
+
+        persist_run_completion_state(
+            &config,
+            &job,
+            Utc::now(),
+            "ok",
+            Some("finished"),
+            RunCompletionAction::Reschedule,
+        )
+        .unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert_eq!(after.next_run, edited.next_run);
+        assert_eq!(after.schedule, edited.schedule);
+        assert_eq!(after.last_status.as_deref(), Some("ok"));
+        assert_eq!(after.last_output.as_deref(), Some("finished"));
+        assert_ne!(selected_next_run, after.next_run);
+    }
+
+    #[test]
+    fn one_shot_edited_to_recurrence_is_rescheduled_instead_of_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            "owner-agent",
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::minutes(10),
+            },
+            "echo once",
+            None,
+        )
+        .unwrap();
+        let edited = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::Every { every_ms: 120_000 }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        persist_run_completion_state(
+            &config,
+            &job,
+            Utc::now(),
+            "ok",
+            Some("finished"),
+            RunCompletionAction::Delete,
+        )
+        .unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(after.enabled);
+        assert!(matches!(after.schedule, Schedule::Every { .. }));
+        assert!(after.next_run > Utc::now());
+        assert_eq!(after.last_status.as_deref(), Some("ok"));
+        assert_eq!(edited.next_run, after.next_run);
+    }
+
+    #[test]
+    fn failed_one_shot_completion_is_disabled_and_retained() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_shell_job(
+            &config,
+            "owner-agent",
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::minutes(10),
+            },
+            "echo once",
+            None,
+        )
+        .unwrap();
+
+        persist_run_completion_state(
+            &config,
+            &job,
+            Utc::now(),
+            "error",
+            Some("failed"),
+            RunCompletionAction::Delete,
+        )
+        .unwrap();
+
+        let after = get_job(&config, &job.id).unwrap();
+        assert!(!after.enabled);
+        assert_eq!(after.last_status.as_deref(), Some("error"));
+        assert_eq!(after.last_output.as_deref(), Some("failed"));
+    }
+
+    #[test]
+    fn any_job_update_cancels_pending_missed_review() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let paused = add_agent_job(
+            &config,
+            "owner-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let prompt_edit = add_agent_job(
+            &config,
+            "owner-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "do other work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute("UPDATE cron_jobs SET enabled = 0, last_status = 'missed_review' WHERE id IN (?1, ?2)",
+                params![paused.id, prompt_edit.id])?;
+            Ok(())
+        }).unwrap();
+        crate::cron::manual_queue::enqueue(&config, &paused.id, "owner-agent", false).unwrap();
+
+        update_job(
+            &config,
+            &paused.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        update_job(
+            &config,
+            &prompt_edit.id,
+            CronJobPatch {
+                prompt: Some("updated task instructions".into()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            crate::cron::manual_queue::pending(&config, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            get_job(&config, &paused.id).unwrap().last_status.as_deref(),
+            Some("review_cancelled")
+        );
+        assert_eq!(
+            get_job(&config, &prompt_edit.id)
+                .unwrap()
+                .last_status
+                .as_deref(),
+            Some("review_cancelled")
+        );
     }
 
     #[test]

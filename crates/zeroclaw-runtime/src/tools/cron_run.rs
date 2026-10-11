@@ -116,6 +116,11 @@ impl Tool for CronRunTool {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
                     "default": false
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Queue the run for the scheduler and return immediately",
+                    "default": false
                 }
             },
             "required": ["job_id"]
@@ -143,6 +148,10 @@ impl Tool for CronRunTool {
         };
         let approved = args
             .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let background = args
+            .get("background")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
@@ -173,6 +182,16 @@ impl Tool for CronRunTool {
             }
         };
 
+        if matches!(job.job_type, JobType::Shell) && !self.security.is_tool_allowed("shell") {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "cron-shell-unavailable",
+                )),
+            });
+        }
+
         if matches!(job.job_type, JobType::Shell)
             && let Err(reason) = cron::validate_shell_command_with_security(
                 self.runtime.as_ref(),
@@ -194,6 +213,30 @@ impl Tool for CronRunTool {
                 output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
+        }
+
+        if background {
+            return match cron::enqueue_manual_request(
+                &self.config,
+                &job.id,
+                &self.agent_alias,
+                approved,
+            ) {
+                Ok(request_id) => Ok(ToolResult {
+                    success: true,
+                    output: crate::i18n::get_required_cli_string_with_args(
+                        "cron-background-queued",
+                        &[("job_id", &job.id), ("request_id", &request_id)],
+                    )
+                    .into(),
+                    error: None,
+                }),
+                Err(error) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                }),
+            };
         }
 
         let lock_token = match cron::claim_job_for_agent_with_token(
@@ -398,6 +441,93 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
         cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_run_returns_queued_without_executing_or_claiming_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["touch".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let marker = tmp.path().join("must-not-exist-until-scheduler-runs");
+        let job = cron::add_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            None,
+            cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            &format!("touch {}", marker.display()),
+            None,
+            true,
+        )
+        .unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({ "job_id": job.id, "approved": true, "background": true }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.to_string().contains("Queued background run"));
+        assert!(
+            !marker.exists(),
+            "background mode must return before shell execution"
+        );
+        assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
+        let requests = cron::pending_manual_requests(&cfg, 10).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].job_id, job.id);
+        assert_eq!(requests[0].agent_alias, TEST_AGENT);
+        assert!(requests[0].approved);
+        assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+        cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cannot_run_shell_job_when_shell_tool_is_not_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+        let mut policy = (*test_security(&cfg)).clone();
+        policy.allowed_tools = Some(vec!["file_read".to_string()]);
+        let tool = CronRunTool::new_with_runtime(
+            cfg.clone(),
+            Arc::new(policy),
+            TEST_AGENT,
+            Arc::from(crate::platform::NativeRuntime::with_shell("pwsh".into())),
+        );
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("shell is not available"));
+        assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -739,12 +869,19 @@ mod tests {
         let theirs = other_agents_job(&cfg);
 
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
-        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
+        let result = tool
+            .execute(json!({"job_id": theirs.id, "background": true}))
+            .await
+            .unwrap();
 
         assert!(!result.success);
         assert!(
             cron::list_runs(&cfg, &theirs.id, 10).unwrap().is_empty(),
             "another agent's job must not have been executed"
+        );
+        assert!(
+            cron::pending_manual_requests(&cfg, 10).unwrap().is_empty(),
+            "another agent's job must not be queued"
         );
     }
 }

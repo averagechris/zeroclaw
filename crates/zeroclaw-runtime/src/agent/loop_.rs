@@ -1128,6 +1128,8 @@ pub fn apply_text_tool_prompt_policy(
 
 #[derive(Default)]
 pub struct AgentRunOverrides {
+    /// Caller-supplied approval policy for background turns without a prompt channel.
+    pub approval: Option<ApprovalManager>,
     pub security: Option<Arc<SecurityPolicy>>,
     pub memory: Option<Arc<dyn Memory>>,
     pub is_subagent: bool,
@@ -1766,7 +1768,9 @@ pub async fn run(
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
-        let approval_manager = if interactive {
+        let approval_manager = if let Some(approval) = overrides.approval {
+            Some(approval)
+        } else if interactive {
             Some(ApprovalManager::from_risk_profile(&risk_profile))
         } else {
             None

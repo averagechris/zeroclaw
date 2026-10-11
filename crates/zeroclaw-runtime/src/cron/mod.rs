@@ -3,6 +3,9 @@ use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
+pub(crate) mod delivery_queue;
+pub mod manual_queue;
+mod missed;
 mod schedule;
 mod store;
 mod types;
@@ -11,6 +14,11 @@ mod types;
 pub mod outbox;
 pub mod scheduler;
 
+pub use manual_queue::{
+    ManualRequest, complete as complete_manual_request, enqueue as enqueue_manual_request,
+    interrupted as interrupted_manual_requests, mark_started as mark_manual_request_started,
+    pending as pending_manual_requests,
+};
 #[allow(unused_imports)]
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,

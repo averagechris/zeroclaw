@@ -608,6 +608,8 @@ cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
 cli-cron-delivery = {"  "}Delivery: {$v}
 cli-cron-delivery-disabled = disabled (output is not sent anywhere)
+cron-shell-unavailable = Security policy: shell is not available in this chat
+cron-background-queued = Queued background run for cron job '{$job_id}' (request {$request_id}).
 
 # ── main / status / quickstart / pairing / desktop ──
 cli-no-command = No command provided.
@@ -1334,3 +1336,6 @@ channel-telegram-invitation-no-pending-handle = That handle has no pending invit
 channel-telegram-invitation-invite-usage = Use /invite by itself for a single-use link, or /invite @handle to approve a Telegram username.
 
 channel-telegram-invitation-settings-restricted = The owner manages this chat's model and settings.
+cron-task-changed = Task was paused, rescheduled, or removed before execution.
+cron-missed-uncertain = I lost track of whether your task '{ $name }' finished. Should I check before trying it again?
+cron-missed-decision-failed = I couldn't decide what to do about your missed task '{ $name }'. Should I do it now or skip it?

@@ -5465,6 +5465,17 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 })
             },
         ));
+        zeroclaw_runtime::cron::scheduler::register_agent_config_resolver(Box::new(
+            |config, agent_alias| {
+                Box::pin(async move {
+                    zeroclaw_channels::orchestrator::load_scheduled_agent_config(
+                        &config,
+                        &agent_alias,
+                    )
+                    .await
+                })
+            },
+        ));
     }
 
     #[cfg(feature = "agent-runtime")]
