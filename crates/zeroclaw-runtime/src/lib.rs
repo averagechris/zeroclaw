@@ -1,3 +1,5 @@
+// Scheduler recovery adds a Send future around the agent loop and provider stack.
+#![recursion_limit = "256"]
 #![allow(
     clippy::to_string_in_format_args,
     clippy::useless_format,

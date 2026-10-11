@@ -424,6 +424,16 @@ impl Tool for CronAddTool {
 
         let result = match job_type {
             JobType::Shell => {
+                if !self.security.is_tool_allowed("shell") {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(crate::i18n::get_required_cli_string(
+                            "cron-shell-unavailable",
+                        )),
+                    });
+                }
+
                 let command = match args.get("command").and_then(serde_json::Value::as_str) {
                     Some(command) if !command.trim().is_empty() => command,
                     _ => {
@@ -629,6 +639,33 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn cannot_add_shell_job_when_shell_tool_is_not_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let mut policy = (*test_security(&cfg)).clone();
+        policy.allowed_tools = Some(vec!["file_read".to_string()]);
+        let tool = CronAddTool::new_with_runtime(
+            cfg.clone(),
+            Arc::new(policy),
+            TEST_AGENT,
+            Arc::from(crate::platform::NativeRuntime::with_shell("pwsh".into())),
+        );
+
+        let result = tool
+            .execute(json!({
+                "job_type": "shell",
+                "command": "echo scheduled",
+                "schedule": {"kind": "every", "every_ms": 60000}
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("shell is not available"));
+        assert!(cron::list_jobs(&cfg).unwrap().is_empty());
     }
 
     #[tokio::test]

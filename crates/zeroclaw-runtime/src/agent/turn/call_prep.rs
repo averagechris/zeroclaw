@@ -5,7 +5,9 @@
 use super::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use super::context::TurnCtx;
 use super::delivery_defaults::{
-    maybe_inject_channel_delivery_defaults, scope_reaction_to_current_conversation,
+    maybe_inject_channel_delivery_defaults,
+    pin_cron_delivery_to_origin as pin_cron_delivery_to_origin_fn,
+    scope_reaction_to_current_conversation,
 };
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
 use super::outcome::ToolLoopCancelled;
@@ -136,6 +138,7 @@ pub(crate) async fn prepare_tool_calls(
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
     dedup_enabled: bool,
+    pin_cron_delivery_to_origin: bool,
 ) -> Result<PreparedToolCalls> {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
@@ -227,6 +230,16 @@ pub(crate) async fn prepare_tool_calls(
                 .map(zeroclaw_api::attribution::Attributable::alias),
             ctx.channel_reply_target,
         );
+        if pin_cron_delivery_to_origin {
+            pin_cron_delivery_to_origin_fn(
+                &tool_name,
+                &mut tool_args,
+                ctx.channel_name,
+                ctx.channel
+                    .map(zeroclaw_api::attribution::Attributable::alias),
+                ctx.channel_reply_target,
+            );
+        }
 
         if let Err(reason) = scope_reaction_to_current_conversation(
             &tool_name,
@@ -644,6 +657,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         )
         .await
         .expect("scoped reaction should be prepared");
@@ -684,6 +698,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         )
         .await
         .expect("unscoped reaction should become a tool result");
@@ -694,6 +709,92 @@ mod tests {
             .expect("rejection should occupy the original result slot");
         assert!(!outcome.success);
         assert!(outcome.output.contains("active channel conversation"));
+    }
+
+    #[tokio::test]
+    async fn review_mode_pins_cron_add_and_update_delivery_to_origin() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let channel = ScopeChannel;
+        let mut ctx = test_ctx_with_origin(
+            &observer,
+            &pacing,
+            &tx,
+            "telegram",
+            Some("-100123:9"),
+            Some(&channel),
+        );
+        // This preparation test inspects arguments, not progress streaming.
+        ctx.on_delta = None;
+        let calls = [
+            ParsedToolCall {
+                name: "cron_add".to_string(),
+                arguments: serde_json::json!({
+                    "job_type": "shell",
+                    "command": "echo done",
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "discord.ops",
+                        "to": "foreign"
+                    }
+                }),
+                tool_call_id: Some("cron-add-1".to_string()),
+            },
+            ParsedToolCall {
+                name: "cron_update".to_string(),
+                arguments: serde_json::json!({
+                    "job_id": "task-1",
+                    "patch": {
+                        "delivery": {
+                            "mode": "announce",
+                            "channel": "discord.ops",
+                            "to": "foreign"
+                        }
+                    }
+                }),
+                tool_call_id: Some("cron-update-1".to_string()),
+            },
+            ParsedToolCall {
+                name: "cron_update".to_string(),
+                arguments: serde_json::json!({
+                    "job_id": "task-2",
+                    "patch": r#"{"delivery":{"mode":"announce","channel":"discord.ops","to":"foreign"}}"#
+                }),
+                tool_call_id: Some("cron-update-string-patch".to_string()),
+            },
+        ];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(prepared.executable_calls.len(), 3);
+        let add = &prepared.executable_calls[0].arguments;
+        assert_eq!(add["delivery"]["channel"], "telegram.home");
+        assert_eq!(add["delivery"]["to"], "-100123:9");
+        assert_eq!(add["delete_after_run"], false);
+        let update = &prepared.executable_calls[1].arguments;
+        assert_eq!(update["patch"]["delivery"]["channel"], "telegram.home");
+        assert_eq!(update["patch"]["delivery"]["to"], "-100123:9");
+        let string_patch = &prepared.executable_calls[2].arguments;
+        assert_eq!(
+            string_patch["patch"]["delivery"]["channel"],
+            "telegram.home"
+        );
+        assert_eq!(string_patch["patch"]["delivery"]["to"], "-100123:9");
     }
 
     async fn emitted_tool_provenance(
@@ -719,6 +820,7 @@ mod tests {
             &mut seen,
             &mut prompt_seen,
             0,
+            false,
             false,
         )
         .await
@@ -920,6 +1022,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         )
         .await
         .expect("preparation completes with the cancelled call recorded");
@@ -966,6 +1069,7 @@ mod tests {
             &mut prompt_seen,
             0,
             true,
+            false,
         )
         .await
         .expect("preparation succeeds with the duplicate suppressed");
@@ -1062,6 +1166,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         );
         tokio::pin!(preparation);
 
@@ -1126,6 +1231,7 @@ mod tests {
             &mut seen,
             &mut prompt_seen,
             0,
+            false,
             false,
         )
         .await
@@ -1234,6 +1340,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         )
         .await
         .expect("preparation completes with the replaced call recorded");
@@ -1294,6 +1401,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            false,
         )
         .await
         .expect("round 0 prepares");
@@ -1313,6 +1421,7 @@ mod tests {
             &mut seen,
             &mut prompt_seen,
             1,
+            false,
             false,
         )
         .await

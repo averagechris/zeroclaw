@@ -2874,6 +2874,22 @@ async fn load_runtime_config_and_defaults_for_data_dir(
     Ok((parsed, defaults))
 }
 
+/// Reload the current runtime configuration and materialize the active
+/// Telegram enrollment for a scheduled agent identity.
+///
+/// Cron jobs use this resolver before execution so an invited identity is
+/// checked against the current membership store and current channel policy,
+/// rather than a daemon-start snapshot.
+pub async fn load_scheduled_agent_config(config: &Config, agent_alias: &str) -> Result<Config> {
+    let (config, _) = load_runtime_config_and_defaults_for_data_dir(
+        &config.config_path,
+        agent_alias,
+        Some(&config.data_dir),
+    )
+    .await?;
+    Ok(config)
+}
+
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
     let Some(config_path) = runtime_config_path(ctx) else {
         return Ok(());

@@ -10,14 +10,19 @@ use crate::cron::{
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{StreamExt, stream};
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
+use zeroclaw_config::schema::{
+    CronJobDecl, CronScheduleDecl, CronShellOutputFormat, MissedRunPolicy,
+};
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
@@ -34,6 +39,34 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
+
+/// Reload current policy and admitted chat identity at the dispatch boundary.
+/// The binary provides the channel-owned identity resolver, avoiding a cycle
+/// between the runtime and channel crates.
+type AgentConfigResolver =
+    Box<dyn Fn(Config, String) -> BoxFuture<'static, Result<Config>> + Send + Sync>;
+static AGENT_CONFIG_RESOLVER: std::sync::OnceLock<AgentConfigResolver> = std::sync::OnceLock::new();
+
+pub fn register_agent_config_resolver(resolver: AgentConfigResolver) {
+    let _ = AGENT_CONFIG_RESOLVER.set(resolver);
+}
+
+async fn effective_job_config(config: &Config, job: &CronJob) -> Result<Config> {
+    let config = if let Some(resolve) = AGENT_CONFIG_RESOLVER.get() {
+        resolve(config.clone(), job.agent_alias.clone()).await?
+    } else {
+        config.clone()
+    };
+    anyhow::ensure!(config.scheduler.enabled, "scheduler disabled");
+    anyhow::ensure!(
+        config
+            .agents
+            .get(&job.agent_alias)
+            .is_some_and(|agent| agent.enabled),
+        "scheduled task's owning chat is no longer available"
+    );
+    Ok(config)
+}
 
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
@@ -227,9 +260,31 @@ async fn run_manual_job_inner(
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+    let review_mode = config.scheduler.missed_run_policy == MissedRunPolicy::Review;
+    let outcome = if review_mode {
+        CronDeliveryOutcome {
+            success,
+            status: if success { "ok" } else { "error" }.into(),
+            output,
+        }
+    } else {
+        deliver_and_classify_run_result(config, job, success, output, context).await
+    };
 
-    if let Err(e) = persist_manual_run_result(
+    if review_mode {
+        retry_captured_result(config, job, || {
+            persist_manual_run_result(
+                config,
+                job,
+                started_at,
+                finished_at,
+                &outcome.status,
+                Some(&outcome.output),
+                duration_ms,
+            )
+        })
+        .await;
+    } else if let Err(error) = persist_manual_run_result(
         config,
         job,
         started_at,
@@ -242,7 +297,7 @@ async fn run_manual_job_inner(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
+                .with_attrs(::serde_json::json!({"job_id": job.id, "error": error.to_string()})),
             "manual cron trigger: failed to persist run history"
         );
     }
@@ -349,52 +404,301 @@ pub async fn run(
         ),
     }
 
-    if config.scheduler.catch_up_on_startup {
+    let mut pending_reviews = VecDeque::new();
+    if config.scheduler.missed_run_policy == MissedRunPolicy::Review {
+        for request in super::manual_queue::interrupted(&config, usize::MAX)? {
+            if !super::manual_queue::settled(&config, &request)?
+                && let Ok(job) =
+                    crate::cron::get_job_for_agent(&config, &request.job_id, &request.agent_alias)
+            {
+                super::missed::mark_interrupted(&config, &job)?;
+            }
+            super::complete_manual_request(&config, &request.id)?;
+        }
+        pending_reviews = prepare_overdue_reviews(&config)?;
+    } else if config.scheduler.catch_up_on_startup {
         catch_up_overdue_jobs(&config, &event_tx).await;
     } else {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Scheduler startup: catch-up disabled by config"
-        );
         skip_missed_jobs_on_startup(&config).await;
     }
 
+    let delivery_cancel = cancel.child_token();
+    let _delivery_guard = delivery_cancel.clone().drop_guard();
+    let delivery_config = config.clone();
+    let worker_cancel = delivery_cancel.clone();
+    let delivery_handle =
+        zeroclaw_spawn::spawn!(async move { delivery_loop(delivery_config, worker_cancel).await });
+
+    let mut running: FuturesUnordered<BoxFuture<'static, (String, bool, String)>> =
+        FuturesUnordered::new();
+    let mut reviewing: FuturesUnordered<BoxFuture<'static, Result<()>>> = FuturesUnordered::new();
+    let mut stopping = false;
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                // Keep scheduler liveness fresh even when there are no due jobs.
+            _ = interval.tick(), if !stopping => {
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
-
-                let jobs = match due_jobs(&config, Utc::now()) {
-                    Ok(jobs) => jobs,
-                    Err(e) => {
-                        crate::health::mark_component_error(SCHEDULER_COMPONENT, e.to_string());
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Scheduler query failed"
-                        );
-                        continue;
-                    }
-                };
-
-                let jobs = claim_due_jobs(&config, jobs);
-                process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
+                let dispatched = (|| -> Result<()> {
+                let capacity = config.scheduler.max_concurrent.max(1).saturating_sub(running.len() + reviewing.len());
+                if capacity == 0 { return Ok(()); }
+                let mut remaining = capacity;
+                for request in super::pending_manual_requests(&config, config.scheduler.max_tasks)? {
+                    if remaining == 0 { break; }
+                    let job = match crate::cron::get_job_for_agent(&config, &request.job_id, &request.agent_alias) {
+                        Ok(job) => job,
+                        Err(_) => { super::complete_manual_request(&config, &request.id)?; continue; }
+                    };
+                    if !super::manual_queue::mark_started(&config, &request.id)? { continue; }
+                    let cfg = config.clone();
+                    running.push(Box::pin(async move {
+                        let result = run_manual_job_inner(&cfg, &job, CronDeliveryContext::Scheduled, &None, None, request.approved).await;
+                        retry_captured_result(&cfg, &job, || super::manual_queue::settle(&cfg, &request)).await;
+                        (job.id, result.success, result.output)
+                    }));
+                    remaining -= 1;
+                }
+                for job in due_jobs(&config, Utc::now())?.into_iter().take(remaining) {
+                    if !claim_job(&config, &job.id, Utc::now())? { continue; }
+                    let cfg = config.clone();
+                    running.push(Box::pin(async move { execute_scheduled_job(&cfg, &job).await }));
+                    remaining -= 1;
+                }
+                // At most one missed-task review at a time, sharing the same
+                // capacity as actual work instead of blocking the startup loop.
+                if remaining > 0
+                    && reviewing.is_empty()
+                    && let Some(job) = pending_reviews.pop_front()
+                {
+                    let cfg = config.clone();
+                    reviewing.push(Box::pin(async move { review_one_missed_job(&cfg, &job).await }));
+                }
+                    Ok(())
+                })();
+                if let Err(error) = dispatched {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})), "cron polling failed; active work retained, retrying");
+                }
             }
-            _ = cancel.cancelled() => {
-                crate::health::mark_component_ok(SCHEDULER_COMPONENT);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "Cron scheduler shutting down via cancellation token"
-                );
-                return Ok(());
+            Some(result) = reviewing.next(), if !reviewing.is_empty() => {
+                if let Err(error) = result {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})), "missed review failed");
+                }
+            }
+            Some((job_id, success, output)) = running.next(), if !running.is_empty() => {
+                if let Some(tx) = &event_tx {
+                    let _ = tx.send(serde_json::json!({"type":"cron_result", "job_id":job_id,
+                        "success":success, "output":output, "timestamp":Utc::now().to_rfc3339()}));
+                }
+            }
+            _ = cancel.cancelled(), if !stopping => { stopping = true; }
+        }
+        if stopping && running.is_empty() && reviewing.is_empty() {
+            break;
+        }
+    }
+    delivery_cancel.cancel();
+    delivery_handle.await??;
+    Ok(())
+}
+
+async fn execute_scheduled_job(config: &Config, job: &CronJob) -> (String, bool, String) {
+    warn_if_high_frequency_agent_job(job);
+    let started = Utc::now();
+    let current = crate::cron::get_job_for_agent(config, &job.id, &job.agent_alias);
+    let (success, output) = match current {
+        Ok(current)
+            if current.enabled
+                && current.next_run == job.next_run
+                && current.next_run <= started =>
+        {
+            execute_job_now(config, &current).await
+        }
+        _ => {
+            let _ = release_job(config, &job.id);
+            return (
+                job.id.clone(),
+                false,
+                crate::i18n::get_required_cli_string("cron-task-changed"),
+            );
+        }
+    };
+    let success = persist_job_result(config, job, success, &output, started, Utc::now()).await;
+    if config.scheduler.missed_run_policy == MissedRunPolicy::Review {
+        retry_captured_result(config, job, || release_job(config, &job.id)).await;
+    } else {
+        if let Err(error) = release_job(config, &job.id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(serde_json::json!({"job_id":job.id, "error":error.to_string()})),
+                "cron release failed"
+            );
+        }
+    }
+    (job.id.clone(), success, output)
+}
+
+async fn delivery_loop(config: Config, cancel: CancellationToken) -> Result<()> {
+    let mut timer = time::interval(Duration::from_secs(2));
+    timer.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            _ = timer.tick() => {
+                if let Err(error) = flush_delivery_queue(&config).await {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"error":error.to_string()})), "cron delivery worker failed; retrying");
+                }
             }
         }
     }
+}
+
+async fn flush_delivery_queue(config: &Config) -> Result<()> {
+    for item in super::delivery_queue::pending(config, Utc::now(), 8)? {
+        if !super::delivery_queue::is_claim_active(config, item.id)? {
+            continue;
+        }
+        let result = async {
+            let mut identity = config.clone();
+            if let Some(resolve) = AGENT_CONFIG_RESOLVER.get() {
+                identity = resolve(identity, item.agent_alias.clone()).await?;
+            }
+            let channel = item
+                .delivery
+                .channel
+                .as_deref()
+                .ok_or_else(|| anyhow::Error::msg("delivery channel missing"))?;
+            let target = item
+                .delivery
+                .to
+                .as_deref()
+                .ok_or_else(|| anyhow::Error::msg("delivery destination missing"))?;
+            deliver_announcement(
+                &identity,
+                channel,
+                target,
+                item.delivery.thread_id.as_deref(),
+                &item.output,
+            )
+            .await
+        };
+        let result = time::timeout(Duration::from_secs(30), result)
+            .await
+            .unwrap_or_else(|_| Err(anyhow::Error::msg("delivery timed out")));
+        match result {
+            Ok(()) => {
+                super::delivery_queue::acknowledge(config, item.id)?;
+            }
+            Err(error) => {
+                super::delivery_queue::retry(config, item.id, Utc::now(), &error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_overdue_reviews(config: &Config) -> Result<VecDeque<CronJob>> {
+    // Incomplete reviews or executions never resume an action automatically.
+    for job in crate::cron::list_jobs(config)? {
+        if job.last_status.as_deref() == Some("missed_review") && !job.enabled {
+            super::missed::finish(
+                config,
+                &job,
+                &super::missed::Decision {
+                    action: super::missed::Action::Ask,
+                    message: crate::i18n::get_required_cli_string_with_args(
+                        "cron-missed-uncertain",
+                        &[("name", job.name.as_deref().unwrap_or("scheduled task"))],
+                    ),
+                },
+                Utc::now(),
+            )?;
+        }
+    }
+    let mut reviews = VecDeque::new();
+    for job in all_overdue_jobs(config, Utc::now())? {
+        if job.source == "declarative" {
+            if !config.scheduler.catch_up_on_startup {
+                skip_missed_run(config, &job, Utc::now())?;
+            }
+            continue;
+        }
+        if job.last_status.as_deref() == Some("missed_run_now") {
+            continue;
+        }
+        if super::missed::begin(config, &job)? {
+            reviews.push_back(job);
+        }
+    }
+    Ok(reviews)
+}
+
+async fn review_one_missed_job(config: &Config, job: &CronJob) -> Result<()> {
+    let decision =
+        match time::timeout(Duration::from_secs(90), review_missed_job(config, job)).await {
+            Ok(Ok(decision)) => decision,
+            _ => super::missed::Decision {
+                action: super::missed::Action::Ask,
+                message: crate::i18n::get_required_cli_string_with_args(
+                    "cron-missed-decision-failed",
+                    &[("name", job.name.as_deref().unwrap_or("scheduled task"))],
+                ),
+            },
+        };
+    loop {
+        match super::missed::finish(config, job, &decision, Utc::now()) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"job_id":job.id,"error":error.to_string()})),
+                    "missed task decision persistence failed; retrying without inference"
+                );
+                time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+pub(super) async fn review_missed_job(
+    config: &Config,
+    job: &CronJob,
+) -> Result<super::missed::Decision> {
+    let mut cfg = effective_job_config(config, job).await?;
+    cfg.memory.auto_save = false;
+    let security = SecurityPolicy::for_agent(&cfg, &job.agent_alias)?;
+    let review_security = cron_agent_run_policy(&security, job, true);
+    let risk_profile = cfg
+        .risk_profile_for_agent(&job.agent_alias)
+        .ok_or_else(|| anyhow::Error::msg("missed task owner has no risk profile"))?;
+    let approval = crate::approval::ApprovalManager::for_non_interactive_backchannel(risk_profile);
+    let review: BoxFuture<'_, Result<String>> = Box::pin(crate::agent::run(
+        cfg,
+        &job.agent_alias,
+        Some(super::missed::prompt(job, Utc::now())),
+        None,
+        job.model.clone(),
+        None,
+        vec![],
+        false,
+        Some(std::path::PathBuf::from(format!(
+            "cron/review/{}",
+            uuid::Uuid::new_v4()
+        ))),
+        None,
+        zeroclaw_api::ingress::TurnOrigin::Cron,
+        crate::agent::loop_::AgentRunOverrides {
+            security: Some(Arc::new(review_security)),
+            approval: Some(approval),
+            memory_free: false,
+            suppress_memory_inject: true,
+            ..Default::default()
+        },
+    ));
+    let response = review.await?;
+    super::missed::Decision::parse(&response, job)
 }
 
 fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str> {
@@ -545,6 +849,11 @@ async fn execute_job_now_with_runtime(
         );
     }
     use zeroclaw_log::Instrument;
+    let current_config = match effective_job_config(config, job).await {
+        Ok(config) => config,
+        Err(error) => return (false, format!("blocked by security policy: {error}")),
+    };
+    let config = &current_config;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
         return (
             false,
@@ -572,9 +881,9 @@ async fn execute_job_now_with_runtime(
     .await
 }
 
-fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob, review: bool) -> SecurityPolicy {
     let mut policy = base.clone();
-    if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
+    if !review && (!matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some()) {
         return policy;
     }
 
@@ -613,7 +922,11 @@ async fn execute_job_with_retry(
     let runtime = runtime.or(owned_runtime.as_deref());
 
     let mut last_output = String::new();
-    let retries = config.reliability.scheduler_retries;
+    let retries = if config.scheduler.missed_run_policy == MissedRunPolicy::Review {
+        0
+    } else {
+        config.reliability.scheduler_retries
+    };
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
@@ -689,33 +1002,9 @@ async fn process_due_jobs(
     crate::health::mark_component_ok(component);
 
     let max_concurrent = config.scheduler.max_concurrent.max(1);
-    let mut in_flight = stream::iter(jobs.into_iter().filter_map(|job| {
-        let Some(agent_alias) = resolve_owning_agent(config, &job) else {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id})), "Cron job has no owning agent; add the alias to an [agents.<x>].cron_jobs list");
-            let _ = release_job(config, &job.id);
-            return None;
-        };
-        let agent_alias = agent_alias.to_owned();
-        let security = match SecurityPolicy::for_agent(config, &agent_alias) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent": agent_alias, "error": format!("{}", e)})), "Cron job: failed to build SecurityPolicy for owning agent");
-                let _ = release_job(config, &job.id);
-                return None;
-            }
-        };
+    let mut in_flight = stream::iter(jobs.into_iter().map(|job| {
         let config = config.clone();
-        let component = component.to_owned();
-        Some(async move {
-            Box::pin(execute_and_persist_job(
-                &config,
-                security.as_ref(),
-                &agent_alias,
-                &job,
-                &component,
-            ))
-            .await
-        })
+        async move { execute_scheduled_job(&config, &job).await }
     }))
     .buffer_unordered(max_concurrent);
 
@@ -740,56 +1029,6 @@ async fn process_due_jobs(
             }));
         }
     }
-}
-
-async fn execute_and_persist_job(
-    config: &Config,
-    security: &SecurityPolicy,
-    agent_alias: &str,
-    job: &CronJob,
-    component: &str,
-) -> (String, bool, String) {
-    crate::health::mark_component_ok(component);
-    warn_if_high_frequency_agent_job(job);
-
-    let started_at = Utc::now();
-    let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(
-        config,
-        security,
-        agent_alias,
-        job,
-        None,
-        false,
-    ))
-    .instrument(span)
-    .await;
-    let finished_at = Utc::now();
-    let success = Box::pin(persist_job_result(
-        config,
-        job,
-        success,
-        &output,
-        started_at,
-        finished_at,
-    ))
-    .await;
-
-    // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
-    // that the run (and its reschedule/disable/delete in `persist_job_result`) is
-    // done. A deleted one-shot row simply releases nothing. If this fails the lock
-    // is recovered by `clear_stale_locks` at the next startup
-    if let Err(e) = release_job(config, &job.id) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "Cron job: failed to release in-flight lock after run"
-        );
-    }
-
-    (job.id.clone(), success, output)
 }
 
 async fn run_agent_job(
@@ -843,9 +1082,14 @@ async fn run_agent_job(
         spawn_site = "cron",
     );
 
-    let run_security = cron_agent_run_policy(security, job);
+    let run_security = cron_agent_run_policy(
+        security,
+        job,
+        config.scheduler.missed_run_policy == MissedRunPolicy::Review,
+    );
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
+        approval: None,
         memory: None,
         is_subagent: false,
         // `uses_memory = false` fully opts the job out of the engine's
@@ -919,6 +1163,29 @@ async fn run_agent_job(
     }
 }
 
+/// Retry storage of the captured outcome, never the task action.
+async fn retry_captured_result(
+    config: &Config,
+    job: &CronJob,
+    mut persist: impl FnMut() -> Result<()>,
+) {
+    while let Err(error) = persist() {
+        let ownership = super::store::owned_job_exists(config, &job.id, &job.agent_alias);
+        if matches!(ownership, Ok(false)) {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                serde_json::json!({"job_id":job.id,"error":error.to_string(),
+                "ownership_error":ownership.err().map(|e| e.to_string())})
+            ),
+            "cron result persistence failed; retrying without execution"
+        );
+        time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
@@ -928,14 +1195,23 @@ async fn persist_job_result(
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(
-        config,
-        job,
-        success,
-        output.to_string(),
-        CronDeliveryContext::Scheduled,
-    )
-    .await;
+    let review_mode = config.scheduler.missed_run_policy == MissedRunPolicy::Review;
+    let outcome = if review_mode {
+        CronDeliveryOutcome {
+            success,
+            status: if success { "ok" } else { "error" }.into(),
+            output: output.to_string(),
+        }
+    } else {
+        deliver_and_classify_run_result(
+            config,
+            job,
+            success,
+            output.to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await
+    };
 
     let action = if is_one_shot_auto_delete(job) && outcome.success {
         RunCompletionAction::Delete
@@ -946,7 +1222,22 @@ async fn persist_job_result(
     };
 
     let job_state_at = Utc::now();
-    if let Err(e) = persist_run_result(
+    if review_mode {
+        retry_captured_result(config, job, || {
+            persist_run_result(
+                config,
+                job,
+                started_at,
+                finished_at,
+                job_state_at,
+                &outcome.status,
+                Some(&outcome.output),
+                duration_ms,
+                action,
+            )
+        })
+        .await;
+    } else if let Err(e) = persist_run_result(
         config,
         job,
         started_at,
@@ -966,10 +1257,6 @@ async fn persist_job_result(
         );
 
         if action == RunCompletionAction::Delete {
-            // Best-effort fallback for the legacy behavior: a successful
-            // auto-delete one-shot should not be picked up again if the
-            // combined history+state transaction fails while inserting or
-            // pruning the run row.
             if let Err(disable_err) = persist_run_completion_state(
                 config,
                 job,
@@ -986,25 +1273,21 @@ async fn persist_job_result(
                     "Failed to disable one-shot cron job after history persistence failure: "
                 );
             }
-        } else {
-            // For recurring jobs and non-delete one-shots, keep the scheduler
-            // moving even if run-history persistence fails.
-            if let Err(state_err) = persist_run_completion_state(
-                config,
-                job,
-                job_state_at,
-                &outcome.status,
-                Some(&outcome.output),
-                action,
-            ) {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
-                    "Failed to update cron job state after history persistence failure: "
-                );
-            }
+        } else if let Err(state_err) = persist_run_completion_state(
+            config,
+            job,
+            job_state_at,
+            &outcome.status,
+            Some(&outcome.output),
+            action,
+        ) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"state_err": state_err.to_string()})),
+                "Failed to persist scheduler completion state after history persistence failure: "
+            );
         }
     }
 
@@ -1142,7 +1425,13 @@ pub async fn deliver_announcement(
             "Cron delivery skipped: no delivery handler registered \
              (register_delivery_fn was not called by the binary)"
         );
-        Ok(())
+        if config.scheduler.missed_run_policy == MissedRunPolicy::Review {
+            Err(anyhow::Error::msg(
+                "cron delivery handler is not registered",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1172,6 +1461,13 @@ async fn run_job_command_with_runtime_and_timeout(
     approved: bool,
     timeout: Duration,
 ) -> (bool, String) {
+    if !security.is_tool_allowed("shell") {
+        return (
+            false,
+            crate::i18n::get_required_cli_string("cron-shell-unavailable"),
+        );
+    }
+
     if !security.can_act() {
         return (
             false,
@@ -1447,7 +1743,7 @@ mod tests {
         let mut job = test_job("");
         job.job_type = JobType::Agent;
 
-        let policy = cron_agent_run_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job, false);
 
         assert_eq!(policy.workspace_dir, workspace);
     }
@@ -1551,6 +1847,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cron_shell_execution_honors_current_shell_tool_permission() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..SecurityPolicy::default()
+        };
+        let runtime = PowerShellProbeRuntime::new();
+        let (success, output) = run_job_command_with_runtime(
+            &config,
+            &runtime,
+            &security,
+            &test_job("echo should-not-run"),
+            false,
+        )
+        .await;
+
+        assert!(!success);
+        assert!(output.contains("shell is not available"));
+        assert_eq!(
+            runtime
+                .build_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "revoked shell permission must be checked before starting a process"
+        );
+    }
+
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
@@ -1640,7 +1968,7 @@ mod tests {
         job.job_type = JobType::Agent;
         job.allowed_tools = None;
 
-        let policy = cron_agent_run_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job, false);
 
         for tool in [
             "cron_add",
@@ -1667,7 +1995,7 @@ mod tests {
         job.job_type = JobType::Agent;
         job.allowed_tools = Some(vec!["cron_add".into()]);
 
-        let policy = cron_agent_run_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job, false);
 
         assert!(
             policy.is_tool_allowed("cron_add"),
@@ -3149,11 +3477,27 @@ mod tests {
 
     // ── Broadcast / EventBroadcast tests ─────────────────────────────
 
+    fn due_broadcast_job(config: &Config, command: &str) -> CronJob {
+        let job = super::super::store::add_job(config, TEST_AGENT, "*/5 * * * *", command).unwrap();
+        super::super::store::with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run=?2 WHERE id=?1",
+                rusqlite::params![
+                    job.id,
+                    (Utc::now() - ChronoDuration::seconds(1)).to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        cron::get_job(config, &job.id).unwrap()
+    }
+
     #[tokio::test]
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("echo broadcast-ok");
+        let job = due_broadcast_job(&config, "echo broadcast-ok");
         // Bind the synthetic test job to test-agent so process_due_jobs's
         // owning-agent lookup succeeds (jobs without an owner are skipped).
         config
@@ -3167,11 +3511,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
@@ -3181,7 +3525,10 @@ mod tests {
     async fn broadcast_sends_cron_result_on_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_broadcast_fail_test");
+        let job = due_broadcast_job(
+            &config,
+            "ls definitely_missing_file_for_broadcast_fail_test",
+        );
         config
             .agents
             .get_mut("test-agent")
@@ -3193,11 +3540,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], false);
         assert!(event["timestamp"].as_str().is_some());
     }
@@ -3282,5 +3629,305 @@ mod tests {
 
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
+    }
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn background_run_does_not_block_later_due_work() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.missed_run_policy = MissedRunPolicy::Review;
+        config.scheduler.max_concurrent = 2;
+        config.reliability.scheduler_poll_secs = 5;
+        let risk = config.risk_profiles.get_mut(TEST_AGENT).unwrap();
+        risk.level = crate::security::AutonomyLevel::Full;
+        risk.allowed_commands = vec!["sleep".into(), "echo".into()];
+        risk.allowed_tools = vec!["shell".into()];
+        let slow = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "sleep 8",
+            None,
+        )
+        .unwrap();
+        let fast = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::seconds(1),
+            },
+            "echo fast",
+            None,
+        )
+        .unwrap();
+        cron::update_job(
+            &config,
+            &fast.id,
+            cron::CronJobPatch {
+                delete_after_run: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        super::super::manual_queue::enqueue(&config, &slow.id, TEST_AGENT, true).unwrap();
+        let cancel = CancellationToken::new();
+        let worker_config = config.clone();
+        let worker_cancel = cancel.clone();
+        let handle = zeroclaw_spawn::spawn!(run(worker_config, None, worker_cancel));
+        let observed = time::timeout(Duration::from_secs(7), async {
+            loop {
+                if !cron::list_runs(&config, &fast.id, 10).unwrap().is_empty() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        // Drain the worker even on failure, so no background test work leaks.
+        cancel.cancel();
+        assert!(
+            cron::list_runs(&config, &slow.id, 10).unwrap().is_empty(),
+            "slow task should still be running when later task completes"
+        );
+        handle.await.unwrap().unwrap();
+        observed.expect("later due task must finish while background task is running");
+        let fast_runs = cron::list_runs(&config, &fast.id, 10).unwrap();
+        assert_eq!(fast_runs[0].status, "ok");
+        assert!(fast_runs[0].output.as_deref().unwrap().contains("fast"));
+        assert_eq!(cron::list_runs(&config, &slow.id, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_result_retries_storage_without_executing_again() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.missed_run_policy = MissedRunPolicy::Review;
+        let job = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "must never execute",
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("test-chat".into()),
+                ..DeliveryConfig::default()
+            }),
+        )
+        .unwrap();
+        let database = config.data_dir.join("cron/jobs.db");
+        rusqlite::Connection::open(&database).unwrap().execute_batch(
+            "CREATE TRIGGER block_result BEFORE INSERT ON cron_runs BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END;"
+        ).unwrap();
+        let cfg = config.clone();
+        let captured = job.clone();
+        let started = Utc::now();
+        let handle = zeroclaw_spawn::spawn!(async move {
+            persist_job_result(&cfg, &captured, true, "captured result", started, started).await
+        });
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished());
+        assert_eq!(
+            cron::get_job(&config, &job.id).unwrap().next_run,
+            job.next_run
+        );
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TRIGGER block_result;")
+            .unwrap();
+        assert!(
+            time::timeout(Duration::from_secs(5), handle)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        let pending = super::super::delivery_queue::pending(&config, Utc::now(), 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].output, "captured result");
+    }
+    #[tokio::test]
+    async fn rescheduled_occurrence_is_not_dispatched_early() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let selected = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::seconds(1),
+            },
+            "echo early",
+            None,
+        )
+        .unwrap();
+        super::super::store::with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run=?2 WHERE id=?1",
+                rusqlite::params![
+                    selected.id,
+                    (Utc::now() - ChronoDuration::seconds(1)).to_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let selected = cron::get_job(&config, &selected.id).unwrap();
+        assert!(claim_job(&config, &selected.id, Utc::now()).unwrap());
+        let future = Schedule::At {
+            at: Utc::now() + ChronoDuration::hours(1),
+        };
+        cron::update_job(
+            &config,
+            &selected.id,
+            cron::CronJobPatch {
+                schedule: Some(future),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (_, success, _) = execute_scheduled_job(&config, &selected).await;
+        assert!(!success);
+        assert!(
+            cron::list_runs(&config, &selected.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let current = cron::get_job(&config, &selected.id).unwrap();
+        assert!(current.enabled);
+        assert!(current.next_run > Utc::now());
+        assert!(claim_job(&config, &current.id, Utc::now()).unwrap());
+        release_job(&config, &current.id).unwrap();
+    }
+
+    #[test]
+    fn review_tasks_cannot_opt_into_scheduler_mutation() {
+        for job_type in [JobType::Agent, JobType::Shell] {
+            let mut job = test_job("");
+            job.job_type = job_type;
+            job.allowed_tools = Some(vec!["cron_add".into(), "web_search_tool".into()]);
+            let policy = cron_agent_run_policy(&SecurityPolicy::default(), &job, true);
+            for tool in [
+                "cron_add",
+                "cron_update",
+                "cron_remove",
+                "cron_run",
+                "schedule",
+            ] {
+                assert!(
+                    !policy.is_tool_allowed(tool),
+                    "{:?} review allows {tool}",
+                    job.job_type
+                );
+            }
+            assert!(policy.is_tool_allowed("web_search_tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn review_mode_preserves_declarative_startup_skip() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.missed_run_policy = MissedRunPolicy::Review;
+        config.scheduler.catch_up_on_startup = false;
+        config.cron.insert(
+            "declared".into(),
+            CronJobDecl {
+                command: Some("echo declarative".into()),
+                schedule: CronScheduleDecl::Every {
+                    every_ms: 3_600_000,
+                },
+                ..Default::default()
+            },
+        );
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push("declared".into());
+        sync_declarative_jobs(&config, &config.cron).unwrap();
+        let job = cron::get_job(&config, "declared").unwrap();
+        super::super::store::with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET source='declarative', next_run=?2 WHERE id=?1",
+                rusqlite::params![job.id, (Utc::now() - ChronoDuration::hours(1)).to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(prepare_overdue_reviews(&config).unwrap().is_empty());
+        assert!(cron::get_job(&config, &job.id).unwrap().next_run > Utc::now());
+    }
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn polling_storage_error_keeps_dispatched_work_alive() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.missed_run_policy = MissedRunPolicy::Review;
+        config.scheduler.max_concurrent = 2;
+        config.reliability.scheduler_poll_secs = 5;
+        let risk = config.risk_profiles.get_mut(TEST_AGENT).unwrap();
+        risk.level = crate::security::AutonomyLevel::Full;
+        risk.allowed_commands = vec!["sleep".into(), "echo".into()];
+        risk.allowed_tools = vec!["shell".into()];
+        let slow = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Every {
+                every_ms: 3_600_000,
+            },
+            "sleep 8",
+            None,
+        )
+        .unwrap();
+        let fast = super::super::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::At {
+                at: Utc::now() + ChronoDuration::seconds(1),
+            },
+            "echo fast",
+            None,
+        )
+        .unwrap();
+        super::super::manual_queue::enqueue(&config, &slow.id, TEST_AGENT, true).unwrap();
+        super::super::store::with_initialized_connection(&config, |conn| {
+            conn.execute_batch("CREATE TRIGGER block_poll BEFORE UPDATE OF locked_at ON cron_jobs WHEN NEW.command='echo fast' BEGIN SELECT RAISE(ABORT, 'temporary polling failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        let cancel = CancellationToken::new();
+        let worker_config = config.clone();
+        let worker_cancel = cancel.clone();
+        let handle = zeroclaw_spawn::spawn!(run(worker_config, None, worker_cancel));
+        let completed = time::timeout(Duration::from_secs(11), async {
+            loop {
+                if !cron::list_runs(&config, &slow.id, 10).unwrap().is_empty() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        cancel.cancel();
+        let settled = handle.await.unwrap();
+        completed.expect("polling failure must not abort the running task");
+        settled.unwrap();
+        assert_eq!(
+            cron::list_runs(&config, &slow.id, 10).unwrap()[0].status,
+            "ok"
+        );
+        assert!(cron::list_runs(&config, &fast.id, 10).unwrap().is_empty());
+        assert!(cron::get_job(&config, &fast.id).unwrap().enabled);
     }
 }

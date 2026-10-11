@@ -160,6 +160,98 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+/// Keep scheduled task results in the conversation that created or updated
+/// the task. The model can choose to suppress an add announcement, but it
+/// cannot redirect an announcement to another configured channel or target.
+pub(crate) fn pin_cron_delivery_to_origin(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_name: &str,
+    channel_alias: Option<&str>,
+    channel_reply_target: Option<&str>,
+) {
+    if tool_name == "cron_add"
+        && let Some(args) = tool_args.as_object_mut()
+    {
+        args.entry("delete_after_run")
+            .or_insert(serde_json::Value::Bool(false));
+    }
+    if !matches!(tool_name, "cron_add" | "cron_update")
+        || !AUTO_DELIVERY_DEFAULT_CHANNELS.contains(&channel_name)
+    {
+        return;
+    }
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    let delivery_channel = match channel_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        Some(alias) => format!("{channel_name}.{alias}"),
+        None => channel_name.to_string(),
+    };
+
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+    let delivery = if tool_name == "cron_add" {
+        Some(
+            args.entry("delivery")
+                .or_insert_with(|| serde_json::json!({"mode": "announce"})),
+        )
+    } else {
+        args.get_mut("patch").and_then(|patch| {
+            // cron_update accepts a JSON object encoded as a string. Normalize
+            // that supported form before pinning so the tool cannot persist a
+            // model supplied destination that bypasses review-mode routing.
+            if let Some(encoded) = patch.as_str()
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(encoded)
+                && parsed.is_object()
+            {
+                *patch = parsed;
+            }
+            patch
+                .as_object_mut()
+                .and_then(|patch| patch.get_mut("delivery"))
+        })
+    };
+    let Some(delivery) = delivery else {
+        return;
+    };
+    if delivery.is_null() && tool_name == "cron_add" {
+        *delivery = serde_json::json!({"mode": "announce"});
+    }
+    let Some(delivery) = delivery.as_object_mut() else {
+        return;
+    };
+    if delivery
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
+    {
+        return;
+    }
+
+    delivery.insert(
+        "channel".to_string(),
+        serde_json::Value::String(delivery_channel),
+    );
+    delivery.insert(
+        "to".to_string(),
+        serde_json::Value::String(reply_target.to_string()),
+    );
+    // Telegram carries topic identity in reply_target (`chat_id:thread_id`).
+    // Drop a separate model-supplied thread so it cannot redirect delivery.
+    if channel_name == "telegram" {
+        delivery.remove("thread_id");
+    }
+}
+
 /// Bind a model-requested reaction to the active inbound conversation.
 ///
 /// The current turn's channel object, channel name, and reply target are the
@@ -232,7 +324,10 @@ pub(crate) fn scope_reaction_to_current_conversation(
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_inject_channel_delivery_defaults, maybe_inject_originating_channel};
+    use super::{
+        maybe_inject_channel_delivery_defaults, maybe_inject_originating_channel,
+        pin_cron_delivery_to_origin,
+    };
 
     #[test]
     fn null_delivery_is_replaced_with_channel_defaults() {
@@ -257,6 +352,19 @@ mod tests {
                 "to": "channel-42",
             })
         );
+    }
+
+    #[test]
+    fn cron_add_preserves_explicit_delete_after_run_choice() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delete_after_run": true,
+            "delivery": { "mode": "announce" }
+        });
+
+        pin_cron_delivery_to_origin("cron_add", &mut args, "discord", None, Some("channel-42"));
+
+        assert_eq!(args["delete_after_run"], true);
     }
 
     #[test]
@@ -364,6 +472,111 @@ mod tests {
         );
 
         assert_eq!(args["delivery"], serde_json::json!({ "mode": "none" }));
+    }
+
+    #[test]
+    fn cron_add_pins_explicit_shell_and_agent_delivery_to_origin() {
+        for job_type in ["shell", "agent"] {
+            let mut args = serde_json::json!({
+                "job_type": job_type,
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord.ops",
+                    "to": "foreign-channel",
+                    "thread_id": "foreign-thread"
+                }
+            });
+
+            pin_cron_delivery_to_origin(
+                "cron_add",
+                &mut args,
+                "telegram",
+                Some("work"),
+                Some("chat-42:topic-7"),
+            );
+
+            assert_eq!(args["delivery"]["channel"], "telegram.work");
+            assert_eq!(args["delivery"]["to"], "chat-42:topic-7");
+            assert!(args["delivery"].get("thread_id").is_none());
+        }
+    }
+
+    #[test]
+    fn cron_add_shell_without_delivery_defaults_to_origin_announcement() {
+        let mut args = serde_json::json!({
+            "job_type": "shell",
+            "command": "echo done"
+        });
+
+        pin_cron_delivery_to_origin("cron_add", &mut args, "discord", None, Some("channel-42"));
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "discord",
+                "to": "channel-42"
+            })
+        );
+        assert_eq!(args["delete_after_run"], false);
+    }
+
+    #[test]
+    fn cron_update_pins_only_present_delivery_patch() {
+        let mut args = serde_json::json!({
+            "job_id": "task-1",
+            "patch": {
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord.ops",
+                    "to": "foreign-channel",
+                    "thread_id": "foreign-thread"
+                }
+            }
+        });
+
+        pin_cron_delivery_to_origin(
+            "cron_update",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42:topic-7"),
+        );
+
+        assert_eq!(args["patch"]["delivery"]["channel"], "telegram.work");
+        assert_eq!(args["patch"]["delivery"]["to"], "chat-42:topic-7");
+        assert!(args["patch"]["delivery"].get("thread_id").is_none());
+
+        let mut omitted = serde_json::json!({ "job_id": "task-1", "patch": { "enabled": false } });
+        pin_cron_delivery_to_origin(
+            "cron_update",
+            &mut omitted,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+        assert_eq!(omitted["patch"], serde_json::json!({ "enabled": false }));
+    }
+
+    #[test]
+    fn cron_add_keeps_explicit_silent_delivery_silent() {
+        let mut args = serde_json::json!({
+            "job_type": "shell",
+            "delivery": { "mode": "none", "channel": "discord.ops", "to": "foreign" }
+        });
+
+        pin_cron_delivery_to_origin(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({ "mode": "none", "channel": "discord.ops", "to": "foreign" })
+        );
     }
 
     #[test]

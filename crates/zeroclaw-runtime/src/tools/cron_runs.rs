@@ -49,7 +49,12 @@ impl Tool for CronRunsTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
-                "limit": { "type": "integer" }
+                "limit": { "type": "integer" },
+                "include_delivery": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Include the latest delivery attempts and their status"
+                }
             },
             "required": ["job_id"]
         })
@@ -75,9 +80,34 @@ impl Tool for CronRunsTool {
             }
         };
 
+        let include_delivery = args
+            .get("include_delivery")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let job_id = match cron::get_job_for_agent(&self.config, raw_job_id, &self.agent_alias) {
             Ok(job) => job.id,
             Err(e) => {
+                // Successful one-shot tasks may already be removed from
+                // cron_jobs while their durable delivery remains pending.
+                // The queue's stored owner is the authorization boundary here.
+                if include_delivery {
+                    let deliveries = cron::delivery_queue::statuses_for_job(
+                        &self.config,
+                        raw_job_id,
+                        &self.agent_alias,
+                    )?;
+                    if !deliveries.is_empty() {
+                        return Ok(ToolResult {
+                            success: true,
+                            output: serde_json::to_string_pretty(&json!({
+                                "runs": [],
+                                "deliveries": deliveries,
+                            }))?
+                            .into(),
+                            error: None,
+                        });
+                    }
+                }
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -106,9 +136,23 @@ impl Tool for CronRunsTool {
                     })
                     .collect();
 
+                let output = if include_delivery {
+                    let deliveries = cron::delivery_queue::statuses_for_job(
+                        &self.config,
+                        &job_id,
+                        &self.agent_alias,
+                    )?;
+                    serde_json::to_string_pretty(&json!({
+                        "runs": runs,
+                        "deliveries": deliveries,
+                    }))?
+                } else {
+                    serde_json::to_string_pretty(&runs)?
+                };
+
                 Ok(ToolResult {
                     success: true,
-                    output: serde_json::to_string_pretty(&runs)?.into(),
+                    output: output.into(),
                     error: None,
                 })
             }
@@ -145,6 +189,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.scheduler.missed_run_policy = zeroclaw_config::schema::MissedRunPolicy::Review;
         config.risk_profiles.insert(
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -197,6 +242,11 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("..."));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&result.output)
+                .unwrap()
+                .is_array()
+        );
     }
 
     #[tokio::test]
@@ -253,5 +303,64 @@ mod tests {
             !format!("{:?}", result.output).contains("private-output"),
             "another agent's job output must not leak"
         );
+    }
+
+    #[tokio::test]
+    async fn optionally_includes_owner_scoped_delivery_status() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            TEST_AGENT,
+            Some("notify".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "summarize changes",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            Some(crate::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("chat-1".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(cfg.data_dir.join("cron/jobs.db")).unwrap();
+        cron::delivery_queue::enqueue_on(&conn, &job, "cron-runs-status-test", "done").unwrap();
+
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let old_shape = tool.execute(json!({"job_id": job.id})).await.unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&old_shape.output)
+                .unwrap()
+                .is_array()
+        );
+
+        let result = tool
+            .execute(json!({"job_id": job.id, "include_delivery": true}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(value["runs"].is_array());
+        assert_eq!(value["deliveries"][0]["status"], "pending");
+        assert_eq!(value["deliveries"][0]["attempts"], 0);
+
+        cron::remove_job_for_agent(&cfg, &job.id, TEST_AGENT).unwrap();
+        let after_deletion = tool
+            .execute(json!({"job_id": job.id, "include_delivery": true}))
+            .await
+            .unwrap();
+        assert!(after_deletion.success);
+        let value: serde_json::Value = serde_json::from_str(&after_deletion.output).unwrap();
+        assert_eq!(value["runs"], json!([]));
+        assert_eq!(value["deliveries"][0]["status"], "cancelled");
     }
 }
