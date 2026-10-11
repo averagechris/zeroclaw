@@ -19,11 +19,13 @@ operational guidance belongs in that runbook; secrets remain in encrypted
 deployment storage. The separate Thorny Codex login and credentials must not be
 mixed with work accounts or workstation credentials.
 
-The immediate frontier is [conversational scheduling](issues/25-conversational-scheduling.md).
-Codex follow-up changes are merged in dotfiles #53; rollout remains separate.
-Scheduling implementation is under review. The deployed baseline does not
-grant scheduling tools to chats. Enable them only with the matching runtime
-and after checking chat isolation, recovery, and result delivery.
+The current implementation frontier is [Kagi lenses](issues/26-kagi-lenses.md).
+Scheduling and Codex follow-up live QA are deferred until tomorrow at the
+owner's request.
+Runtime #30 and dotfiles #54 are merged; Codex follow-up changes are merged
+in dotfiles #53. Rollout remains separate. Confirm the host revision and check
+chat isolation, missed-task recovery, and result delivery before treating these
+changes as deployed.
 
 ## Notes
 
@@ -140,6 +142,8 @@ Agents scan this directory for open, unblocked child decisions.
 
 ## Decisions so far
 
+- [Conversational scheduling](issues/25-conversational-scheduling.md): one-off and recurring work uses current chat permissions, context-aware missed-task judgment, and inference-free clock checks; runtime and host changes are merged.
+
 - [Deployed baseline](issues/23-deployed-baseline.md): invitations and isolated memo are verified; media tools, Kagi extraction, owner video editing, and location input are deployed.
 - [Memo trial](issues/22-memo-trial.md): use a workspace-bound CLI tool with empty stores; disable native durable memory and defer sharing.
 
@@ -222,11 +226,12 @@ Agents scan this directory for open, unblocked child decisions.
   before treating them as deployed.
 - [Conversational scheduling](issues/25-conversational-scheduling.md): one-off
   and recurring tasks for every admitted chat, bounded by that chat's tools.
-  Runtime and host changes are being validated for draft review. Due checks
-  use no inference; actual missed tasks receive one bounded judgment. Telegram
-  rollout checks remain outstanding.
-- Kagi lenses: explain how lenses filter results, then choose useful filters
-  before creating named lenses. Default search remains preferred.
+  [Runtime #30](https://github.com/averagechris/zeroclaw/pull/30) and
+  [host #54](https://github.com/averagechris/dotfiles/pull/54) are merged.
+  Rollout and live Telegram checks remain outstanding.
+- [Kagi lenses](issues/26-kagi-lenses.md): implement three local activities
+  collections and automatic selection guidance, with broad business search.
+  Blind Luna evaluation, Sol review, and live source-quality QA track readiness.
 - Consider `ctx` only if Michi's own coding history needs it; consider
   `sideshow` if slide creation becomes useful.
 - Personal account tools: choose a concrete service before resuming

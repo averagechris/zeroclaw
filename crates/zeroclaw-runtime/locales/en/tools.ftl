@@ -198,7 +198,9 @@ tool-web-search-tool-kagi-param-action = Use search (the default) to search Kagi
 tool-web-search-tool-kagi-param-query = Required for action=search. Be specific for better results.
 tool-web-search-tool-kagi-param-url = Required for action=extract. One publicly reachable HTTPS page URL; private, local, metadata, and user-information URLs are rejected.
 tool-web-search-tool-kagi-param-lens-id = Optional Kagi lens identifier or shareable lens URL for action=search. Omit it to use the Kagi account's normal search settings.
-tool-web-search-tool-error-kagi-invalid-arguments = Invalid Kagi tool arguments. Use action=search with a query and optional lens_id, or action=extract with one public HTTPS URL; DuckDuckGo fallback is available only for search.
+tool-web-search-tool-kagi-param-lens = Optional inline Kagi lens for action=search. Currently supports only sites_included with 1 to 10 domain names; use either lens or lens_id, not both.
+tool-web-search-tool-kagi-param-lens-sites-included = Domains to include in Kagi search results. Enter host names such as example.com without a scheme, path, or port.
+tool-web-search-tool-error-kagi-invalid-arguments = Invalid Kagi tool arguments. Use action=search with a query and optional lens_id or a lens containing 1 to 10 domains in sites_included, or action=extract with one public HTTPS URL; DuckDuckGo fallback is available only for search.
 tool-web-search-tool-error-kagi-unsafe-extract-url = Kagi extraction accepts public HTTPS URLs without user information; private, local, and metadata hosts are blocked.
 tool-web-search-tool-error-kagi-extract-api-failure = Kagi extraction failed ({ $details }). Check API access, billing or usage limits, and page accessibility.
 tool-web-search-tool-error-kagi-extract-page-failure = Kagi returned no page content. Check that the requested page is publicly accessible over HTTPS.

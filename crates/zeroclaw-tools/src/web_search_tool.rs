@@ -1513,6 +1513,7 @@ impl WebSearchTool {
         url: &str,
         query: &str,
         lens_id: Option<&str>,
+        lens: Option<&serde_json::Value>,
     ) -> anyhow::Result<String> {
         // A missing key is a configuration error and is reported without the
         // fallback offer. Only failures of the call itself carry it.
@@ -1521,7 +1522,7 @@ impl WebSearchTool {
         let builder =
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
         let client = builder.build()?;
-        self.search_kagi_with_client(&client, url, &api_key, query, lens_id)
+        self.search_kagi_with_client(&client, url, &api_key, query, lens_id, lens)
             .await
             .map_err(kagi_runtime_failure)
     }
@@ -1533,6 +1534,7 @@ impl WebSearchTool {
         api_key: &str,
         query: &str,
         lens_id: Option<&str>,
+        lens: Option<&serde_json::Value>,
     ) -> anyhow::Result<String> {
         // Keep this request to ordinary web results. Lenses are optional, and
         // safe search remains on because shared chats can reach this tool.
@@ -1544,6 +1546,9 @@ impl WebSearchTool {
         });
         if let Some(lens_id) = lens_id {
             request_body["lens_id"] = json!(lens_id);
+        }
+        if let Some(lens) = lens {
+            request_body["lens"] = lens.clone();
         }
 
         let response = client
@@ -2147,6 +2152,7 @@ const KAGI_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 const KAGI_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const KAGI_EXTRACT_CONTENT_LIMIT_CHARS: usize = 12_000;
 const KAGI_LENS_ID_LIMIT_CHARS: usize = 2_048;
+const KAGI_LENS_SITES_LIMIT: usize = 10;
 const KAGI_TOOL_DESCRIPTION_KEY: &str = "tool-web-search-tool-kagi-description";
 const KAGI_INVALID_ARGUMENTS_KEY: &str = "tool-web-search-tool-error-kagi-invalid-arguments";
 const KAGI_UNSAFE_EXTRACT_URL_KEY: &str = "tool-web-search-tool-error-kagi-unsafe-extract-url";
@@ -2175,6 +2181,40 @@ fn kagi_invalid_arguments() -> anyhow::Error {
     anyhow::Error::msg(crate::i18n::get_required_tool_string(
         KAGI_INVALID_ARGUMENTS_KEY,
     ))
+}
+
+fn validate_kagi_inline_lens(value: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let object = value.as_object().ok_or_else(kagi_invalid_arguments)?;
+    if object.len() != 1 {
+        return Err(kagi_invalid_arguments());
+    }
+    let sites = object
+        .get("sites_included")
+        .and_then(serde_json::Value::as_array)
+        .filter(|sites| !sites.is_empty() && sites.len() <= KAGI_LENS_SITES_LIMIT)
+        .ok_or_else(kagi_invalid_arguments)?;
+    if sites.iter().any(|site| {
+        site.as_str()
+            .is_none_or(|domain| !is_kagi_lens_domain(domain))
+    }) {
+        return Err(kagi_invalid_arguments());
+    }
+    Ok(value.clone())
+}
+
+fn is_kagi_lens_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    domain.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn kagi_unsafe_extract_url() -> anyhow::Error {
@@ -2742,6 +2782,21 @@ impl Tool for WebSearchTool {
                 "type": "string",
                 "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-lens-id")
             });
+            schema["properties"]["lens"] = json!({
+                "type": "object",
+                "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-lens"),
+                "additionalProperties": false,
+                "required": ["sites_included"],
+                "properties": {
+                    "sites_included": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": KAGI_LENS_SITES_LIMIT,
+                        "description": crate::i18n::get_required_tool_string("tool-web-search-tool-kagi-param-lens-sites-included"),
+                        "items": {"type": "string"}
+                    }
+                }
+            });
             if let Some(object) = schema.as_object_mut() {
                 object.remove("required");
             }
@@ -2767,7 +2822,10 @@ impl Tool for WebSearchTool {
             return Err(kagi_invalid_arguments());
         }
         if action == "extract" {
-            if args.get("query").is_some() || args.get("lens_id").is_some() {
+            if args.get("query").is_some()
+                || args.get("lens_id").is_some()
+                || args.get("lens").is_some()
+            {
                 return Err(kagi_invalid_arguments());
             }
             if args
@@ -2792,8 +2850,8 @@ impl Tool for WebSearchTool {
         if args.get("url").is_some() {
             return Err(kagi_invalid_arguments());
         }
-        let lens_id = if is_kagi {
-            match args.get("lens_id") {
+        let (lens_id, lens) = if is_kagi {
+            let lens_id = match args.get("lens_id") {
                 None => None,
                 Some(value) => {
                     let value = value.as_str().ok_or_else(kagi_invalid_arguments)?.trim();
@@ -2805,12 +2863,20 @@ impl Tool for WebSearchTool {
                     }
                     Some(value)
                 }
-            }
-        } else {
-            if args.get("lens_id").is_some() {
+            };
+            if args.get("lens_id").is_some() && args.get("lens").is_some() {
                 return Err(kagi_invalid_arguments());
             }
-            None
+            let lens = args
+                .get("lens")
+                .map(validate_kagi_inline_lens)
+                .transpose()?;
+            (lens_id, lens)
+        } else {
+            if args.get("lens_id").is_some() || args.get("lens").is_some() {
+                return Err(kagi_invalid_arguments());
+            }
+            (None, None)
         };
         let query = args.get("query").and_then(|q| q.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -2868,7 +2934,8 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
             WebSearchProviderRoute::Kagi => {
-                self.search_kagi_at(KAGI_SEARCH_URL, query, lens_id).await?
+                self.search_kagi_at(KAGI_SEARCH_URL, query, lens_id, lens.as_ref())
+                    .await?
             }
         };
 
@@ -6907,6 +6974,7 @@ mod tests {
                 &format!("{}/api/v1/search", server.uri()),
                 "what is rust",
                 None,
+                None,
             )
             .await
             .expect("mocked Kagi search succeeds");
@@ -6951,9 +7019,48 @@ mod tests {
             &format!("{}/api/v1/search", server.uri()),
             "vegetarian dinner",
             Some("recipes"),
+            None,
         )
         .await
         .expect("a Kagi lens is forwarded in the v1 Search request");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn kagi_search_request_forwards_bounded_inline_sites_lens() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .and(body_json(serde_json::json!({
+                "query": "rust async runtime",
+                "workflow": "search",
+                "limit": 5,
+                "safe_search": true,
+                "lens": {"sites_included": ["rust-lang.org", "doc.rust-lang.org"]}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"search": []}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
+        let lens = validate_kagi_inline_lens(&json!({
+            "sites_included": ["rust-lang.org", "doc.rust-lang.org"]
+        }))
+        .expect("common registrable domains and subdomains are accepted");
+        tool.search_kagi_at(
+            &format!("{}/api/v1/search", server.uri()),
+            "rust async runtime",
+            None,
+            Some(&lens),
+        )
+        .await
+        .expect("inline lens is forwarded in the Kagi v1 Search request");
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
@@ -7036,6 +7143,17 @@ mod tests {
             json!({"query": "q", "url": "https://example.com"}),
             json!({"query": "q", "lens_id": "  "}),
             json!({"query": "q", "lens_id": 1}),
+            json!({"query": "q", "lens_id": "recipes", "lens": {"sites_included": ["example.com"]}}),
+            json!({"action": "extract", "url": "https://example.com", "lens": {"sites_included": ["example.com"]}}),
+            json!({"query": "q", "lens": {}}),
+            json!({"query": "q", "lens": {"sites_included": []}}),
+            json!({"query": "q", "lens": {"sites_included": ["example.com", "example.org", "example.net", "example.edu", "example.gov", "example.io", "example.dev", "example.app", "example.co", "example.uk", "example.info"]}}),
+            json!({"query": "q", "lens": {"sites_included": ["https://example.com"]}}),
+            json!({"query": "q", "lens": {"sites_included": ["example.com/path"]}}),
+            json!({"query": "q", "lens": {"sites_included": ["example.com:443"]}}),
+            json!({"query": "q", "lens": {"sites_included": ["bad..example.com"]}}),
+            json!({"query": "q", "lens": {"sites_included": [1]}}),
+            json!({"query": "q", "lens": {"sites_included": ["example.com"], "keywords_included": ["rust"]}}),
         ] {
             let result = tool.execute(args).await;
             assert!(result.is_err(), "invalid arguments unexpectedly succeeded");
@@ -7051,6 +7169,10 @@ mod tests {
         let non_kagi = WebSearchTool::new("serply".to_string(), None, None, 5, 15);
         let result = non_kagi
             .execute(json!({"action": "extract", "url": "https://example.com"}))
+            .await;
+        assert!(result.is_err());
+        let result = non_kagi
+            .execute(json!({"query": "q", "lens": {"sites_included": ["example.com"]}}))
             .await;
         assert!(result.is_err());
     }
@@ -7139,7 +7261,7 @@ mod tests {
 
         let (_tmp, tool) = kagi_tool_with_key("kagi-test-key");
         let err = tool
-            .search_kagi_at(&url, "rust", None)
+            .search_kagi_at(&url, "rust", None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -7153,7 +7275,7 @@ mod tests {
         std::fs::write(&config_path, "[web_search]\nsearch_provider = \"kagi\"\n").unwrap();
         let before = server.received_requests().await.unwrap().len();
         let err = kagi_tool(config_path)
-            .search_kagi_at(&url, "rust", None)
+            .search_kagi_at(&url, "rust", None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -7173,6 +7295,16 @@ mod tests {
         assert!(schema.get("required").is_none());
         assert_eq!(schema["properties"]["action"]["default"], "search");
         assert_eq!(schema["properties"]["lens_id"]["type"], "string");
+        assert_eq!(schema["properties"]["lens"]["type"], "object");
+        assert_eq!(schema["properties"]["lens"]["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["lens"]["properties"]["sites_included"]["minItems"],
+            1
+        );
+        assert_eq!(
+            schema["properties"]["lens"]["properties"]["sites_included"]["maxItems"],
+            KAGI_LENS_SITES_LIMIT
+        );
         assert_eq!(schema["properties"]["url"]["type"], "string");
         let route =
             |tool: &WebSearchTool, args: serde_json::Value| tool.route_for_call(&args).route;

@@ -1,7 +1,7 @@
 # Conversational scheduling
 
 Type: task
-Status: claimed
+Status: resolved
 Blocked by: none
 
 ## Question
@@ -11,8 +11,9 @@ chat, and receive results without spending inference on routine time checks?
 
 ## Answer
 
-The owner authorized implementation on 2026-10-10. The draft uses the existing
-cron store and tools, with opt-in recovery and durable result delivery.
+The owner authorized implementation on 2026-10-10 and approved both PRs for
+merge. Runtime #30 and dotfiles #54 are merged. The implementation uses the
+existing cron store and tools, with opt-in recovery and durable result delivery.
 
 ### Agreed behavior
 
@@ -51,16 +52,17 @@ host changes must roll out together.
 
 ### Remaining acceptance checks
 
-1. Pass focused runtime, channel, config, formatting, and documentation checks.
-2. Complete independent review before opening draft PRs.
-3. After merge and an authorized host rollout, test an owner DM, invited DM,
+Focused runtime, channel, config, formatting, and documentation checks passed.
+Independent review is complete.
+
+1. After an authorized host rollout, test an owner DM, invited DM,
    and approved group through Telegram. Create and edit a one-shot and a
    recurrence, test a background run, receive results, and remove trial tasks.
-4. Verify task ownership, current permission removal, no idle model requests,
+2. Verify task ownership, current permission removal, no idle model requests,
    continued chat availability during slow work, and a remembered missed-task
    decision after restart.
 
-No deployment or Telegram trial is included in the draft implementation.
+No deployment or Telegram trial has been performed in this implementation effort.
 To roll back, pause or remove active tasks before reverting runtime and host
 settings. Revoking scheduling tools alone does not stop saved schedules.
 
@@ -70,3 +72,8 @@ settings. Revoking scheduling tools alone does not stop saved schedules.
 - [Scheduler](../../../../crates/zeroclaw-runtime/src/cron/scheduler.rs)
 - [Task store](../../../../crates/zeroclaw-runtime/src/cron/store.rs)
 - [Host runbook](https://github.com/averagechris/dotfiles/blob/main/docs/zeroclaw.md)
+
+## Delivery links
+
+- [Runtime scheduling #30](https://github.com/averagechris/zeroclaw/pull/30), merged as `36712eeead9ed0ef6705019bd621fc6e30a0b3b8`.
+- [Michi host configuration #54](https://github.com/averagechris/dotfiles/pull/54), merged as `3a2808d98610c610ebf6758baa2eea16abc7afd7`.

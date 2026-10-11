@@ -103,10 +103,13 @@ kagi_api_key = "..."
 
 Search calls use `POST https://kagi.com/api/v1/search` with
 `workflow = "search"`, `limit` set from `max_results`, and safe search on. The
-optional `lens_id` selects a Kagi lens; omit it to use the API key owner's
-normal Kagi account settings. Find lens IDs in Kagi's [Lens settings](https://kagi.com/settings/lenses)
-or use a built-in lens identifier. Kagi does not currently expose a lens-list
-endpoint in its v1 API.
+optional `lens_id` selects a saved or built-in Kagi lens; omit it to use the
+API key owner's normal Kagi account settings. For repo-maintained local lenses,
+`lens` accepts only `sites_included` with 1 to 10 domain names, for example
+`{"sites_included":["rust-lang.org","doc.rust-lang.org"]}`. Use either
+`lens_id` or `lens`, not both. Find shareable lens IDs in Kagi's [Lens
+settings](https://kagi.com/settings/lenses); Kagi does not currently expose a
+lens-list endpoint in its v1 API.
 
 Kagi also supports an explicit page extraction action:
 
