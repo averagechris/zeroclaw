@@ -2398,36 +2398,41 @@ fn strip_inline_data_image_markers(content: &str) -> String {
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let mut normalized = Vec::with_capacity(turns.len());
-    let mut expecting_user = true;
+    let mut normalized: Vec<ChatMessage> = Vec::with_capacity(turns.len());
 
     for turn in turns {
-        match (expecting_user, turn.role.as_str()) {
-            // Pass through tool-role messages preserved by
-            // keep_tool_context_turns.  After a tool result the
-            // next expected message is an assistant response, same as
-            // after a user message.
-            (_, "tool") | (true, "user") => {
-                normalized.push(turn);
-                expecting_user = false;
-            }
-            (false, "assistant") => {
-                normalized.push(turn);
-                expecting_user = true;
-            }
-            // Interrupted channel turns can produce consecutive user messages
-            // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
-                if let Some(last_turn) = normalized.last_mut()
-                    && !turn.content.is_empty()
-                {
-                    if !last_turn.content.is_empty() {
-                        last_turn.content.push_str("\n\n");
+        let merge_with_previous = normalized.last().is_some_and(|previous| {
+            previous.role == turn.role
+                && match turn.role.as_str() {
+                    // Interrupted channel turns can produce consecutive user
+                    // messages (no assistant persisted yet). Merge adjacent
+                    // user text, but never cross another message role.
+                    "user" => true,
+                    // Tool calls are protocol messages. Keep their JSON and
+                    // pairing intact even when a provider also returns visible
+                    // text alongside a native tool call.
+                    "assistant" => {
+                        !zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(
+                            &previous.content,
+                        ) && !zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(
+                            &turn.content,
+                        )
                     }
-                    last_turn.content.push_str(&turn.content);
+                    _ => false,
                 }
+        });
+
+        if merge_with_previous {
+            if let Some(last_turn) = normalized.last_mut()
+                && !turn.content.is_empty()
+            {
+                if !last_turn.content.is_empty() {
+                    last_turn.content.push_str("\n\n");
+                }
+                last_turn.content.push_str(&turn.content);
             }
-            _ => {}
+        } else {
+            normalized.push(turn);
         }
     }
 
@@ -51099,6 +51104,56 @@ Done."#;
         // user, assistant(tool_call), tool, assistant(final), user
         assert_eq!(normalized.len(), 5);
         assert_eq!(normalized[2].role, "tool");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_preserves_serialized_native_tool_exchange_and_user_boundary()
+    {
+        let tool_call =
+            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#;
+        let tool_result = r#"{"content":"Invitation is pending.","tool_call_id":"call_1"}"#;
+        let normalized = normalize_cached_channel_turns(vec![
+            ChatMessage::user("Check the invitation status."),
+            ChatMessage::assistant(tool_call),
+            ChatMessage::tool(tool_result),
+            ChatMessage::user("Can you explain what pending means?"),
+            ChatMessage::assistant("The invitation has not been accepted yet."),
+            ChatMessage::user("Thanks."),
+        ]);
+
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|turn| turn.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "user", "assistant", "user"]
+        );
+        assert_eq!(normalized[1].content, tool_call);
+        assert_eq!(normalized[2].content, tool_result);
+        let call: serde_json::Value = serde_json::from_str(&normalized[1].content).unwrap();
+        let result: serde_json::Value = serde_json::from_str(&normalized[2].content).unwrap();
+        assert_eq!(call["tool_calls"][0]["id"], result["tool_call_id"]);
+        assert_eq!(normalized[3].content, "Can you explain what pending means?");
+        assert_eq!(
+            normalized[4].content,
+            "The invitation has not been accepted yet."
+        );
+        assert_eq!(normalized[5].content, "Thanks.");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_does_not_merge_plain_assistant_text_into_tool_call_json() {
+        let tool_call =
+            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#;
+        let normalized = normalize_cached_channel_turns(vec![
+            ChatMessage::user("do a check"),
+            ChatMessage::assistant(tool_call),
+            ChatMessage::assistant("I will report the result next."),
+        ]);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].content, tool_call);
+        assert_eq!(normalized[2].content, "I will report the result next.");
     }
 
     #[test]

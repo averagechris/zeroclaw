@@ -30,6 +30,12 @@ messages or breaking a tool exchange.
 Leading system messages are retained. When no trim is needed, message order and
 shape are left unchanged.
 
+Channel history normalization merges adjacent user text and adjacent assistant
+text only. It preserves tool results, native tool-call envelopes, and user
+messages following a tool result as separate messages. A follow-up after an
+iteration-limit summary therefore retains the call/result pairing required by
+the provider.
+
 ## Token budget
 
 The token budget comes from `ResolvedRuntime::effective_context_budget()`:
